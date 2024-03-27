@@ -1,0 +1,5 @@
+numba==0.55.1
+numpy==1.21.6
+tqdm==4.64.1
+distributed==2024.2.0
+networkx==3.1
