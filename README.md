@@ -1,4 +1,4 @@
-![alt text](SAGESim-stacked-color.png=x200 "SAGESim")
+<img src="SAGESim-stacked-color.png" alt="SAGESim" height="200"/>
 
 Scalable Agent-based GPU Enabled Simulator
 
