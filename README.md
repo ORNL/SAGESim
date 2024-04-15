@@ -1,4 +1,4 @@
-![alt text](SAGESim-stacked-color.png =x200 "SAGESim")
+![alt text](SAGESim-stacked-color.png=x200 "SAGESim")
 
 Scalable Agent-based GPU Enabled Simulator
 
