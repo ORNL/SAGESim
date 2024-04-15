@@ -1,6 +1,6 @@
-<img src="SAGESim-stacked-color.png" alt="SAGESim" height="200"/>
+<img src="SAGESim-inline-tag-color.png" alt="SAGESim: Scalable Agent-based GPU Enabled Simulator" height="300"/>
 
-Scalable Agent-based GPU Enabled Simulator
+
 
 # Requirements
 
