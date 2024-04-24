@@ -5,6 +5,7 @@
 # Requirements
 
  - Python 3.7+
+ - GPU device with compute capability 3.0+. See https://developer.nvidia.com/cuda-gpus .
  - `conda create -n sagesimenv python=3.9`
  - `conda activate sagesimenv`
  - `conda install -c anaconda cudatoolkit`
@@ -16,9 +17,3 @@
  - `export PYTHONPATH=/path/to/clone_repo`
  - `cd /path/to/clone_repo`
  - `python examples/sir/run.py`
-
-# Unit Tests
-
-To run unit tests, `cd` to root dir and run:
-
-`python -m unittest tests.simple_agent_test`
