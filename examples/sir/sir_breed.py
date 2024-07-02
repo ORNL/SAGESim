@@ -1,12 +1,15 @@
-from math import isnan
+from random import random 
+
+from cupy import isnan
 
 from sagesim.breed import Breed
 from examples.sir.state import SIRState
-from sagesim.step_func_utils import (
-    step_func_helper_get_agent_index,
-    step_func_helper_get_random_float,
-)
-from numba import cuda
+#from sagesim.step_func_utils import (
+#    step_func_helper_get_agent_index,
+#    step_func_helper_get_random_float,
+#)
+#from numba import cuda
+import numpy as np
 
 global INFECTED
 INFECTED = SIRState.INFECTED.value
@@ -23,22 +26,21 @@ class SIRBreed(Breed):
         self.register_step_func(step_func)
 
 
-def step_func(id, id2index, rng_states, globals, breeds, locations, states):
-    agent_index = step_func_helper_get_agent_index(id, id2index)
-    if isnan(agent_index):
-        return
-    else:
-        agent_index = int(agent_index)
-    neighbors = locations[agent_index]  # network location is defined by neighbors
-    rand = step_func_helper_get_random_float(rng_states, id)
-    p_infection = globals[1]
-    for i in range(len(neighbors)):
-        neighbor_id = neighbors[i]
-        if isnan(neighbor_id):
-            break
-        neighbor_index = step_func_helper_get_agent_index(neighbor_id, id2index)
-        if isnan(neighbor_index):
-            break
-        neighbor_state = states[int(neighbor_index)]
-        if neighbor_state == 2 and rand < p_infection:
-            states[agent_index] = 2.0
+def step_func(id, id2index, globals, breeds, locations, states):
+    #agent_index = step_func_helper_get_agent_index(id, id2index)
+    # nan checked by inequality to self. Unfortunate limitation of cupyx
+    if (id == id) and (id2index[int(id)] == id2index[int(id)]):
+        agent_index = int(id2index[int(id)])
+         
+        neighbors = locations[agent_index]  # network location is defined by neighbors
+        rand = random()#0.1#step_func_helper_get_random_float(rng_states, id)
+        p_infection = globals[1]
+        
+        for i in range(len(neighbors)):
+            neighbor_id = neighbors[i]                
+            #neighbor_index = step_func_helper_get_agent_index(neighbor_id, id2index)
+            if (neighbor_id == neighbor_id) and (id2index[int(neighbor_id)] == id2index[int(neighbor_id)]):
+                    neighbor_index = int(id2index[int(neighbor_id)])
+                    neighbor_state = states[neighbor_index]
+                    if neighbor_state == 2 and rand < p_infection:
+                        states[agent_index] = 2.0
