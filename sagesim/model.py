@@ -3,6 +3,7 @@ SuperNeuroABM basic Model class
 
 """
 
+from functools import partial
 from typing import Dict, List, Callable, Set, Any, Union, Optional
 import math
 import heapq
@@ -10,14 +11,18 @@ from multiprocessing import Pool, Manager
 import inspect
 import time
 import numpy as np
+import cupy as cp
+import tempfile
+from importlib import util
+import importlib.machinery
 import importlib
 import os
 
-from numba import cuda
-from numba.cuda.random import create_xoroshiro128p_states
+import cupy
+from cupyx import jit
 from tqdm import tqdm
 from distributed import get_worker, get_client
-
+from mpi4py import MPI
 
 from sagesim.agent import (
     AgentFactory,
@@ -26,12 +31,14 @@ from sagesim.agent import (
     contextualize_agent_data_tensors,
 )
 from sagesim.util import (
-    init_dask_cluster,
     compress_tensor,
     convert_to_equal_side_tensor,
 )
 from sagesim.space import Space, NetworkSpace
 
+comm = MPI.COMM_WORLD
+num_workers = comm.Get_size()
+worker = comm.Get_rank()
 
 class Model:
     THREADSPERBLOCK = 32
@@ -41,10 +48,7 @@ class Model:
         self._agent_factory = AgentFactory(space)
         self._globals = {"tick": 0}
         # following may be set later in setup if distributed execution
-        self._distributed = False
-        self._num_workers = 0
-        self._client = None
-
+        
     def register_breed(self, breed: Breed) -> None:
         if self._agent_factory.num_agents > 0:
             raise Exception(f"Breeds must be registered before agents are created!")
@@ -86,9 +90,7 @@ class Model:
 
     def setup(
         self,
-        use_cuda: bool = True,
-        num_dask_worker: int = None,
-        scheduler_fpath: Optional[str] = None,
+        use_gpu: bool = True
     ) -> None:
         """
         Must be called before first simulate call.
@@ -100,12 +102,12 @@ class Model:
         :param scheduler_fpath: specify if using external dask cluster. Else
             distributed.LocalCluster is set up.
         """
-        self._use_cuda = use_cuda
-        if self._use_cuda:
-            if not cuda.is_available():
+        self._use_gpu = use_gpu
+        if self._use_gpu:
+            '''if not cuda.is_available():
                 raise EnvironmentError(
                     "CUDA requested but no cuda installation detected."
-                )
+                )'''
         # Create record of agent step functions by breed and priority
         self._breed_idx_2_step_func_by_priority: List[Dict[int, Callable]] = []
         heap_priority_breedidx_func = []
@@ -128,15 +130,6 @@ class Model:
                 )
                 last_priority = priority
 
-        # If distributed init dask cluster and get client
-        if num_dask_worker:
-            self._distributed = True
-            self._num_workers = num_dask_worker
-            self._client = init_dask_cluster(
-                num_workers=num_dask_worker, scheduler_fpath=scheduler_fpath
-            )
-        else:
-            self._num_workers = 1
         # Generate global data tensor
         self._global_data_vector = list(self._globals.values())
         with open(Model.STEPFUNCPATH, "w") as f:
@@ -152,17 +145,23 @@ class Model:
         ticks: int,
         sync_workers_every_n_ticks: int = 1,
     ) -> None:
-        # TODO Remove the following commeneted code once Summit-tested
-        # Generate agent data tensors
+        
+            # TODO Remove the following commeneted code once Summit-tested
+            # Generate agent data tensors
         self._agent_data_tensors = self._agent_factory.generate_agent_data_tensors()
 
-        # Chunk agent ids
-        all_agent_ids = [int(i) for i in range(len(self._agent_data_tensors[0]))]
-        chunk_size = len(all_agent_ids) // self._num_workers
-        agent_ids_chunks = [
-            all_agent_ids[i * chunk_size : (i + 1) * chunk_size]
-            for i in range(self._num_workers - 1)
-        ] + [all_agent_ids[(self._num_workers - 1) * chunk_size :]]
+        if worker == 0:
+            # Chunk agent ids
+            all_agent_ids = [int(i) for i in range(len(self._agent_data_tensors[0]))]
+            chunk_size = len(all_agent_ids) // num_workers
+            agent_ids_chunks = [
+                all_agent_ids[i * chunk_size : (i + 1) * chunk_size]
+                for i in range(num_workers - 1)
+            ] + [all_agent_ids[(num_workers - 1) * chunk_size :]]
+        else:
+            agent_ids_chunks = None
+
+
         # Repeatedly execute worker coroutine untill simulation
         # has run for the right amount of ticks
         for time_chunk in range((ticks // sync_workers_every_n_ticks) + 1):
@@ -173,37 +172,60 @@ class Model:
                 )
                 if sync_workers_every_n_ticks == 0:
                     break
-            agent_chunk_futures = []
-            for chunk_index, agent_ids_chunk in enumerate(agent_ids_chunks):
-                agent_futures_chunk = self._client.submit(
-                    worker_coroutine,
+            elif ticks % sync_workers_every_n_ticks:
+                sync_workers_every_n_ticks = ticks % sync_workers_every_n_ticks
+
+            
+            """ # Used earlier if we were not using MPI
+            (
+                self._global_data_vector,
+                self._agent_data_tensors,
+                _
+            ) = worker_coroutine(
+                agent_ids=all_agent_ids,
+                global_data_vector=self._global_data_vector,
+                agent_data_tensors=self._agent_data_tensors,
+                neighbor_compute_func=self.get_space()._neighbor_compute_func,
+                sync_workers_every_n_ticks=sync_workers_every_n_ticks,
+            )
+            self._agent_data_tensors = [cupy.asnumpy(adt) for adt in self._agent_data_tensors]"""
+                
+        
+            worker_agent_ids_chunk = comm.scatter(agent_ids_chunks, root=0)
+            (
+                worker_global_data_vector,
+                worker_agent_data_tensors,
+                worker_agent_ids_result
+            ) = worker_coroutine(
+                    worker_agent_ids_chunk,
                     self._global_data_vector,
                     self._agent_data_tensors,
-                    agent_ids_chunk,
                     self.get_space()._neighbor_compute_func,
                     sync_workers_every_n_ticks,
-                )
-                agent_chunk_futures.append(agent_futures_chunk)
-
-            subsolutions = self._client.gather(agent_chunk_futures)
-            (
-                global_data_vector_versions,
-                agent_data_tensors_versions,
-                agent_ids_versions,
-            ) = zip(*subsolutions)
-            self._global_data_vector = global_data_vector_versions[0]
-            for property_id in range(self._agent_factory.num_properties):
-                for agent_data_tensors_version, agent_ids_version in zip(
-                    agent_data_tensors_versions, agent_ids_versions
-                ):
-
-                    self._agent_data_tensors[property_id][agent_ids_version] = (
-                        agent_data_tensors_version[property_id]
-                    )
+            )
+            self._global_data_vector = comm.allreduce(worker_global_data_vector, op=reduce_global_data_vector)
+            self._agent_data_tensors = comm.allreduce(worker_agent_data_tensors, op=reduce_agent_data_tensors)
 
         self._agent_factory.update_agents_properties(self._agent_data_tensors)
-
+        
         return
+
+
+def reduce_global_data_vector(A, B):
+    values = np.stack([A, B], axis=1)    
+    return np.max(values, axis=1)
+
+def reduce_agent_data_tensors(A, B):
+    result = []
+    # breed would be same as first
+    result.append(A[0])
+    # network would be same as first 
+    result.append(A[1])
+    # state would be max value. Infected superceeds susceptible.
+    states = np.stack([A[2], B[2]], axis=1)
+    new_state = np.max(states, axis=1)
+    result.append(new_state)
+    return result
 
 
 def smap(func_args):
@@ -264,53 +286,45 @@ def generate_gpu_func(
     """
     args = [f"a{i}" for i in range(n_properties)]
     sim_loop = ""
+    step_sources = ""
     for breed_idx_2_step_func in breed_idx_2_step_func_by_priority:
         for breedidx, breed_step_func in breed_idx_2_step_func.items():
             step_source = inspect.getsource(breed_step_func)
+            step_sources += "\n\n@jit.rawkernel(device='cuda')\n" + step_source
             step_func_name = getattr(breed_step_func, "__name__", repr(callable))
-            step_source = "\t\t\t\t".join(step_source.splitlines(True))
+            #step_source = step_source.splitlines(True)
             sim_loop += f"""
-            \n\t\t\tif breed_id == {breedidx}:
-            \n\t\t\t\t{step_source}
-            \t{step_func_name}(
-            \t\tagent_id,
-            \t\tagents_index_in_subcontext,
-            \t\trng_states,
-            \t\tdevice_global_data_vector,
-            \t\t{','.join(args)},
-            \t)
-            g.sync()
+            \n\t\t\t\tif breed_id == {breedidx}:
+            \t\t{step_func_name}(
+            \t\t\tagent_id,
+            \t\t\tagents_index_in_subcontext,
+            \t\t\tdevice_global_data_vector,
+            \t\t\t{','.join(args)},
+            \t\t)
             #cuda.syncthreads()
 
             """
     func = f"""
-    \nfrom numba import cuda
-    \nfrom sagesim.step_func_utils import *
-    \n@cuda.jit\ndef stepfunc(
+    \nfrom random import random
+    \nfrom cupyx import jit
+    \n\n{step_sources}
+    \n\n@jit.rawkernel()
+def stepfunc(
     device_global_data_vector,
     {','.join(args)},
     sync_workers_every_n_ticks,
     agent_ids,
     agents_index_in_subcontext,
-    rng_states,
     ):
-        thread_id = int(cuda.grid(1))
-        g = cuda.cg.this_grid()
-        agent_id = thread_id
-        if agent_id >= len(a0):
-            return
-        valid = False
-        for i in range(len(agent_ids)):
-            if agent_id == agent_ids[i]:
-                valid = True
-                break
-        if not valid:
-            return
-        breed_id = a0[agent_id]
-        for tick in range(sync_workers_every_n_ticks):
-            {sim_loop}
-            if thread_id == 0:
-                device_global_data_vector[0] += 1
+        thread_id = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x
+        #g = cuda.cg.this_grid()
+        agent_id = thread_id        
+        if agent_id < agent_ids.shape[0]:
+            breed_id = a0[agent_id]                
+            for tick in range(sync_workers_every_n_ticks):
+                {sim_loop}                
+                if thread_id == 0:
+                    device_global_data_vector[0] += 1
     """
     func = func.replace("\t", "    ")
     return func  # compile(func, "<string>", "exec")
@@ -319,9 +333,9 @@ def generate_gpu_func(
 # Define worker coroutine that executes cuda kernel
 # ------------------------------------------------------
 def worker_coroutine(
+    agent_ids,
     global_data_vector,
     agent_data_tensors,
-    agent_ids,
     neighbor_compute_func,
     sync_workers_every_n_ticks,
 ):
@@ -342,54 +356,60 @@ def worker_coroutine(
         the simulation by
     :param agent_ids: agents to process by this cudakernel call
     """
+     
     # Contextualize
     # Import the package using module package
     step_func_module = importlib.import_module(os.path.splitext(Model.STEPFUNCPATH)[0])
 
     # Access the step function using the module
     step_func = step_func_module.stepfunc
-
+    
     threadsperblock = 32
     blockspergrid = int(math.ceil(len(agent_ids) / threadsperblock))
-    rng_states = create_xoroshiro128p_states(threadsperblock * blockspergrid, seed=1)
+    rng_states = None#create_xoroshiro128p_states(threadsperblock * blockspergrid, seed=1)
     start = time.time()
-    all_neighbors = np.unique(neighbor_compute_func(agent_data_tensors[1], agent_ids))
-    # ...
 
+
+
+    # Get all neighbors of agents in agent_ids
     all_neighbors = np.unique(neighbor_compute_func(agent_data_tensors[1], agent_ids))
     all_neighbors = all_neighbors[~np.isnan(all_neighbors)].astype(int)
+    
+    # Contextualize agent data tensors
     (
-        agents_index_in_subcontext,
-        agent_data_tensors,
+        agent_ids_in_subcontext,
+        agent_index_in_subcontextualized_adts,
+        contextualized_agent_data_tensors,
     ) = contextualize_agent_data_tensors(agent_data_tensors, all_neighbors, agent_ids)
-    # sync_workers_every_n_ticks block of time on a worker
-
+    
     # Pickling won't work on ctypes so have to let the
     # dask worker send the ADTs and GDT to GPU device
-    device_global_data_vector = cuda.to_device(global_data_vector)
-    device_agent_data_tensors = [cuda.to_device(adt) for adt in agent_data_tensors]
-    device_agent_ids = cuda.to_device(agent_ids)
+    device_global_data_vector = cupy.asarray(global_data_vector)
+    device_agent_data_tensors_subcontext = [cupy.asarray(adt) for adt in contextualized_agent_data_tensors]
+    device_agent_ids = cupy.asarray(agent_ids)
+
     # TODO document what this does
-    device_agents_index_in_subcontext = cuda.to_device(agents_index_in_subcontext)
+    device_agents_index_in_subcontext = cupy.asarray(agent_index_in_subcontextualized_adts)
     # Execute cuda kernel. Unfortunately this seems to have to also
     # be performed in a string
     step_func[blockspergrid, threadsperblock](
         device_global_data_vector,
-        *device_agent_data_tensors,
+        *device_agent_data_tensors_subcontext,
         sync_workers_every_n_ticks,
         device_agent_ids,
         device_agents_index_in_subcontext,
-        rng_states,
     )
-    cuda.synchronize()
+
+    #cuda.synchronize()
     # TODO consider using update_agents_properties as it's
     # best case time complexity is lower than copy_to_host()
-    agent_subcontext_indices = agents_index_in_subcontext[agent_ids].astype(int)
+    #agent_subcontext_indices = agent_index_in_subcontextualized_adts[agent_ids].astype(int)    
+    for i in range(len(agent_data_tensors)):
+        agent_data_tensors[i][agent_ids_in_subcontext] = cp.asnumpy(device_agent_data_tensors_subcontext[i])
+
     return (
-        device_global_data_vector.copy_to_host(),
-        [
-            adt.copy_to_host()[agent_subcontext_indices]
-            for adt in device_agent_data_tensors
-        ],
+        device_global_data_vector,
+        agent_data_tensors,
         agent_ids,
     )
+

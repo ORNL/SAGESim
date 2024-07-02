@@ -14,7 +14,7 @@ setup(
     long_description_content_type="text/markdown",
     project_urls={"Source": "https://code.ornl.gov/sagesim/sagesim"},
     install_requires=[
-        "numba==0.53.1",
+        "cupy",
         "numpy==1.21.6",
         "tqdm==4.64.1",
         "distributed==2021.7.1",

@@ -9,7 +9,7 @@ import time
 # from multiprocessing import shared_memory
 
 import numpy as np
-from numba import cuda
+import cupy as cp
 from tqdm import tqdm
 
 from sagesim.breed import Breed
@@ -194,7 +194,7 @@ class AgentFactory:
     def generate_agent_data_tensors(
         self,  # , use_cuda=True, distributed=False
     ) -> Union[
-        List[cuda.cudadrv.devicearray.DeviceNDArray],
+        List[cp.ndarray],
         Dict[str, np.array[Any]],
     ]:
         converted_agent_data_tensors = []
@@ -288,6 +288,7 @@ def contextualize_agent_data_tensors(
             agents_index_in_subcontext.append(int(index_in_subcontext))
             index_in_subcontext += 1
     return (
+        np.array(agent_ids_in_subcontext),
         np.array(agents_index_in_subcontext),
         agent_data_tensors_subcontext,
     )

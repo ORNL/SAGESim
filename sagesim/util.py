@@ -4,7 +4,7 @@ import math
 
 import numpy as np
 
-from dask.distributed import Client, LocalCluster
+from distributed import Client, LocalCluster, get_client
 
 
 def convert_to_equal_side_tensor(
@@ -71,18 +71,19 @@ def compress_tensor(arr: Iterable, level: int = 0):
 def init_dask_cluster(
     num_workers: int, scheduler_fpath: Optional[str] = None
 ) -> Client:
-    cluster = LocalCluster(n_workers=num_workers)
-    # 1. Connects to the dask-cuda-cluster
-    client = (
-        Client(scheduler_file=scheduler_fpath)
-        if scheduler_fpath
-        else cluster.get_client()
-    )
-    print("client information ", client)
+    if scheduler_fpath:
+        
+        client = Client(scheduler_file=scheduler_fpath)
+    else:
+        print("Starting LocalCluster")
+        cluster = LocalCluster(n_workers=num_workers)
+        # 1. Connects to the dask-cuda-cluster
+        client = Client(cluster)
+        print("client information ", client)
 
-    # 2. Blocks until num_workers are ready
-    print("Waiting for " + str(num_workers) + " workers...")
-    client.wait_for_workers(n_workers=num_workers)
+        # 2. Blocks until num_workers are ready
+        print("Waiting for " + str(num_workers) + " workers...")
+        client.wait_for_workers(n_workers=num_workers)
 
     workers_info = client.scheduler_info()["workers"]
     connected_workers = len(workers_info)
