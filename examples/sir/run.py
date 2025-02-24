@@ -1,6 +1,6 @@
 import argparse
-from examples.sir.sir_model import SIRModel
-from examples.sir.state import SIRState
+from sir_model import SIRModel
+from state import SIRState
 from mpi4py import MPI
 
 from random import sample
@@ -53,7 +53,7 @@ def generate_small_world_of_agents(
     for n in network.nodes:
         model.create_agent(SIRState.SUSCEPTIBLE.value)
 
-    for n in sample(network.nodes, num_infected):
+    for n in sample(sorted(network.nodes), num_infected):
         model.set_agent_property_value(n, "state", SIRState.INFECTED.value)
 
     for edge in network.edges:

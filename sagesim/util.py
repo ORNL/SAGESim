@@ -4,8 +4,6 @@ import math
 
 import numpy as np
 
-from distributed import Client, LocalCluster, get_client
-
 
 def convert_to_equal_side_tensor(
     tensor: List[Any], max_dims: Optional[Tuple[int]] = None
@@ -67,32 +65,3 @@ def compress_tensor(arr: Iterable, level: int = 0):
         else:
             return [] if level else None
 
-
-def init_dask_cluster(
-    num_workers: int, scheduler_fpath: Optional[str] = None
-) -> Client:
-    if scheduler_fpath:
-        
-        client = Client(scheduler_file=scheduler_fpath)
-    else:
-        print("Starting LocalCluster")
-        cluster = LocalCluster(n_workers=num_workers)
-        # 1. Connects to the dask-cuda-cluster
-        client = Client(cluster)
-        print("client information ", client)
-
-        # 2. Blocks until num_workers are ready
-        print("Waiting for " + str(num_workers) + " workers...")
-        client.wait_for_workers(n_workers=num_workers)
-
-    workers_info = client.scheduler_info()["workers"]
-    connected_workers = len(workers_info)
-
-    print(str(connected_workers) + " workers connected")
-    print(f"workers_info: {workers_info}")
-
-    return client
-
-
-def submit_to_dask_cluster():
-    pass

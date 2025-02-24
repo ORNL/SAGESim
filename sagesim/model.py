@@ -3,25 +3,18 @@ SuperNeuroABM basic Model class
 
 """
 
-from functools import partial
-from typing import Dict, List, Callable, Set, Any, Union, Optional
+from typing import Dict, List, Callable, Set, Any, Union
 import math
 import heapq
-from multiprocessing import Pool, Manager
 import inspect
 import time
 import numpy as np
 import cupy as cp
-import tempfile
-from importlib import util
 import importlib.machinery
 import importlib
 import os
 
 import cupy
-from cupyx import jit
-from tqdm import tqdm
-from distributed import get_worker, get_client
 from mpi4py import MPI
 
 from sagesim.agent import (
@@ -366,10 +359,6 @@ def worker_coroutine(
     
     threadsperblock = 32
     blockspergrid = int(math.ceil(len(agent_ids) / threadsperblock))
-    rng_states = None#create_xoroshiro128p_states(threadsperblock * blockspergrid, seed=1)
-    start = time.time()
-
-
 
     # Get all neighbors of agents in agent_ids
     all_neighbors = np.unique(neighbor_compute_func(agent_data_tensors[1], agent_ids))

@@ -10,7 +10,6 @@ import time
 
 import numpy as np
 import cupy as cp
-from tqdm import tqdm
 
 from sagesim.breed import Breed
 from sagesim.util import (
