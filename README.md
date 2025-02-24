@@ -1,3 +1,36 @@
-<img src="SAGESim-inline-tag-color.png" alt="SAGESim: Scalable Agent-based GPU Enabled Simulator" height="200"/>
+# SAGESim
+
+Scalable Agent-based GPU Enabled Simulator
+
+# Requirements
+
+ - Python 3.7+
+ - `conda create -n sagesimenv python=3.9`
+ - `conda activate sagesimenv`
+ - Install CUDA toolkit
+ - - https://developer.nvidia.com/cuda-toolkit
+ - - https://rocm.docs.amd.com/projects/install-on-linux/en/docs-6.0.2/
+ - - [Install using Anaconda](`conda install -c anaconda cudatoolkit`)
+ - install mpi4py (Recommend using conda): https://mpi4py.readthedocs.io/en/stable/install.html#using-conda
+ - [Follow the instructions here to install CuPy](https://docs.cupy.dev/en/stable/install.html)
+ - `pip install -r requirements.txt`
+ 
+# Run Example
+
+ - `git clone https://code.ornl.gov/sagesim/sagesim`
+ - `export PYTHONPATH=/path/to/clone_repo`
+ - `cd /path/to/clone_repo/examples/sir`
+ - `mpiexec -n 4 python run.py`
+
+# Unit Tests
+
+To run unit tests, `cd` to root dir and run:
+
+`python -m unittest tests.simple_agent_test`
 
 
+# There are some unfortunate quirks to using CuPy:
+ - nan checked by inequality to self. Unfortunate limitation of cupyx.
+ - Dicts and objects are unsupported.
+ - *args and **kwargs are unsupported.
+ - nested functions are unsupported.
