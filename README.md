@@ -37,3 +37,4 @@ To run unit tests, `cd` to root dir and run:
  - Be sure to use `cupy` data types and array routines in favor of `numpy`: [https://docs.cupy.dev/en/stable/reference/routines.html]
  - `for` loops must use range iterator only. No 'for each' style loops.
  - `return` does not seem to work well either
+ - `break` and `continue` are unsupported!
