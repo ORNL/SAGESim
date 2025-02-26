@@ -29,9 +29,11 @@ To run unit tests, `cd` to root dir and run:
 `python -m unittest tests.simple_agent_test`
 
 
-# There are some unfortunate quirks to using CuPy:
+# There are some unfortunate quirks to using CuPyx `jit.rawkernel`:
  - nan checked by inequality to self. Unfortunate limitation of cupyx.
  - Dicts and objects are unsupported.
  - *args and **kwargs are unsupported.
  - nested functions are unsupported.
- - Be sure to use `cupy` data types and array routines in favor of `numpy`: [https://docs.cupy.dev/en/stable/reference/routines.html] 
+ - Be sure to use `cupy` data types and array routines in favor of `numpy`: [https://docs.cupy.dev/en/stable/reference/routines.html]
+ - `for` loops must use range iterator only. No 'for each' style loops.
+ - `return` does not seem to work well either
