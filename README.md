@@ -34,3 +34,4 @@ To run unit tests, `cd` to root dir and run:
  - Dicts and objects are unsupported.
  - *args and **kwargs are unsupported.
  - nested functions are unsupported.
+ - Be sure to use `cupy` data types and array routines in favor of `numpy`: [https://docs.cupy.dev/en/stable/reference/routines.html] 
