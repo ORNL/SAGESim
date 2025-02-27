@@ -21,8 +21,6 @@ class SIRBreed(Breed):
 
     
 def step_func(id, id2index, globals, breeds, locations, states):
-    def my_func(a):
-        a[0] = 3
     #agent_index = step_func_helper_get_agent_index(id, id2index)
     # nan checked by inequality to self. Unfortunate limitation of cupyx
     if (id == id) and (id2index[int(id)] == id2index[int(id)]):
@@ -42,5 +40,3 @@ def step_func(id, id2index, globals, breeds, locations, states):
                     if neighbor_state == 2 and rand < p_infection:
                         states[agent_index] = 2.0
 
-        
-        my_func(states)
