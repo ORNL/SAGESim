@@ -2,12 +2,12 @@ import time
 from typing import Iterable, List, Any, Tuple, Optional
 import math
 
-import numpy as np
+import cupy as cp
 
 
 def convert_to_equal_side_tensor(
     tensor: List[Any], max_dims: Optional[Tuple[int]] = None
-) -> np.array:
+) -> cp.array:
     dim2maxlen = {}
 
     def find_max_depth(l, curr_depth=0):
@@ -25,9 +25,9 @@ def convert_to_equal_side_tensor(
         max_dims = tuple(list(dim2maxlen.values()))
 
     if len(max_dims) > 1 and max_dims[1] == 0:
-        return np.full(shape=max_dims[0], fill_value=math.nan)
+        return cp.full(shape=max_dims[0], fill_value=math.nan)
 
-    answer = np.full(shape=max_dims, fill_value=math.nan)
+    answer = cp.full(shape=max_dims, fill_value=math.nan)
 
     def fill_arr(arr, coord):
         if len(coord) == len(max_dims):
@@ -46,7 +46,7 @@ def convert_to_equal_side_tensor(
 
 def compress_tensor(arr: Iterable, level: int = 0):
     if not hasattr(arr, "__iter__") and not hasattr(arr, "__cuda_array_interface__"):
-        if not np.isnan(arr):
+        if not cp.isnan(arr):
             return arr
         else:
             return None
@@ -64,4 +64,3 @@ def compress_tensor(arr: Iterable, level: int = 0):
             return new_arr
         else:
             return [] if level else None
-
