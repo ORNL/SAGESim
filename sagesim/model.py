@@ -7,11 +7,12 @@ from typing import Dict, List, Callable, Set, Any, Union
 import math
 import heapq
 import inspect
+import cupy as cp
 import importlib.machinery
 import importlib
 import os
 
-import cupy as cp
+import cupy
 from mpi4py import MPI
 
 from sagesim.agent import (
@@ -363,14 +364,14 @@ def worker_coroutine(
 
     # Pickling won't work on ctypes so have to let the
     # dask worker send the ADTs and GDT to GPU device
-    device_global_data_vector = cp.asarray(global_data_vector)
+    device_global_data_vector = cupy.asarray(global_data_vector)
     device_agent_data_tensors_subcontext = [
-        cp.asarray(adt) for adt in contextualized_agent_data_tensors
+        cupy.asarray(adt) for adt in contextualized_agent_data_tensors
     ]
-    device_agent_ids = cp.asarray(agent_ids)
+    device_agent_ids = cupy.asarray(agent_ids)
 
     # TODO document what this does
-    device_agents_index_in_subcontext = cp.asarray(
+    device_agents_index_in_subcontext = cupy.asarray(
         agent_index_in_subcontextualized_adts
     )
     # Execute cuda kernel. Unfortunately this seems to have to also
