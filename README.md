@@ -38,3 +38,4 @@ To run unit tests, `cd` to root dir and run:
  - `for` loops must use range iterator only. No 'for each' style loops.
  - `return` does not seem to work well either
  - `break` and `continue` are unsupported!
+ - Cannot reassign variables within `if` or `for` statements. Must be assigned at top level of function or new variable declared under subscope.
