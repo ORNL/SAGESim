@@ -8,7 +8,7 @@ import time
 
 # from multiprocessing import shared_memory
 
-import cupy as cp
+import numpy as np
 
 from sagesim.breed import Breed
 from sagesim.util import (
@@ -192,11 +192,11 @@ class AgentFactory:
     def generate_agent_data_tensors(
         self,  # , use_cuda=True, distributed=False
     ) -> Union[
-        List[cp.ndarray],
-        Dict[str, cp.array[Any]],
+        List[np.ndarray],
+        Dict[str, np.array[Any]],
     ]:
         converted_agent_data_tensors = []
-        dtype = cp.float64
+        dtype = np.float64
         for property_name in self._property_name_2_agent_data_tensor.keys():
             adt = self._property_name_2_agent_data_tensor[property_name]
             max_dims = self._property_name_2_max_dims.get(property_name, None)
@@ -272,8 +272,8 @@ def contextualize_agent_data_tensors(
             agents_index_in_subcontext.append(int(index_in_subcontext))
             index_in_subcontext += 1
     return (
-        cp.array(agent_ids_in_subcontext),
-        cp.array(agents_index_in_subcontext),
+        np.array(agent_ids_in_subcontext),
+        np.array(agents_index_in_subcontext),
         agent_data_tensors_subcontext,
     )
 
@@ -303,7 +303,7 @@ def decontextualize_agent_data_tensors(
     total_num_agents = len(previous_agent_data_tensors_full[0])
     processed_set = set(agents_to_be_processed)
     counter = 0
-    agents_index_in_partition_of_prev = cp.full(
+    agents_index_in_partition_of_prev = np.full(
         (total_num_agents,), math.nan, dtype=int
     )
     for agent_id in range(total_num_agents):

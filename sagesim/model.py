@@ -13,6 +13,7 @@ import importlib
 import os
 
 import cupy
+import numpy as np
 from mpi4py import MPI
 
 from sagesim.agent import (
@@ -188,8 +189,8 @@ class Model:
 
 
 def reduce_global_data_vector(A, B):
-    values = cp.stack([A, B], axis=1)
-    return cp.max(values, axis=1)
+    values = np.stack([A, B], axis=1)
+    return np.max(values, axis=1)
 
 
 def reduce_agent_data_tensors_(A, B):
@@ -199,8 +200,8 @@ def reduce_agent_data_tensors_(A, B):
     # network would be same as first
     result.append(A[1])
     # state would be max value. Infected superceeds susceptible.
-    states = cp.stack([A[2], B[2]], axis=1)
-    new_state = cp.max(states, axis=1)
+    states = np.stack([A[2], B[2]], axis=1)
+    new_state = np.max(states, axis=1)
     result.append(new_state)
     return result
 
@@ -352,8 +353,8 @@ def worker_coroutine(
     blockspergrid = int(math.ceil(len(agent_ids) / threadsperblock))
 
     # Get all neighbors of agents in agent_ids
-    all_neighbors = cp.unique(neighbor_compute_func(agent_data_tensors[1], agent_ids))
-    all_neighbors = all_neighbors[~cp.isnan(all_neighbors)].astype(int)
+    all_neighbors = np.unique(neighbor_compute_func(agent_data_tensors[1], agent_ids))
+    all_neighbors = all_neighbors[~np.isnan(all_neighbors)].astype(int)
 
     # Contextualize agent data tensors
     (
@@ -364,14 +365,14 @@ def worker_coroutine(
 
     # Pickling won't work on ctypes so have to let the
     # dask worker send the ADTs and GDT to GPU device
-    device_global_data_vector = cupy.asarray(global_data_vector)
+    device_global_data_vector = cp.asarray(global_data_vector)
     device_agent_data_tensors_subcontext = [
-        cupy.asarray(adt) for adt in contextualized_agent_data_tensors
+        cp.asarray(adt) for adt in contextualized_agent_data_tensors
     ]
-    device_agent_ids = cupy.asarray(agent_ids)
+    device_agent_ids = cp.asarray(agent_ids)
 
     # TODO document what this does
-    device_agents_index_in_subcontext = cupy.asarray(
+    device_agents_index_in_subcontext = cp.asarray(
         agent_index_in_subcontextualized_adts
     )
     # Execute cuda kernel. Unfortunately this seems to have to also
@@ -389,9 +390,7 @@ def worker_coroutine(
     # best case time complexity is lower than copy_to_host()
     # agent_subcontext_indices = agent_index_in_subcontextualized_adts[agent_ids].astype(int)
     for i in range(len(agent_data_tensors)):
-        agent_data_tensors[i][agent_ids_in_subcontext] = cp.asnumpy(
-            device_agent_data_tensors_subcontext[i]
-        )
+        agent_data_tensors[i][agent_ids_in_subcontext] = device_agent_data_tensors_subcontext[i].get()
 
     return (
         device_global_data_vector,
