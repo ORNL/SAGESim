@@ -22,12 +22,6 @@ Scalable Agent-based GPU Enabled Simulator
  - `cd /path/to/clone_repo/examples/sir`
  - `mpiexec -n 4 python run.py`
 
-# Unit Tests
-
-To run unit tests, `cd` to root dir and run:
-
-`python -m unittest tests.simple_agent_test`
-
 
 # There are some unfortunate quirks to using CuPyx `jit.rawkernel`:
  - nan checked by inequality to self. Unfortunate limitation of cupyx.
