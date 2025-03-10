@@ -7,6 +7,9 @@ from cupyx import jit
 
 
 
+import cupy as cp
+import math
+
 @jit.rawkernel(device='cuda')
 def step_func(id, id2index, globals, breeds, locations, states):
     #agent_index = step_func_helper_get_agent_index(id, id2index)

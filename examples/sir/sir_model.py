@@ -1,7 +1,7 @@
 from sagesim.model import Model
 from sagesim.space import NetworkSpace
-from examples.sir.sir_breed import SIRBreed
-from examples.sir.state import SIRState
+from sir_breed import SIRBreed
+from state import SIRState
 
 
 class SIRModel(Model):

@@ -1,7 +1,7 @@
 from random import random 
 
 from sagesim.breed import Breed
-from examples.sir.state import SIRState
+from state import SIRState
 from cupyx import jit
 
 global INFECTED

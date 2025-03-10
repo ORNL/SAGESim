@@ -1,3 +1,4 @@
+from time import time
 import argparse
 from sir_model import SIRModel
 from state import SIRState
@@ -47,9 +48,9 @@ def test_network():
 
 
 def generate_small_world_of_agents(
-    model, n_agents: int, num_infected: float
+        model, num_agents: int, num_init_connections: int, num_infected: int
 ) -> SIRModel:
-    network = generate_small_world_network(n_agents, 2, 0.2)
+    network = generate_small_world_network(num_agents, num_init_connections, 0.2)
     for n in network.nodes:
         model.create_agent(SIRState.SUSCEPTIBLE.value)
 
@@ -65,27 +66,48 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--scheduler_fpath",
-        help="Optional path to scheduler path of Dask cluster",
-        required=False,
+        "--num_agents",
+        type=int,
+    )
+    parser.add_argument(
+        "--num_init_connections",
+        type=int,
+    )
+    parser.add_argument(
+        "--num_nodes",
+        type=int,
     )
     args = parser.parse_args()
 
     model = SIRModel()
     model.setup(use_gpu=True)
-    n_agents = 1000
-    model = generate_small_world_of_agents(model, n_agents, 1)  # test_network()  #
+    num_agents = args.num_agents
+    num_init_connections = args.num_init_connections
+    
+    model_creation_start = time()
+    model = generate_small_world_of_agents(model, num_agents, num_init_connections, int(0.1*num_agents))  # test_network()  #
+    model_creation_end = time()
+    model_creation_duration = model_creation_end - model_creation_start
     """print(
         [
             SIRState(model.get_agent_property_value(agent_id, property_name="state"))
             for agent_id in range(n_agents)
         ]
     )"""
+    
+    simulate_start = time()
     model.simulate(100, sync_workers_every_n_ticks=1)
-    if worker == 0:
+    simulate_end = time()
+    simulate_duration = simulate_end - simulate_start
+
+    with open("execution_times.csv", "a") as f:
+        f.write(f"{num_agents}, {num_init_connections}, {num_nodes}, {num_workers}, {model_creation_duration}, {simulate_duration}")
+    
+    """if worker == 0:
         print(
             [
                 SIRState(model.get_agent_property_value(agent_id, property_name="state"))
                     for agent_id in range(n_agents)
             ]
         )
+    """

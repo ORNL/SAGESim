@@ -13,5 +13,5 @@ setup(
     long_description="""A GPU-based general purpose multi-agent simulation framework.""",
     long_description_content_type="text/markdown",
     project_urls={"Source": "https://code.ornl.gov/sagesim/sagesim"},
-    install_requires=["cupy-cuda12x==13.3.0", "tqdm==4.67.1", "networkx>=3.4.2"],
+    install_requires=["tqdm==4.67.1", "networkx>=3.4.2"],
 )
