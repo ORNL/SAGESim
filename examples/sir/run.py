@@ -48,7 +48,7 @@ def test_network():
 
 
 def generate_small_world_of_agents(
-        model, num_agents: int, num_init_connections: int, num_infected: int
+    model, num_agents: int, num_init_connections: int, num_infected: int
 ) -> SIRModel:
     network = generate_small_world_network(num_agents, num_init_connections, 0.2)
     for n in network.nodes:
@@ -63,7 +63,7 @@ def generate_small_world_of_agents(
 
 
 if __name__ == "__main__":
-    
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--num_agents",
@@ -83,9 +83,12 @@ if __name__ == "__main__":
     model.setup(use_gpu=True)
     num_agents = args.num_agents
     num_init_connections = args.num_init_connections
-    
+    num_nodes = args.num_nodes
+
     model_creation_start = time()
-    model = generate_small_world_of_agents(model, num_agents, num_init_connections, int(0.1*num_agents))  # test_network()  #
+    model = generate_small_world_of_agents(
+        model, num_agents, num_init_connections, int(0.1 * num_agents)
+    )  # test_network()  #
     model_creation_end = time()
     model_creation_duration = model_creation_end - model_creation_start
     """print(
@@ -94,15 +97,17 @@ if __name__ == "__main__":
             for agent_id in range(n_agents)
         ]
     )"""
-    
+
     simulate_start = time()
     model.simulate(100, sync_workers_every_n_ticks=1)
     simulate_end = time()
     simulate_duration = simulate_end - simulate_start
 
     with open("execution_times.csv", "a") as f:
-        f.write(f"{num_agents}, {num_init_connections}, {num_nodes}, {num_workers}, {model_creation_duration}, {simulate_duration}")
-    
+        f.write(
+            f"{num_agents}, {num_init_connections}, {num_nodes}, {num_workers}, {model_creation_duration}, {simulate_duration}"
+        )
+
     """if worker == 0:
         print(
             [
