@@ -9,8 +9,6 @@ import time
 # from multiprocessing import shared_memory
 
 import numpy as np
-from numba import cuda
-from tqdm import tqdm
 
 from sagesim.breed import Breed
 from sagesim.util import (
@@ -194,7 +192,7 @@ class AgentFactory:
     def generate_agent_data_tensors(
         self,  # , use_cuda=True, distributed=False
     ) -> Union[
-        List[cuda.cudadrv.devicearray.DeviceNDArray],
+        List[np.ndarray],
         Dict[str, np.array[Any]],
     ]:
         converted_agent_data_tensors = []
@@ -205,22 +203,6 @@ class AgentFactory:
             if max_dims != None:
                 max_dims = [self.num_agents] + max_dims
             adt = convert_to_equal_side_tensor(adt, max_dims)
-            """if use_cuda:
-                if not distributed:
-                    adt = cuda.to_device(adt)
-            else:
-                # TODO fix shared memory usage
-                if False:
-                    d_size = np.dtype(dtype).itemsize * np.prod(adt.shape)
-                    shm = shared_memory.SharedMemory(
-                        create=True,
-                        size=d_size,
-                        name=f"npshared{property_name}",
-                    )
-                    dst = np.ndarray(
-                        shape=adt.shape, dtype=dtype, buffer=shm.buf
-                    )
-                    dst[:] = adt[:]"""
             converted_agent_data_tensors.append(adt)
 
         return converted_agent_data_tensors
@@ -270,7 +252,9 @@ def contextualize_agent_data_tensors(
         3. agent_data_tensors_subcontexts: subcontext of agent_data_tensors
             required by agents of agent_ids_chunks to be processed by a worker
     """
-    agent_ids_in_subcontext = set.union(set(agent_ids_chunk), set(all_neighbors))
+    agent_ids_in_subcontext = set.union(
+        set(agent_ids_chunk), set(all_neighbors.tolist())
+    )
     """for agent_id in agent_ids_chunk:
         agent_ids_in_subcontext.add(agent_id)
         neighbors = all_neighbors.get(agent_id, set())
@@ -288,6 +272,7 @@ def contextualize_agent_data_tensors(
             agents_index_in_subcontext.append(int(index_in_subcontext))
             index_in_subcontext += 1
     return (
+        np.array(agent_ids_in_subcontext).astype(int),
         np.array(agents_index_in_subcontext),
         agent_data_tensors_subcontext,
     )

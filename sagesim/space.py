@@ -9,8 +9,6 @@ workers, which is the crux of load balancing...
 
 from typing import List, Any
 
-from numba import cuda
-
 
 class Space:
     """

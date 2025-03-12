@@ -13,10 +13,5 @@ setup(
     long_description="""A GPU-based general purpose multi-agent simulation framework.""",
     long_description_content_type="text/markdown",
     project_urls={"Source": "https://code.ornl.gov/sagesim/sagesim"},
-    install_requires=[
-        "numba==0.53.1",
-        "numpy==1.21.6",
-        "tqdm==4.64.1",
-        "distributed==2021.7.1",
-    ],
+    install_requires=["tqdm==4.67.1", "networkx>=3.4.2"],
 )

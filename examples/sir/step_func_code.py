@@ -1,25 +1,16 @@
-from random import random 
-
-from sagesim.breed import Breed
-from state import SIRState
-from cupyx import jit
-
-global INFECTED
-INFECTED = SIRState.INFECTED.value
-global SUSCEPTIBLE
-SUSCEPTIBLE = SIRState.SUSCEPTIBLE.value
-
-
-class SIRBreed(Breed):
-
-    def __init__(self) -> None:
-        name = "SIR"
-        super().__init__(name)
-        self.register_property("state", SIRState.SUSCEPTIBLE.value)
-        self.register_step_func(step_func)
-
 
     
+from random import random
+    
+from cupyx import jit
+    
+
+
+
+import cupy as cp
+import math
+
+@jit.rawkernel(device='cuda')
 def step_func(id, id2index, globals, breeds, locations, states):
     #agent_index = step_func_helper_get_agent_index(id, id2index)
     # nan checked by inequality to self. Unfortunate limitation of cupyx
@@ -40,3 +31,34 @@ def step_func(id, id2index, globals, breeds, locations, states):
                     if neighbor_state == 2 and rand < p_infection:
                         states[agent_index] = 2.0
 
+    
+
+@jit.rawkernel()
+def stepfunc(
+    device_global_data_vector,
+    a0,a1,a2,
+    sync_workers_every_n_ticks,
+    agent_ids,
+    agents_index_in_subcontext,
+    ):
+        thread_id = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x
+        #g = cuda.cg.this_grid()
+        agent_id = thread_id        
+        if agent_id < agent_ids.shape[0]:
+            breed_id = a0[agent_id]                
+            for tick in range(sync_workers_every_n_ticks):
+                
+            
+                if breed_id == 0:
+                    step_func(
+                        agent_id,
+                        agents_index_in_subcontext,
+                        device_global_data_vector,
+                        a0,a1,a2,
+                    )
+            #cuda.syncthreads()
+
+                            
+                if thread_id == 0:
+                    device_global_data_vector[0] += 1
+    
