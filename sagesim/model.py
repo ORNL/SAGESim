@@ -4,15 +4,15 @@ SuperNeuroABM basic Model class
 """
 
 from typing import Dict, List, Callable, Set, Any, Union
-import math
-import heapq
 import inspect
-import cupy as cp
 import importlib.machinery
 import importlib
 import os
+import pickle
+import math
+import heapq
 
-import cupy
+import cupy as cp
 import numpy as np
 from mpi4py import MPI
 
@@ -186,6 +186,29 @@ class Model:
         self._agent_factory.update_agents_properties(self._agent_data_tensors)
 
         return
+
+    def save(self, app: "Model", fpath: str) -> None:
+        """
+        Saves model. Must be overridden if additional data
+        pertaining to application must be saved.
+
+        :param fpath: file path to save pickle file at
+        :param app_data: additional application data to be saved.
+        """
+        if "_agent_data_tensors" in app.__dict__:
+            del app.__dict__["_agent_data_tensors"]
+        with open(fpath, "wb") as fout:
+            pickle.dump(app, fout)
+
+    def load(self, fpath: str) -> "Model":
+        """
+        Loads model from pickle file.
+
+        :param fpath: file path to pickle file.
+        """
+        with open(fpath, "rb") as fin:
+            app = pickle.load(fin)
+        return app
 
 
 def reduce_global_data_vector(A, B):
@@ -390,7 +413,9 @@ def worker_coroutine(
     # best case time complexity is lower than copy_to_host()
     # agent_subcontext_indices = agent_index_in_subcontextualized_adts[agent_ids].astype(int)
     for i in range(len(agent_data_tensors)):
-        agent_data_tensors[i][agent_ids_in_subcontext] = device_agent_data_tensors_subcontext[i].get()
+        agent_data_tensors[i][agent_ids_in_subcontext] = (
+            device_agent_data_tensors_subcontext[i].get()
+        )
 
     return (
         device_global_data_vector,
