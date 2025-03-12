@@ -70,8 +70,8 @@ if __name__ == "__main__":
         type=int,
     )
     parser.add_argument(
-        "--num_init_connections",
-        type=int,
+        "--percent_init_connections",
+        type=float,
     )
     parser.add_argument(
         "--num_nodes",
@@ -82,7 +82,7 @@ if __name__ == "__main__":
     model = SIRModel()
     model.setup(use_gpu=True)
     num_agents = args.num_agents
-    num_init_connections = args.num_init_connections
+    num_init_connections = int(args.percent_init_connections * num_agents)
     num_nodes = args.num_nodes
 
     model_creation_start = time()
@@ -103,10 +103,11 @@ if __name__ == "__main__":
     simulate_end = time()
     simulate_duration = simulate_end - simulate_start
 
-    with open("execution_times.csv", "a") as f:
-        f.write(
-            f"{num_agents}, {num_init_connections}, {num_nodes}, {num_workers}, {model_creation_duration}, {simulate_duration}"
-        )
+    if worker == 0:
+        with open("execution_times.csv", "a") as f:
+            f.write(
+                f"{num_agents}, {num_init_connections}, {num_nodes}, {num_workers}, {model_creation_duration}, {simulate_duration}\n"
+            )
 
     """if worker == 0:
         print(
