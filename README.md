@@ -33,3 +33,4 @@ Scalable Agent-based GPU Enabled Simulator
  - `return` does not seem to work well either
  - `break` and `continue` are unsupported!
  - Cannot reassign variables within `if` or `for` statements. Must be assigned at top level of function or new variable declared under subscope.
+ -  `-1` indexing does not necessarily work as expected, as it will access the last element of the memory block of the array instead of the logical array. Use `len(my_array) - 1` instead
