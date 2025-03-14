@@ -24,13 +24,13 @@ def convert_to_equal_side_tensor(ragged_list: List[Any]) -> cp.ndarray:
     return ak.to_cupy(awkward_array)
 
 
-def compress_tensor(regular_tensor: cp.ndarray) -> List[Any]:
+def compress_tensor(regular_tensor: cp.ndarray, min_axis: int = 1) -> List[Any]:
     awkward_tensor = ak.from_cupy(regular_tensor)
     awkward_tensor = ak.nan_to_none(awkward_tensor)
     awkward_tensor = ak.drop_none(awkward_tensor)
 
     i = -1
-    while awkward_tensor.layout.minmax_depth[0] + i > 1:
+    while awkward_tensor.layout.minmax_depth[0] + i > min_axis:
         awkward_tensor = ak.mask(awkward_tensor, ak.num(awkward_tensor, axis=i) > 0)
         awkward_tensor = ak.drop_none(awkward_tensor)
         i -= 1

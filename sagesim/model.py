@@ -55,8 +55,8 @@ class Model:
 
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
         current_tick = self._global_data_vector[0]
-        self._agent_factory._update_agents_property(
-            self._agent_data_tensors, property_name, current_tick
+        self._agent_factory._update_agent_property(
+            self._agent_data_tensors, id, property_name, current_tick
         )
         return self._agent_factory.get_agent_property_value(
             property_name=property_name, agent_id=id

@@ -1,6 +1,6 @@
 from __future__ import annotations
 import math
-from typing import Any, Callable, List, Dict, Union, Tuple
+from typing import Any, Callable, Iterable, List, Dict, Union, Tuple
 from collections import OrderedDict
 from copy import copy
 from time import time
@@ -187,21 +187,27 @@ class AgentFactory:
 
         return converted_agent_data_tensors
 
-    def _update_agents_property(
+    def _update_agent_property(
         self,
         regularized_agent_data_tensors: List[cp.ndarray],
+        agent_id: int,
         property_name: str,
         tick: int,
     ) -> None:
-        if self._property_name_2_last_synced_at[property_name] < tick:
-            time_d = time()
-            property_idx = self._property_name_2_index[property_name]
-            adt = regularized_agent_data_tensors[property_idx]
-            self._property_name_2_agent_data_tensor[property_name] = compress_tensor(
-                adt
-            )
-            self._property_name_2_last_synced_at[property_name] = tick
-            print(f"Time to update agent properties: {time() - time_d:.6f} seconds")
+        # if self._property_name_2_last_synced_at[property_name] < tick:
+        time_d = time()
+        property_idx = self._property_name_2_index[property_name]
+        adt = regularized_agent_data_tensors[property_idx]
+        value = (
+            compress_tensor(adt[agent_id], min_axis=0)
+            if type(adt[agent_id]) == Iterable
+            else adt[agent_id]
+        )
+
+        self._property_name_2_agent_data_tensor[property_name][agent_id] = value
+        self._property_name_2_last_synced_at[property_name] = tick
+
+        #    print(f"Time to update agent properties: {time() - time_d:.6f} seconds")
 
 
 def contextualize_agent_data_tensors(
