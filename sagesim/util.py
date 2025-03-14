@@ -1,66 +1,38 @@
-import time
-from typing import Iterable, List, Any, Tuple, Optional
-import math
+from typing import List, Any
 
-import numpy as np
-
-
-def convert_to_equal_side_tensor(
-    tensor: List[Any], max_dims: Optional[Tuple[int]] = None
-) -> np.array:
-    dim2maxlen = {}
-
-    def find_max_depth(l, curr_depth=0):
-        dim2maxlen[curr_depth] = max(dim2maxlen.get(curr_depth, 0), len(l))
-        max_depth = curr_depth
-        for item in l:
-            if type(item) == list:
-                max_depth = max(max_depth, find_max_depth(item, curr_depth + 1))
-        return max_depth
-
-    start = time.time()
-    if not max_dims:
-        print("no dims specified... running find max depth")
-        find_max_depth(tensor)
-        max_dims = tuple(list(dim2maxlen.values()))
-
-    if len(max_dims) > 1 and max_dims[1] == 0:
-        return np.full(shape=max_dims[0], fill_value=math.nan)
-
-    answer = np.full(shape=max_dims, fill_value=math.nan)
-
-    def fill_arr(arr, coord):
-        if len(coord) == len(max_dims):
-            if type(arr) == list:
-                raise TypeError()
-            answer[tuple(coord)] = arr
-        else:
-            for i, item in enumerate(arr):
-                new_coord = coord + [i]
-                fill_arr(item, new_coord)
-
-    start = time.time()
-    fill_arr(tensor, [])
-    return answer
+import awkward as ak
+import cupy as cp
 
 
-def compress_tensor(arr: Iterable, level: int = 0):
-    if not hasattr(arr, "__iter__") and not hasattr(arr, "__cuda_array_interface__"):
-        if not np.isnan(arr):
-            return arr
-        else:
-            return None
-    else:
-        new_arr = []
-        for item in arr:
-            new_item = compress_tensor(item, level + 1)
-            if (
-                (not isinstance(new_item, Iterable) and new_item != None)
-                or (isinstance(new_item, Iterable) and len(new_item))
-                or level <= 0
-            ):
-                new_arr.append(new_item)
-        if len(new_arr):
-            return new_arr
-        else:
-            return [] if level else None
+def convert_to_equal_side_tensor(ragged_list: List[Any]) -> cp.ndarray:
+    awkward_array = ak.from_iter(ragged_list)
+    assert (
+        awkward_array.layout.minmax_depth[0] == awkward_array.layout.minmax_depth[1]
+    ), "Tensor is of unequal depth"
+
+    i = 1
+    while i < awkward_array.layout.minmax_depth[0]:
+        awkward_array = ak.fill_none(awkward_array, [], axis=i - 1)
+        nums_in_level = ak.fill_none(ak.ravel(ak.num(awkward_array, axis=i)), value=0)
+        awkward_array = ak.pad_none(
+            awkward_array, int(max(nums_in_level)), axis=i, clip=True
+        )
+        i += 1
+
+    awkward_array = ak.fill_none(awkward_array, cp.nan, axis=-1)
+
+    return ak.to_cupy(awkward_array)
+
+
+def compress_tensor(regular_tensor: cp.ndarray) -> List[Any]:
+    awkward_tensor = ak.from_cupy(regular_tensor)
+    awkward_tensor = ak.nan_to_none(awkward_tensor)
+    awkward_tensor = ak.drop_none(awkward_tensor)
+
+    i = -1
+    while awkward_tensor.layout.minmax_depth[0] + i > 1:
+        awkward_tensor = ak.mask(awkward_tensor, ak.num(awkward_tensor, axis=i) > 0)
+        awkward_tensor = ak.drop_none(awkward_tensor)
+        i -= 1
+
+    return ak.to_list(awkward_tensor)

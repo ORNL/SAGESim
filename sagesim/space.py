@@ -1,8 +1,8 @@
 """
-This file describes the different spaces that SAGESim agents 
-may exist in. Space is important in calculating proximity. 
-Promixity is important in approximating interactions. 
-Intractions are important when binning agents into 
+This file describes the different spaces that SAGESim agents
+may exist in. Space is important in calculating proximity.
+Promixity is important in approximating interactions.
+Intractions are important when binning agents into
 workers, which is the crux of load balancing...
 
 """
@@ -70,7 +70,6 @@ class NetworkSpace(Space):
             "locations",
             agent_0,
             self._locations[agent_0],
-            [len(self._locations[agent_0])],
         )
         if not directed:
             self._locations[agent_1].add(agent_0)
@@ -78,7 +77,6 @@ class NetworkSpace(Space):
                 "locations",
                 agent_1,
                 self._locations[agent_1],
-                [len(self._locations[agent_1])],
             )
 
     def disconnect_agents(
