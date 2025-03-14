@@ -22,10 +22,6 @@ from sagesim.agent import (
     decontextualize_agent_data_tensors,
     contextualize_agent_data_tensors,
 )
-from sagesim.util import (
-    compress_tensor,
-    convert_to_equal_side_tensor,
-)
 from sagesim.space import Space, NetworkSpace
 
 comm = MPI.COMM_WORLD
@@ -56,15 +52,9 @@ class Model:
             property_name=property_name, agent_id=id
         )
 
-    def set_agent_property_value(
-        self,
-        id: int,
-        property_name: str,
-        value: Any,
-        dims: List[int] = None,
-    ) -> None:
+    def set_agent_property_value(self, id: int, property_name: str, value: Any) -> None:
         self._agent_factory.set_agent_property_value(
-            property_name=property_name, agent_id=id, value=value, dims=dims
+            property_name=property_name, agent_id=id, value=value
         )
 
     def get_space(self) -> Space:
@@ -138,7 +128,7 @@ class Model:
 
         # TODO Remove the following commeneted code once Summit-tested
         # Generate agent data tensors
-        self._agent_data_tensors = self._agent_factory.generate_agent_data_tensors()
+        self._agent_data_tensors = self._agent_factory._generate_agent_data_tensors()
 
         if worker == 0:
             # Chunk agent ids
@@ -183,7 +173,7 @@ class Model:
                 worker_agent_data_tensors, op=reduce_agent_data_tensors
             )
 
-        self._agent_factory.update_agents_properties(self._agent_data_tensors)
+        self._agent_factory._update_agents_properties(self._agent_data_tensors)
 
         return
 

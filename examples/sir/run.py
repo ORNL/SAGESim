@@ -99,7 +99,7 @@ if __name__ == "__main__":
     )"""
 
     simulate_start = time()
-    model.simulate(100, sync_workers_every_n_ticks=1)
+    model.simulate(1000, sync_workers_every_n_ticks=1)
     simulate_end = time()
     simulate_duration = simulate_end - simulate_start
 

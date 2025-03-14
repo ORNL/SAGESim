@@ -1,14 +1,14 @@
 from __future__ import annotations
 import math
-from typing import Any, Callable, List, Dict, Optional, Union, Tuple
+from typing import Any, Callable, List, Dict, Union, Tuple
 from collections import OrderedDict
 from copy import copy
-import warnings
 import time
 
 # from multiprocessing import shared_memory
 
 import numpy as np
+import cupy as cp
 
 from sagesim.breed import Breed
 from sagesim.util import (
@@ -33,9 +33,6 @@ class AgentFactory:
                 "breed": 0,
                 "locations": self._space._locations_defaults,
             }
-        )
-        self._property_name_2_max_dims = OrderedDict(
-            {"breed": [], "locations": self._space._locations_max_dims}
         )
         self._agent_connectivity: Dict[int, Dict[int, float]] = {}
 
@@ -81,9 +78,6 @@ class AgentFactory:
         for property_name, default in breed.properties.items():
             self._property_name_2_agent_data_tensor[property_name] = []
             self._property_name_2_defaults[property_name] = default
-            self._property_name_2_max_dims[property_name] = breed._prop2maxdims[
-                property_name
-            ]
 
     def create_agent(self, breed: Breed, **kwargs) -> int:
         """
@@ -131,7 +125,6 @@ class AgentFactory:
         property_name: str,
         agent_id: int,
         value: Any,
-        dims: Optional[List[int]] = None,
     ) -> None:
         """
         Sets the property of property_name for the agent with agent_id with
@@ -139,31 +132,11 @@ class AgentFactory:
         :param property_name: str name of property as registered in the breed.
         :param agent_id: Agent's id as returned by create_agent
         :param value: New value for property
-        :param dims: Optional dimensions of property_value as List of ints. Not
-            required, but improves performance if provied. E.g. [0] if value is a
-            single number like 0, [4, 2] if it is a multi-dimensional list/array with
-            dimensions 4 and 2.
         """
 
         if property_name not in self._property_name_2_agent_data_tensor:
             raise ValueError(f"{property_name} not a property of any breed")
         self._property_name_2_agent_data_tensor[property_name][agent_id] = value
-        if dims != None:
-            if self._property_name_2_max_dims[property_name]:
-                if len(dims) != len(self._property_name_2_max_dims[property_name]):
-                    raise ValueError(
-                        f"Dimensions {dims} do not match exsiting number of dimensions of property {property_name} which is {len(dims)} for other agents"
-                    )
-                max_dims = self._property_name_2_max_dims.get(property_name, dims)
-                for i, dim in enumerate(dims):
-                    max_dims[i] = max(max_dims[i], dim)
-                self._property_name_2_max_dims[property_name] = max_dims
-            else:
-                self._property_name_2_max_dims[property_name] = dims
-        else:
-            warnings.warn(
-                "Performance reduced with no dimension specification for agent property"
-            )
 
     def get_agents_with(self, query: Callable) -> Dict[int, List[Any]]:
         """
@@ -189,48 +162,27 @@ class AgentFactory:
                 matching_agents[agent_id] = agent_properties
         return matching_agents
 
-    def generate_agent_data_tensors(
-        self,  # , use_cuda=True, distributed=False
-    ) -> Union[
-        List[np.ndarray],
-        Dict[str, np.array[Any]],
-    ]:
+    def _generate_agent_data_tensors(
+        self,
+    ) -> Union[List[cp.ndarray],]:
         converted_agent_data_tensors = []
-        dtype = np.float64
         for property_name in self._property_name_2_agent_data_tensor.keys():
-            adt = self._property_name_2_agent_data_tensor[property_name]
-            max_dims = self._property_name_2_max_dims.get(property_name, None)
-            if max_dims != None:
-                max_dims = [self.num_agents] + max_dims
-            adt = convert_to_equal_side_tensor(adt, max_dims)
-            converted_agent_data_tensors.append(adt)
+            converted_agent_data_tensors.append(
+                convert_to_equal_side_tensor(
+                    self._property_name_2_agent_data_tensor[property_name]
+                )
+            )
 
         return converted_agent_data_tensors
 
-    def update_agents_properties(
+    def _update_agents_properties(
         self,
-        equal_side_agent_data_tensors=List[List[Any]],
-        # use_cuda=True,
-        # distributed=False,
+        regularized_agent_data_tensors=List[cp.ndarray],
     ) -> None:
         property_names = list(self._property_name_2_agent_data_tensor.keys())
         for i, property_name in enumerate(property_names):
-            dt = equal_side_agent_data_tensors[i]
-            """if use_cuda:
-                dt = equal_side_agent_data_tensors[i]
-            else:
-                dt = equal_side_agent_data_tensors[i]
-                # TODO Free shared memory
-                if False:
-                    if dt.size != 0:
-                        shm = shared_memory.SharedMemory(
-                            name=f"npshared{property_name}"
-                        )
-                        shm.close()
-                        shm.unlink()"""
-            self._property_name_2_agent_data_tensor[property_names[i]] = (
-                compress_tensor(dt)
-            )
+            dt = regularized_agent_data_tensors[i]
+            self._property_name_2_agent_data_tensor[property_name] = compress_tensor(dt)
 
 
 def contextualize_agent_data_tensors(
