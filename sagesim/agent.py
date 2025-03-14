@@ -3,7 +3,7 @@ import math
 from typing import Any, Callable, List, Dict, Union, Tuple
 from collections import OrderedDict
 from copy import copy
-import time
+from time import time
 
 # from multiprocessing import shared_memory
 
@@ -34,6 +34,14 @@ class AgentFactory:
                 "locations": self._space._locations_defaults,
             }
         )
+        self._property_name_2_index = {
+            "breed": 0,
+            "locations": 1,
+        }
+        self._property_name_2_last_synced_at = {
+            "breed": 0,
+            "locations": 0,
+        }
         self._agent_connectivity: Dict[int, Dict[int, float]] = {}
 
     @property
@@ -76,8 +84,12 @@ class AgentFactory:
         self._num_breeds += 1
         self._breeds[breed.name] = breed
         for property_name, default in breed.properties.items():
+            self._property_name_2_index[property_name] = len(
+                self._property_name_2_agent_data_tensor
+            )
             self._property_name_2_agent_data_tensor[property_name] = []
             self._property_name_2_defaults[property_name] = default
+            self._property_name_2_last_synced_at[property_name] = 0
 
     def create_agent(self, breed: Breed, **kwargs) -> int:
         """
@@ -175,14 +187,21 @@ class AgentFactory:
 
         return converted_agent_data_tensors
 
-    def _update_agents_properties(
+    def _update_agents_property(
         self,
-        regularized_agent_data_tensors=List[cp.ndarray],
+        regularized_agent_data_tensors: List[cp.ndarray],
+        property_name: str,
+        tick: int,
     ) -> None:
-        property_names = list(self._property_name_2_agent_data_tensor.keys())
-        for i, property_name in enumerate(property_names):
-            dt = regularized_agent_data_tensors[i]
-            self._property_name_2_agent_data_tensor[property_name] = compress_tensor(dt)
+        if self._property_name_2_last_synced_at[property_name] < tick:
+            time_d = time()
+            property_idx = self._property_name_2_index[property_name]
+            adt = regularized_agent_data_tensors[property_idx]
+            self._property_name_2_agent_data_tensor[property_name] = compress_tensor(
+                adt
+            )
+            self._property_name_2_last_synced_at[property_name] = tick
+            print(f"Time to update agent properties: {time() - time_d:.6f} seconds")
 
 
 def contextualize_agent_data_tensors(
@@ -250,7 +269,7 @@ def decontextualize_agent_data_tensors(
             reduced_agent = previous_agent
         return reduced_agent
 
-    start = time.time()
+    start = time()
     print("starting reduce partition previous adts")
     total_num_agents = len(previous_agent_data_tensors_full[0])
     processed_set = set(agents_to_be_processed)
@@ -266,14 +285,14 @@ def decontextualize_agent_data_tensors(
         [padt_fullcontext[aid] for aid in agents_to_be_processed]
         for padt_fullcontext in previous_agent_data_tensors_full
     ]
-    print(f"Reduce partition previous adts  took {time.time() - start} seconds")
+    print(f"Reduce partition previous adts  took {time() - start} seconds")
 
-    start = time.time()
+    start = time()
     print("starting reduce compress partition previous adts")
     previous_agent_data_tensors_partition = [
         compress_tensor(adt) for adt in previous_agent_data_tensors_partition
     ]
-    print(f"finished compress partition previous adts {time.time() - start} seconds")
+    print(f"finished compress partition previous adts {time() - start} seconds")
     n_properties = len(previous_agent_data_tensors_partition)
     n_versions = len(agent_data_tensors_versions)
 

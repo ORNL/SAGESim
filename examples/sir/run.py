@@ -99,7 +99,7 @@ if __name__ == "__main__":
     )"""
 
     simulate_start = time()
-    model.simulate(1000, sync_workers_every_n_ticks=1)
+    model.simulate(10, sync_workers_every_n_ticks=2)
     simulate_end = time()
     simulate_duration = simulate_end - simulate_start
 
@@ -109,11 +109,12 @@ if __name__ == "__main__":
                 f"{num_agents}, {num_init_connections}, {num_nodes}, {num_workers}, {model_creation_duration}, {simulate_duration}\n"
             )
 
-    """if worker == 0:
+    if worker == 0:
         print(
             [
-                SIRState(model.get_agent_property_value(agent_id, property_name="state"))
-                    for agent_id in range(n_agents)
+                SIRState(
+                    model.get_agent_property_value(agent_id, property_name="state")
+                )
+                for agent_id in range(num_agents)
             ]
         )
-    """
