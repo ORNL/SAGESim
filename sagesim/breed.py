@@ -9,12 +9,12 @@ class Breed:
         # self._properties is a dict with keys as property name and
         #   values are properties.
         #   properties themselves are list of type and default value.
-        self._properties = OrderedDict()
-        self._prop2pos = {}
+        self._properties: OrderedDict[str, List[Any, Any]] = OrderedDict()
+        self._prop2pos: Dict[str, int] = {}
         self._name: str = name
         self._step_funcs: Dict[int, Callable] = {}
-        self._breedidx = -1
-        self._num_properties = 0
+        self._breedidx: int = -1
+        self._num_properties: int = 0
         self._prop2maxdims: Dict[str, List[int]] = {}
 
     @property

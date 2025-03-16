@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools >= 75.8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sagesim"
+version = "0.1.0"
+dependencies = [
+    "awkward==2.7.4",
+    "cupy_cuda12x==13.3.0",
+    "mpi4py==4.0.3",
+    "networkx==3.4.2",
+    "numpy==2.2.3",
+    "ragged==0.2.0",
+    "setuptools==75.8.0",
+]
+requires-python = ">=3.11"
+authors = [
+  {name = "Chathika Gunaratne", email = "chathikagunaratne@gmail.com"}
+]
+maintainers = [
+  {name = "Chathika Gunaratne", email = "chathikagunaratne@gmail.com"}
+]
+
+description = "Scalable Agent-based GPU Enabled Simulator."
+
+readme = "README.md"
+license = {file = "LICENSE", type = "text/plain"}
+
+keywords = ["agent-based", "hpc", "gpu"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[project.urls]
+Repository = "https://github.com/ornl/sagesim.git"

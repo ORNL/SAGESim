@@ -11,6 +11,7 @@ import os
 import pickle
 import math
 import heapq
+import warnings
 
 import cupy as cp
 import numpy as np
@@ -22,10 +23,6 @@ from sagesim.agent import (
     decontextualize_agent_data_tensors,
     contextualize_agent_data_tensors,
 )
-from sagesim.util import (
-    compress_tensor,
-    convert_to_equal_side_tensor,
-)
 from sagesim.space import Space, NetworkSpace
 
 comm = MPI.COMM_WORLD
@@ -34,17 +31,22 @@ worker = comm.Get_rank()
 
 
 class Model:
-    THREADSPERBLOCK = 32
-    STEPFUNCPATH = "step_func_code.py"
 
-    def __init__(self, space: Space) -> None:
+    def __init__(
+        self,
+        space: Space,
+        threads_per_block: int = 32,
+        step_function_file_path: str = "step_func_code.py",
+    ) -> None:
+        self._threads_per_block = threads_per_block
+        self._step_function_file_path = step_function_file_path
         self._agent_factory = AgentFactory(space)
         self._globals = {"tick": 0}
         # following may be set later in setup if distributed execution
 
     def register_breed(self, breed: Breed) -> None:
         if self._agent_factory.num_agents > 0:
-            raise Exception(f"Breeds must be registered before agents are created!")
+            raise Exception(f"All breeds must be registered before agents are created!")
         self._agent_factory.register_breed(breed)
 
     def create_agent_of_breed(self, breed: Breed, **kwargs) -> int:
@@ -52,19 +54,17 @@ class Model:
         return agent_id
 
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
+        current_tick = self._global_data_vector[0]
+        self._agent_factory._update_agent_property(
+            self._agent_data_tensors, id, property_name, current_tick
+        )
         return self._agent_factory.get_agent_property_value(
             property_name=property_name, agent_id=id
         )
 
-    def set_agent_property_value(
-        self,
-        id: int,
-        property_name: str,
-        value: Any,
-        dims: List[int] = None,
-    ) -> None:
+    def set_agent_property_value(self, id: int, property_name: str, value: Any) -> None:
         self._agent_factory.set_agent_property_value(
-            property_name=property_name, agent_id=id, value=value, dims=dims
+            property_name=property_name, agent_id=id, value=value
         )
 
     def get_space(self) -> Space:
@@ -93,11 +93,6 @@ class Model:
             distributed.LocalCluster is set up.
         """
         self._use_gpu = use_gpu
-        if self._use_gpu:
-            """if not cuda.is_available():
-            raise EnvironmentError(
-                "CUDA requested but no cuda installation detected."
-            )"""
         # Create record of agent step functions by breed and priority
         self._breed_idx_2_step_func_by_priority: List[Dict[int, Callable]] = []
         heap_priority_breedidx_func = []
@@ -122,7 +117,7 @@ class Model:
 
         # Generate global data tensor
         self._global_data_vector = list(self._globals.values())
-        with open(Model.STEPFUNCPATH, "w") as f:
+        with open(self._step_function_file_path, "w") as f:
             f.write(
                 generate_gpu_func(
                     self._agent_factory.num_properties,
@@ -138,7 +133,7 @@ class Model:
 
         # TODO Remove the following commeneted code once Summit-tested
         # Generate agent data tensors
-        self._agent_data_tensors = self._agent_factory.generate_agent_data_tensors()
+        self._agent_data_tensors = self._agent_factory._generate_agent_data_tensors()
 
         if worker == 0:
             # Chunk agent ids
@@ -175,17 +170,19 @@ class Model:
                 self._agent_data_tensors,
                 self.get_space()._neighbor_compute_func,
                 sync_workers_every_n_ticks,
+                self._step_function_file_path,
             )
+
             self._global_data_vector = comm.allreduce(
                 worker_global_data_vector, op=reduce_global_data_vector
             )
+
             self._agent_data_tensors = comm.allreduce(
                 worker_agent_data_tensors, op=reduce_agent_data_tensors
             )
 
-        self._agent_factory.update_agents_properties(self._agent_data_tensors)
-
-        return
+            # TODO convert global data vector to list of data tensors too
+            # Time must always be sync'd
 
     def save(self, app: "Model", fpath: str) -> None:
         """
@@ -346,6 +343,7 @@ def worker_coroutine(
     agent_data_tensors,
     neighbor_compute_func,
     sync_workers_every_n_ticks,
+    step_function_file_path,
 ):
     """
     Corountine that exec's cuda kernel. This coroutine should
@@ -367,7 +365,11 @@ def worker_coroutine(
 
     # Contextualize
     # Import the package using module package
-    step_func_module = importlib.import_module(os.path.splitext(Model.STEPFUNCPATH)[0])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        step_func_module = importlib.import_module(
+            os.path.splitext(step_function_file_path)[0]
+        )
 
     # Access the step function using the module
     step_func = step_func_module.stepfunc
