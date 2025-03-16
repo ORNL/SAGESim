@@ -83,7 +83,6 @@ class AgentFactory:
             )
             self._property_name_2_agent_data_tensor[property_name] = []
             self._property_name_2_defaults[property_name] = default
-            self._property_name_2_last_synced_at[property_name] = 0
 
     def create_agent(self, breed: Breed, **kwargs) -> int:
         """
