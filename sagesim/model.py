@@ -11,7 +11,7 @@ import os
 import pickle
 import math
 import heapq
-from time import time
+import warnings
 
 import cupy as cp
 import numpy as np
@@ -149,9 +149,6 @@ class Model:
         # Repeatedly execute worker coroutine untill simulation
         # has run for the right amount of ticks
         for time_chunk in range((ticks // sync_workers_every_n_ticks) + 1):
-            print(f"Worker {worker} executing time chunk {time_chunk}")
-
-            time_e = time()
             if time_chunk == (ticks // sync_workers_every_n_ticks):
                 num_time_chunks = ticks // sync_workers_every_n_ticks
                 sync_workers_every_n_ticks = (
@@ -161,9 +158,7 @@ class Model:
                     break
             elif ticks % sync_workers_every_n_ticks:
                 sync_workers_every_n_ticks = ticks % sync_workers_every_n_ticks
-            print(f"Time to calculate time chunk: {time() - time_e:.6f} seconds")
 
-            time_a = time()
             worker_agent_ids_chunk = comm.scatter(agent_ids_chunks, root=0)
             (
                 worker_global_data_vector,
@@ -177,27 +172,17 @@ class Model:
                 sync_workers_every_n_ticks,
                 self._step_function_file_path,
             )
-            print(f"Time to scatter and run kernel: {time() - time_a:.6f} seconds")
 
-            time_b = time()
             self._global_data_vector = comm.allreduce(
                 worker_global_data_vector, op=reduce_global_data_vector
             )
-            print(
-                f"Time to allreduce global data vector: {time() - time_b:.6f} seconds"
-            )
 
-            time_c = time()
             self._agent_data_tensors = comm.allreduce(
                 worker_agent_data_tensors, op=reduce_agent_data_tensors
-            )
-            print(
-                f"Time to allreduce agent data tensors: {time() - time_c:.6f} seconds"
             )
 
             # TODO convert global data vector to list of data tensors too
             # Time must always be sync'd
-            print(f"Simulation clock: {self._global_data_vector[0]} ticks")
 
     def save(self, app: "Model", fpath: str) -> None:
         """
@@ -380,9 +365,11 @@ def worker_coroutine(
 
     # Contextualize
     # Import the package using module package
-    step_func_module = importlib.import_module(
-        os.path.splitext(step_function_file_path)[0]
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        step_func_module = importlib.import_module(
+            os.path.splitext(step_function_file_path)[0]
+        )
 
     # Access the step function using the module
     step_func = step_func_module.stepfunc
