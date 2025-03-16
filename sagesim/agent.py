@@ -5,8 +5,6 @@ from collections import OrderedDict
 from copy import copy
 from time import time
 
-# from multiprocessing import shared_memory
-
 import numpy as np
 import cupy as cp
 
@@ -37,10 +35,6 @@ class AgentFactory:
         self._property_name_2_index = {
             "breed": 0,
             "locations": 1,
-        }
-        self._property_name_2_last_synced_at = {
-            "breed": 0,
-            "locations": 0,
         }
         self._agent_connectivity: Dict[int, Dict[int, float]] = {}
 
@@ -194,8 +188,6 @@ class AgentFactory:
         property_name: str,
         tick: int,
     ) -> None:
-        # if self._property_name_2_last_synced_at[property_name] < tick:
-        time_d = time()
         property_idx = self._property_name_2_index[property_name]
         adt = regularized_agent_data_tensors[property_idx]
         value = (
@@ -205,9 +197,6 @@ class AgentFactory:
         )
 
         self._property_name_2_agent_data_tensor[property_name][agent_id] = value
-        self._property_name_2_last_synced_at[property_name] = tick
-
-        #    print(f"Time to update agent properties: {time() - time_d:.6f} seconds")
 
 
 def contextualize_agent_data_tensors(
