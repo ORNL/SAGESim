@@ -4,21 +4,29 @@ Scalable Agent-based GPU Enabled Simulator
 
 # Requirements
 
- - Python 3.7+
- - `conda create -n sagesimenv python=3.9`
- - `conda activate sagesimenv`
- - Install CUDA toolkit
- - - https://developer.nvidia.com/cuda-toolkit
- - - https://rocm.docs.amd.com/projects/install-on-linux/en/docs-6.0.2/
- - - [Install using Anaconda](`conda install -c anaconda cudatoolkit`)
- - install mpi4py (Recommend using conda): https://mpi4py.readthedocs.io/en/stable/install.html#using-conda
- - [Follow the instructions here to install CuPy](https://docs.cupy.dev/en/stable/install.html)
- - `pip install -r requirements.txt`
- 
+ - Python 3.11+
+ - NVIDIA GPU with CUDA drivers or AMD GPU with ROCm 5.7.1+ 
+
+# Installation
+
+The most straightforward way is to use conda to install SAGESim and all dependencies:
+
+Add to your current env: 
+
+`conda env update --name myenv --file sagesim_all_deps.yml --prune`
+
+or, create a new env:
+
+`conda create --name sagesimenv --file sagesim_all_deps.yml`
+
+However, your system might require specific steps to installing `mpi4py` and/or `cupy` depending on your hardware.
+In that case use your systems recommended instructions to install `mpi4py` and `cupy` and execute:
+
+`pip install sagesim` 
+
 # Run Example
 
  - `git clone https://code.ornl.gov/sagesim/sagesim`
- - `export PYTHONPATH=/path/to/clone_repo`
  - `cd /path/to/clone_repo/examples/sir`
  - `mpiexec -n 4 python run.py`
 
