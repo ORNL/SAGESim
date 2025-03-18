@@ -17,7 +17,7 @@ Add to your current env:
 
 or, create a new env:
 
-`conda create --name sagesimenv --file sagesim_all_deps.yml`
+`conda env create --name sagesimenv --file sagesim_all_deps.yml`
 
 However, your system might require specific steps to installing `mpi4py` and/or `cupy` depending on your hardware.
 In that case use your systems recommended instructions to install `mpi4py` and `cupy` and execute:
