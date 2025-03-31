@@ -8,18 +8,7 @@ Scalable Agent-based GPU Enabled Simulator
  - NVIDIA GPU with CUDA drivers or AMD GPU with ROCm 5.7.1+ 
 
 # Installation
-
-The most straightforward way is to use conda to install SAGESim and all dependencies:
-
-Add to your current env: 
-
-`conda env update --name myenv --file sagesim_all_deps.yml --prune`
-
-or, create a new env:
-
-`conda env create --name sagesimenv --file sagesim_all_deps.yml`
-
-However, your system might require specific steps to installing `mpi4py` and/or `cupy` depending on your hardware.
+Your system might require specific steps to installing `mpi4py` and/or `cupy` depending on your hardware.
 In that case use your systems recommended instructions to install `mpi4py` and `cupy` and execute:
 
 `pip install sagesim` 
