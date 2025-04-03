@@ -17,7 +17,7 @@ In that case use your systems recommended instructions to install `mpi4py` and `
 
  - `git clone https://code.ornl.gov/sagesim/sagesim`
  - `cd /path/to/clone_repo/examples/sir`
- - `mpiexec -n 4 python run.py`
+ - `mpirun -n 4 python run.py --num_agents 10000 --percent_init_connections 0.1 --num_nodes 1`
 
 
 # There are some unfortunate quirks to using CuPyx `jit.rawkernel`:
