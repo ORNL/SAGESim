@@ -12,16 +12,16 @@ import pickle
 import math
 import heapq
 import warnings
+from time import time
 
 import cupy as cp
 import numpy as np
+import awkward as ak
 from mpi4py import MPI
 
 from sagesim.agent import (
     AgentFactory,
     Breed,
-    decontextualize_agent_data_tensors,
-    contextualize_agent_data_tensors,
 )
 from sagesim.space import Space, NetworkSpace
 
@@ -54,9 +54,8 @@ class Model:
         return agent_id
 
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
-        current_tick = self._global_data_vector[0]
         self._agent_factory._update_agent_property(
-            self._agent_data_tensors, id, property_name, current_tick
+            self._agent_data_tensors, id, property_name
         )
         return self._agent_factory.get_agent_property_value(
             property_name=property_name, agent_id=id
@@ -135,14 +134,9 @@ class Model:
         # Generate agent data tensors
         self._agent_data_tensors = self._agent_factory._generate_agent_data_tensors()
 
+        # Compute space partitioning
         if worker == 0:
-            # Chunk agent ids
-            all_agent_ids = [int(i) for i in range(len(self._agent_data_tensors[0]))]
-            chunk_size = len(all_agent_ids) // num_workers
-            agent_ids_chunks = [
-                all_agent_ids[i * chunk_size : (i + 1) * chunk_size]
-                for i in range(num_workers - 1)
-            ] + [all_agent_ids[(num_workers - 1) * chunk_size :]]
+            agent_ids_chunks = self.get_space()._compute_partitioning(num_workers)
         else:
             agent_ids_chunks = None
 
@@ -163,8 +157,8 @@ class Model:
             (
                 worker_global_data_vector,
                 worker_agent_data_tensors,
-                worker_agent_ids_result,
-            ) = worker_coroutine(
+                worker_agent_ids_in_subcontext,
+            ) = self.worker_coroutine(
                 worker_agent_ids_chunk,
                 self._global_data_vector,
                 self._agent_data_tensors,
@@ -177,10 +171,18 @@ class Model:
                 worker_global_data_vector, op=reduce_global_data_vector
             )
 
-            self._agent_data_tensors = comm.allreduce(
-                worker_agent_data_tensors, op=reduce_agent_data_tensors
+            """recv = comm.allgather(
+                (worker_agent_data_tensors, worker_agent_ids_in_subcontext)
             )
 
+            for i in range(0, num_workers):
+                worker_agent_data_tensors = reduce_agent_data_tensors_(
+                    worker_agent_data_tensors, worker_agent_ids_in_subcontext, *recv[i]
+                )
+                assert len(worker_agent_data_tensors[0]) == len(
+                    worker_agent_ids_in_subcontext
+                ), f"len of worker_agent_data_tensors {len(worker_agent_data_tensors[0])} and worker_agent_ids_in_subcontext {len(worker_agent_ids_in_subcontext)} must be same"
+            """
             # TODO convert global data vector to list of data tensors too
             # Time must always be sync'd
 
@@ -207,27 +209,117 @@ class Model:
             app = pickle.load(fin)
         return app
 
+    # Define worker coroutine that executes cuda kernel
+    # ------------------------------------------------------
+    def worker_coroutine(
+        self,
+        agent_ids_chunk,
+        global_data_vector,
+        agent_data_tensors,
+        neighbor_compute_func,
+        sync_workers_every_n_ticks,
+        step_function_file_path,
+    ):
+        """
+        Corountine that exec's cuda kernel. This coroutine should
+        eventually be distributed among dask workers with agent
+        data partitioning and data reduction.
+
+        :param device_global_data_vector: cuda device array containing
+            SAGESim global properties
+        :param agent_data_tensors: listof property data tensors defined by user.
+            Contains all agent info. Each inner list represents a particular property and may
+            itself be a multidimensional list. This is also where the
+            cuda kernels will make modifications as agent properties
+            are updated.
+        :param current_tick: Current simulation tick
+        :param sync_workers_every_n_ticks: number of ticks to forward
+            the simulation by
+        :param agent_ids: agents to process by this cudakernel call
+        """
+
+        # Contextualize
+        # Import the package using module package
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            step_func_module = importlib.import_module(
+                os.path.splitext(step_function_file_path)[0]
+            )
+
+        # Access the step function using the module
+        step_func = step_func_module.stepfunc
+
+        agent_ids_chunk = self._agent_factory._rank2agentids[worker]
+        threadsperblock = 32
+        blockspergrid = int(math.ceil(len(agent_ids_chunk) / threadsperblock))
+
+        # Get all neighbors of agents in agent_ids
+        agent_subcontextidxs = [
+            self._agent_factory._this_rank_agent2subcontextidx[agent_id]
+            for agent_id in agent_ids_chunk
+        ]
+        all_neighbors = neighbor_compute_func(
+            agent_data_tensors[1], agent_subcontextidxs
+        )
+        agent2neighbors = dict(zip(agent_ids_chunk, all_neighbors))
+        agent2neighbors = [
+            (k, x.item())
+            for k, v in agent2neighbors.items()
+            for x in v
+            if not np.isnan(x)
+        ]
+
+        # Contextualize agent data tensors
+        (
+            agent_ids_in_subcontext,
+            contextualized_agent_data_tensors,
+        ) = self._agent_factory.contextualize_agent_data_tensors(
+            self._agent_data_tensors, agent2neighbors
+        )
+
+        device_global_data_vector = cp.asarray(global_data_vector)
+
+        # Execute cuda kernel. Unfortunately this seems to have to also
+        # be performed in a string
+        step_func[blockspergrid, threadsperblock](
+            device_global_data_vector,
+            *contextualized_agent_data_tensors,
+            sync_workers_every_n_ticks,
+            cp.array(
+                agent_ids_chunk, dtype=cp.int32
+            ),  # agent_ids_chunk is a numpy array, convert to cupy array
+        )
+
+        contextualized_agent_data_tensors = (
+            self._agent_factory.reduce_agent_data_tensors(
+                contextualized_agent_data_tensors,
+                agent_ids_in_subcontext,
+                reduce_agent_data_tensors_,
+            )
+        )
+
+        return (
+            device_global_data_vector,
+            contextualized_agent_data_tensors,
+            agent_ids_in_subcontext,
+        )
+
 
 def reduce_global_data_vector(A, B):
     values = np.stack([A, B], axis=1)
     return np.max(values, axis=1)
 
 
-def reduce_agent_data_tensors_(A, B):
+def reduce_agent_data_tensors_(adts_A, adts_B):
     result = []
     # breed would be same as first
-    result.append(A[0])
+    result.append(adts_A[0])
     # network would be same as first
-    result.append(A[1])
+    result.append(adts_A[1])
     # state would be max value. Infected superceeds susceptible.
-    states = np.stack([A[2], B[2]], axis=1)
-    new_state = np.max(states, axis=1)
-    result.append(new_state)
+    states_A, states_B = adts_A[2], adts_B[2]
+    result.append(max(states_A, states_B))
     return result
-
-
-def reduce_agent_data_tensors(A, B):
-    return A
 
 
 def smap(func_args):
@@ -302,7 +394,6 @@ def generate_gpu_func(
             \n\t\t\t\tif breed_id == {breedidx}:
             \t\t{step_func_name}(
             \t\t\tagent_id,
-            \t\t\tagents_index_in_subcontext,
             \t\t\tdevice_global_data_vector,
             \t\t\t{','.join(args)},
             \t\t)
@@ -319,7 +410,6 @@ def stepfunc(
     {','.join(args)},
     sync_workers_every_n_ticks,
     agent_ids,
-    agents_index_in_subcontext,
     ):
         thread_id = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x
         #g = cuda.cg.this_grid()
@@ -333,94 +423,3 @@ def stepfunc(
     """
     func = func.replace("\t", "    ")
     return func  # compile(func, "<string>", "exec")
-
-
-# Define worker coroutine that executes cuda kernel
-# ------------------------------------------------------
-def worker_coroutine(
-    agent_ids,
-    global_data_vector,
-    agent_data_tensors,
-    neighbor_compute_func,
-    sync_workers_every_n_ticks,
-    step_function_file_path,
-):
-    """
-    Corountine that exec's cuda kernel. This coroutine should
-    eventually be distributed among dask workers with agent
-    data partitioning and data reduction.
-
-    :param device_global_data_vector: cuda device array containing
-        SAGESim global properties
-    :param agent_data_tensors: listof property data tensors defined by user.
-        Contains all agent info. Each inner list represents a particular property and may
-        itself be a multidimensional list. This is also where the
-        cuda kernels will make modifications as agent properties
-        are updated.
-    :param current_tick: Current simulation tick
-    :param sync_workers_every_n_ticks: number of ticks to forward
-        the simulation by
-    :param agent_ids: agents to process by this cudakernel call
-    """
-
-    # Contextualize
-    # Import the package using module package
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        step_func_module = importlib.import_module(
-            os.path.splitext(step_function_file_path)[0]
-        )
-
-    # Access the step function using the module
-    step_func = step_func_module.stepfunc
-
-    threadsperblock = 32
-    blockspergrid = int(math.ceil(len(agent_ids) / threadsperblock))
-
-    # Get all neighbors of agents in agent_ids
-    all_neighbors = np.unique(neighbor_compute_func(agent_data_tensors[1], agent_ids))
-    all_neighbors = all_neighbors[~np.isnan(all_neighbors)].astype(int)
-
-    # Contextualize agent data tensors
-    (
-        agent_ids_in_subcontext,
-        agent_index_in_subcontextualized_adts,
-        contextualized_agent_data_tensors,
-    ) = contextualize_agent_data_tensors(agent_data_tensors, all_neighbors, agent_ids)
-
-    # Pickling won't work on ctypes so have to let the
-    # dask worker send the ADTs and GDT to GPU device
-    device_global_data_vector = cp.asarray(global_data_vector)
-    device_agent_data_tensors_subcontext = [
-        cp.asarray(adt) for adt in contextualized_agent_data_tensors
-    ]
-    device_agent_ids = cp.asarray(agent_ids)
-
-    # TODO document what this does
-    device_agents_index_in_subcontext = cp.asarray(
-        agent_index_in_subcontextualized_adts
-    )
-    # Execute cuda kernel. Unfortunately this seems to have to also
-    # be performed in a string
-    step_func[blockspergrid, threadsperblock](
-        device_global_data_vector,
-        *device_agent_data_tensors_subcontext,
-        sync_workers_every_n_ticks,
-        device_agent_ids,
-        device_agents_index_in_subcontext,
-    )
-
-    # cuda.synchronize()
-    # TODO consider using update_agents_properties as it's
-    # best case time complexity is lower than copy_to_host()
-    # agent_subcontext_indices = agent_index_in_subcontextualized_adts[agent_ids].astype(int)
-    for i in range(len(agent_data_tensors)):
-        agent_data_tensors[i][agent_ids_in_subcontext] = (
-            device_agent_data_tensors_subcontext[i].get()
-        )
-
-    return (
-        device_global_data_vector,
-        agent_data_tensors,
-        agent_ids,
-    )

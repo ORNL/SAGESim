@@ -19,11 +19,12 @@ class SIRBreed(Breed):
         self.register_step_func(step_func)
 
 
-def step_func(id, id2index, globals, breeds, locations, states):
+@jit.rawkernel(device="cuda")
+def step_func(id, globals, breeds, locations, states):
     # agent_index = step_func_helper_get_agent_index(id, id2index)
     # nan checked by inequality to self. Unfortunate limitation of cupyx
-    if (id == id) and (id2index[int(id)] == id2index[int(id)]):
-        agent_index = int(id2index[int(id)])
+    if id == id:
+        agent_index = int(id)
 
         neighbors = locations[agent_index]  # network location is defined by neighbors
         rand = random()  # 0.1#step_func_helper_get_random_float(rng_states, id)
@@ -33,10 +34,8 @@ def step_func(id, id2index, globals, breeds, locations, states):
         for i in range(len(neighbors)):
             neighbor_id = neighbors[i]
             # neighbor_index = step_func_helper_get_agent_index(neighbor_id, id2index)
-            if (neighbor_id == neighbor_id) and (
-                id2index[int(neighbor_id)] == id2index[int(neighbor_id)]
-            ):
-                neighbor_index = int(id2index[int(neighbor_id)])
+            if (neighbor_id == neighbor_id) and (int(neighbor_id) == int(neighbor_id)):
+                neighbor_index = int(neighbor_id)
                 neighbor_state = states[neighbor_index]
                 if neighbor_state == 2 and rand < p_infection:
                     states[agent_index] = 2
