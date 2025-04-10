@@ -341,6 +341,9 @@ class AgentFactory:
 
         received_neighbor_adts = [list(v) for v in list(zip(*received_neighbor_adts))]
 
+        if len(received_neighbor_adts) == 0:
+            received_neighbor_adts = [[] for i in range(self.num_properties)]
+
         agent_and_neighbor_adts = [
             convert_to_equal_side_tensor(
                 agent_data_tensors[i].tolist() + received_neighbor_adts[i]
