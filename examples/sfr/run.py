@@ -13,33 +13,13 @@ num_workers = comm.Get_size()
 worker = comm.Get_rank()
 
 
-
-def test_network():
-    network = nx.Graph()
-    network.add_nodes_from(range(8))
-    network.add_edges_from(
-        [(0, 1), (0, 4), (2, 3), (3, 4), (4, 5), (4, 7), (6, 5), (7, 6)]
-    )
-
-    for n in network.nodes:
-        if n == 0:
-            model.create_agent(SFRState.INFECTED.value)
-        else:
-            model.create_agent(SFRState.SUSCEPTIBLE.value)
-
-    for edge in network.edges:
-        model.connect_agents(edge[0], edge[1])
-        print(edge[0], "->", edge[1])
-    return model
-
-
 def generate_small_world_of_agents(
     model,
 ) -> SFRModel:
     network = G_masked
     # create agent with random popularity value and init number of vehicles
     for n in network.nodes:
-        model.create_agent(random.random(), random.randint(0, 100))
+        model.create_agent(network.nodes[n]['osmnxid'], random.random(), random.randint(0, 100))
 
     for edge in network.edges:
         model.connect_agents(edge[0], edge[1])
@@ -84,8 +64,8 @@ if __name__ == "__main__":
     G_masked = nx.MultiDiGraph()
     G_masked.add_nodes_from(range(len(original_nodes)))
 
-    for osmnx_id, masked_id in node_id_map.items():
-        G_masked.add_node(masked_id, osmnx_id=osmnx_id)
+    for osmnxid, masked_id in node_id_map.items():
+        G_masked.add_node(masked_id, osmnxid=osmnxid)
     
     # Add edges using the new node IDs and preserve attributes
     for u, v, k, data in G.edges(keys=True, data=True):
