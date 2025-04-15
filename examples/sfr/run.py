@@ -14,12 +14,13 @@ worker = comm.Get_rank()
 
 
 def generate_small_world_of_agents(
-    model,
+    model, network
 ) -> SFRModel:
-    network = G_masked
     # create agent with random popularity value and init number of vehicles
     for n in network.nodes:
-        model.create_agent(network.nodes[n]['osmnxid'], random.random(), random.randint(0, 100))
+        model.create_agent(osmnxid =network.nodes[n]['osmnxid'], 
+                           popularity = random.random(), 
+                           vehicle_num = random.randint(0, 100))
 
     for edge in network.edges:
         model.connect_agents(edge[0], edge[1])
@@ -28,12 +29,6 @@ def generate_small_world_of_agents(
 
 if __name__ == "__main__":
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--num_nodes",
-        type=int,
-    )
-    args = parser.parse_args()
 
     # load the sf drivng network
     gPath = "/home/xxz/SAGESim/examples/sfr/"
@@ -75,21 +70,7 @@ if __name__ == "__main__":
 
     model = SFRModel()
     model.setup(use_gpu=True)
-    # num_agents = args.num_agents
-    # num_init_connections = int(args.percent_init_connections * num_agents)
-    num_nodes = args.num_nodes
-
-    num_agents = G_masked.number_of_nodes()
-    num_edges = G_masked.number_of_edges()
-
-    model_creation_start = time()
-
-    model = generate_small_world_of_agents(
-        model,
-    )  # test_network()  #
-
-    model_creation_end = time()
-    model_creation_duration = model_creation_end - model_creation_start
+    model = generate_small_world_of_agents(model, G_masked)  
 
     simulate_start = time()
     model.simulate(10, sync_workers_every_n_ticks=2)
