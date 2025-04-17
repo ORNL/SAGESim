@@ -9,6 +9,8 @@ workers, which is the crux of load balancing...
 
 from typing import List, Any
 
+import networkx as nx
+
 
 class Space:
     """
@@ -40,6 +42,11 @@ class Space:
         """Returns agents neighbors"""
         return self._neighbor_compute_func(self._locations, agent_id)
 
+    def _compute_partitioning(self):
+        """Compute partitioning of the space for load balancing"""
+        # Placeholder for partitioning logic
+        pass
+
 
 def _network_space_compute_neighbors(agent_locations, agent_id):
     agents_current_neighbors = agent_locations[agent_id]
@@ -65,6 +72,8 @@ class NetworkSpace(Space):
     def connect_agents(
         self, agent_0: int, agent_1: int, directed: bool = False
     ) -> None:
+        agent_0 = int(agent_0)
+        agent_1 = int(agent_1)
         self._locations[agent_0].add(agent_1)
         self._agent_factory.set_agent_property_value(
             "locations",
@@ -85,6 +94,15 @@ class NetworkSpace(Space):
         self._locations[agent_0].remove(agent_1)
         if not directed:
             self._locations[agent_1].remove(agent_0)
+
+    def _compute_partitioning(self, k: int = 2) -> List[set]:
+        """Compute partitioning of the network space for load balancing"""
+        all_agent_ids = [int(i) for i in range(len(self._locations))]
+        chunk_size = len(all_agent_ids) // k
+        agent_ids_chunks = [
+            all_agent_ids[i * chunk_size : (i + 1) * chunk_size] for i in range(k - 1)
+        ] + [all_agent_ids[(k - 1) * chunk_size :]]
+        return agent_ids_chunks
 
 
 if __name__ == "__main__":
