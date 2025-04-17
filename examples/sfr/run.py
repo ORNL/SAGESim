@@ -13,14 +13,14 @@ num_workers = comm.Get_size()
 worker = comm.Get_rank()
 
 
-def generate_small_world_of_agents(
-    model, network
-) -> SFRModel:
+def generate_small_world_of_agents(model, network) -> SFRModel:
     # create agent with random popularity value and init number of vehicles
     for n in network.nodes:
-        model.create_agent(osmnxid =network.nodes[n]['osmnxid'], 
-                           popularity = random.random(), 
-                           vehicle_num = random.randint(0, 100))
+        model.create_agent(
+            osmnxid=network.nodes[n]["osmnxid"],
+            popularity=random.random(),
+            vehicle_num=random.randint(0, 100),
+        )
 
     for edge in network.edges:
         model.connect_agents(edge[0], edge[1])
@@ -29,15 +29,13 @@ def generate_small_world_of_agents(
 
 if __name__ == "__main__":
 
-
     # load the sf drivng network
-    gPath = "/home/xxz/SAGESim/examples/sfr/"
-    # load json file 
-    with open(f"{gPath}sfr.json", "r") as f:
+    # load json file
+    with open(f"sfr.json", "r") as f:
         G_info = json.load(f)
-    
-    nodes = G_info['nodes']
-    edges = G_info['edges']
+
+    nodes = G_info["nodes"]
+    edges = G_info["edges"]
 
     # create a muliiDiGraph using the node and edge lists
     G = nx.MultiDiGraph()
@@ -61,7 +59,7 @@ if __name__ == "__main__":
 
     for osmnxid, masked_id in node_id_map.items():
         G_masked.add_node(masked_id, osmnxid=osmnxid)
-    
+
     # Add edges using the new node IDs and preserve attributes
     for u, v, k, data in G.edges(keys=True, data=True):
         new_u = node_id_map[u]
@@ -70,7 +68,7 @@ if __name__ == "__main__":
 
     model = SFRModel()
     model.setup(use_gpu=True)
-    model = generate_small_world_of_agents(model, G_masked)  
+    model = generate_small_world_of_agents(model, G_masked)
 
     simulate_start = time()
     model.simulate(10, sync_workers_every_n_ticks=2)
