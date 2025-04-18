@@ -3,7 +3,7 @@ import math
 from typing import Any, Callable, Iterable, List, Dict, Union, Tuple, Set
 from collections import OrderedDict
 from copy import copy
-from time import time
+import time
 
 import numpy as np
 import cupy as cp
@@ -247,7 +247,7 @@ class AgentFactory:
             ] = value
 
     def contextualize_agent_data_tensors(
-        self, agent_data_tensors, agentandneighbors
+        self, agent_data_tensors, agent_ids_chunk, all_neighbors
     ) -> Tuple[Set[int], List[cp.array]]:
         """
         Chunks agent data tensors so that each distributed worker does not
@@ -259,6 +259,18 @@ class AgentFactory:
             3. agent_data_tensors_subcontexts: subcontext of agent_data_tensors
                 required by agents of agent_ids_chunks to be processed by a worker
         """
+        start_time = time.time()
+        agentandneighbors = dict(zip(agent_ids_chunk, all_neighbors))
+        agentandneighbors = [
+            (k, x.item())
+            for k, v in agentandneighbors.items()
+            for x in v
+            if not np.isnan(x)
+        ]
+        print(
+            f"Time to process agentandneighbors: {time.time() - start_time:.6f} seconds"
+        )
+        start_time = time.time()
         neighborrankandagentadts = [
             (
                 self._agent2rank[neighbor_id],
@@ -280,6 +292,10 @@ class AgentFactory:
         for rank, adts in send_info.items():
             # send_adts = [list(v) for v in list(zip(*adts))]
             send_info[rank] = (adts, neighborrank2agentids[rank])
+
+        print(f"Time to prepare what to send: {time.time() - start_time:.6f} seconds")
+
+        start_time = time.time()
 
         received_neighbor_adts = []
         received_neighbor_ids = []
@@ -353,6 +369,8 @@ class AgentFactory:
         agent_and_neighbor_ids = (
             self._rank2agentids.get(worker, []) + received_neighbor_ids
         )
+
+        print(f"Time to send and recv: {time.time() - start_time:.6f} seconds")
 
         return (
             agent_and_neighbor_ids,

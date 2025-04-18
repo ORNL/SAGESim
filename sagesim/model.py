@@ -5,25 +5,23 @@ SuperNeuroABM basic Model class
 
 from typing import Dict, List, Callable, Set, Any, Union
 import inspect
-import importlib.machinery
 import importlib
 import os
 import pickle
 import math
 import heapq
 import warnings
-from time import time
 
 import cupy as cp
 import numpy as np
-import awkward as ak
 from mpi4py import MPI
 
 from sagesim.agent import (
     AgentFactory,
     Breed,
 )
-from sagesim.space import Space, NetworkSpace
+from sagesim.space import Space
+import time
 
 comm = MPI.COMM_WORLD
 num_workers = comm.Get_size()
@@ -55,7 +53,7 @@ class Model:
 
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
         self._agent_factory._update_agent_property(
-            self._agent_data_tensors, id, property_name
+            self._worker_agent_data_tensors, id, property_name
         )
         return self._agent_factory.get_agent_property_value(
             property_name=property_name, agent_id=id
@@ -79,6 +77,9 @@ class Model:
 
     def get_global_property_value(self, property_name: str) -> Union[float, int]:
         return self._globals[property_name]
+
+    def register_reduce_function(self, reduce_func: Callable) -> None:
+        self._reduce_func = reduce_func
 
     def setup(self, use_gpu: bool = True) -> None:
         """
@@ -115,7 +116,7 @@ class Model:
                 last_priority = priority
 
         # Generate global data tensor
-        self._global_data_vector = list(self._globals.values())
+        self._global_data_vector = cp.array(list(self._globals.values()))
         with open(self._step_function_file_path, "w") as f:
             f.write(
                 generate_gpu_func(
@@ -123,6 +124,16 @@ class Model:
                     self._breed_idx_2_step_func_by_priority,
                 )
             )
+
+        # Import the package using module package
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            step_func_module = importlib.import_module(
+                os.path.splitext(self._step_function_file_path)[0]
+            )
+
+        # Access the step function using the module
+        self._step_func = step_func_module.stepfunc
 
     def simulate(
         self,
@@ -132,13 +143,9 @@ class Model:
 
         # TODO Remove the following commeneted code once Summit-tested
         # Generate agent data tensors
-        self._agent_data_tensors = self._agent_factory._generate_agent_data_tensors()
-
-        # Compute space partitioning
-        if worker == 0:
-            agent_ids_chunks = self.get_space()._compute_partitioning(num_workers)
-        else:
-            agent_ids_chunks = None
+        self._worker_agent_data_tensors = (
+            self._agent_factory._generate_agent_data_tensors()
+        )
 
         # Repeatedly execute worker coroutine untill simulation
         # has run for the right amount of ticks
@@ -153,38 +160,9 @@ class Model:
             elif ticks % sync_workers_every_n_ticks:
                 sync_workers_every_n_ticks = ticks % sync_workers_every_n_ticks
 
-            worker_agent_ids_chunk = comm.scatter(agent_ids_chunks, root=0)
-            (
-                worker_global_data_vector,
-                worker_agent_data_tensors,
-                worker_agent_ids_in_subcontext,
-            ) = self.worker_coroutine(
-                worker_agent_ids_chunk,
-                self._global_data_vector,
-                self._agent_data_tensors,
-                self.get_space()._neighbor_compute_func,
+            self.worker_coroutine(
                 sync_workers_every_n_ticks,
-                self._step_function_file_path,
             )
-
-            self._global_data_vector = comm.allreduce(
-                worker_global_data_vector, op=reduce_global_data_vector
-            )
-
-            """recv = comm.allgather(
-                (worker_agent_data_tensors, worker_agent_ids_in_subcontext)
-            )
-
-            for i in range(0, num_workers):
-                worker_agent_data_tensors = reduce_agent_data_tensors_(
-                    worker_agent_data_tensors, worker_agent_ids_in_subcontext, *recv[i]
-                )
-                assert len(worker_agent_data_tensors[0]) == len(
-                    worker_agent_ids_in_subcontext
-                ), f"len of worker_agent_data_tensors {len(worker_agent_data_tensors[0])} and worker_agent_ids_in_subcontext {len(worker_agent_ids_in_subcontext)} must be same"
-            """
-            # TODO convert global data vector to list of data tensors too
-            # Time must always be sync'd
 
     def save(self, app: "Model", fpath: str) -> None:
         """
@@ -213,12 +191,7 @@ class Model:
     # ------------------------------------------------------
     def worker_coroutine(
         self,
-        agent_ids_chunk,
-        global_data_vector,
-        agent_data_tensors,
-        neighbor_compute_func,
         sync_workers_every_n_ticks,
-        step_function_file_path,
     ):
         """
         Corountine that exec's cuda kernel. This coroutine should
@@ -238,71 +211,80 @@ class Model:
         :param agent_ids: agents to process by this cudakernel call
         """
 
-        # Contextualize
-        # Import the package using module package
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            step_func_module = importlib.import_module(
-                os.path.splitext(step_function_file_path)[0]
-            )
-
-        # Access the step function using the module
-        step_func = step_func_module.stepfunc
-
+        start_time = time.time()
         agent_ids_chunk = self._agent_factory._rank2agentids[worker]
+        print(f"Time to get agent_ids_chunk: {time.time() - start_time:.6f} seconds")
+
+        start_time = time.time()
         threadsperblock = 32
         blockspergrid = int(math.ceil(len(agent_ids_chunk) / threadsperblock))
+        print(
+            f"Time to calculate blockspergrid: {time.time() - start_time:.6f} seconds"
+        )
 
-        # Get all neighbors of agents in agent_ids
+        start_time = time.time()
         agent_subcontextidxs = [
             self._agent_factory._this_rank_agent2subcontextidx[agent_id]
             for agent_id in agent_ids_chunk
         ]
-        all_neighbors = neighbor_compute_func(
-            agent_data_tensors[1], agent_subcontextidxs
+        print(
+            f"Time to get agent_subcontextidxs: {time.time() - start_time:.6f} seconds"
         )
-        agent2neighbors = dict(zip(agent_ids_chunk, all_neighbors))
-        agent2neighbors = [
-            (k, x.item())
-            for k, v in agent2neighbors.items()
-            for x in v
-            if not np.isnan(x)
-        ]
 
-        # Contextualize agent data tensors
+        start_time = time.time()
+        all_neighbors = self.get_space()._neighbor_compute_func(
+            self._worker_agent_data_tensors[1], agent_subcontextidxs
+        )
+        print(f"Time to compute all_neighbors: {time.time() - start_time:.6f} seconds")
+
+        start_time = time.time()
         (
-            agent_ids_in_subcontext,
-            contextualized_agent_data_tensors,
+            agent_and_neighbor_ids_in_subcontext,
+            worker_agent_and_neighbor_data_tensors,
         ) = self._agent_factory.contextualize_agent_data_tensors(
-            self._agent_data_tensors, agent2neighbors
+            self._worker_agent_data_tensors, agent_ids_chunk, all_neighbors
+        )
+        print(
+            f"Time to contextualize agent data tensors: {time.time() - start_time:.6f} seconds"
         )
 
-        device_global_data_vector = cp.asarray(global_data_vector)
-
-        # Execute cuda kernel. Unfortunately this seems to have to also
-        # be performed in a string
-        step_func[blockspergrid, threadsperblock](
-            device_global_data_vector,
-            *contextualized_agent_data_tensors,
+        start_time = time.time()
+        self._step_func[blockspergrid, threadsperblock](
+            self._global_data_vector,
+            *worker_agent_and_neighbor_data_tensors,
             sync_workers_every_n_ticks,
             cp.array(
                 agent_ids_chunk, dtype=cp.int32
             ),  # agent_ids_chunk is a numpy array, convert to cupy array
         )
+        print(f"Time to execute CUDA kernel: {time.time() - start_time:.6f} seconds")
 
-        contextualized_agent_data_tensors = (
+        start_time = time.time()
+        worker_agent_and_neighbor_data_tensors = (
             self._agent_factory.reduce_agent_data_tensors(
-                contextualized_agent_data_tensors,
-                agent_ids_in_subcontext,
-                reduce_agent_data_tensors_,
+                worker_agent_and_neighbor_data_tensors,
+                agent_and_neighbor_ids_in_subcontext,
+                self._reduce_func,
             )
         )
-
-        return (
-            device_global_data_vector,
-            contextualized_agent_data_tensors,
-            agent_ids_in_subcontext,
+        print(
+            f"Time to reduce agent data tensors: {time.time() - start_time:.6f} seconds"
         )
+
+        start_time = time.time()
+        self._worker_agent_data_tensors = [
+            andt[: len(agent_ids_chunk)]
+            for andt in worker_agent_and_neighbor_data_tensors
+        ]
+        print(
+            f"Time to remove neighbor information: {time.time() - start_time:.6f} seconds"
+        )
+
+        start_time = time.time()
+        self._global_data_vector = comm.allreduce(
+            self._global_data_vector, op=reduce_global_data_vector
+        )
+        print(f"Time to reduce globals: {time.time() - start_time:.6f} seconds")
 
 
 def reduce_global_data_vector(A, B):
@@ -320,10 +302,6 @@ def reduce_agent_data_tensors_(adts_A, adts_B):
     states_A, states_B = adts_A[2], adts_B[2]
     result.append(max(states_A, states_B))
     return result
-
-
-def smap(func_args):
-    return func_args[0](*func_args[1])
 
 
 def generate_gpu_func(

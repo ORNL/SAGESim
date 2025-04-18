@@ -21,7 +21,7 @@ def convert_to_equal_side_tensor(ragged_list: List[Any]) -> cp.ndarray:
 
     awkward_array = ak.fill_none(awkward_array, cp.nan, axis=-1)
 
-    return ak.to_cupy(awkward_array)
+    return ak.to_cupy(awkward_array).astype(cp.float32)
 
 
 def compress_tensor(regular_tensor: cp.ndarray, min_axis: int = 1) -> List[Any]:
