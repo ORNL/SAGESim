@@ -15,15 +15,19 @@ worker = comm.Get_rank()
 
 def generate_small_world_of_agents(model, network) -> SFRModel:
     # create agent with random popularity value and init number of vehicles
-    for n in network.nodes:
+    for i, n in enumerate(network.nodes):
         model.create_agent(
-            osmnxid=network.nodes[n]["osmnxid"],
+            osmnxid=0.0,  # network.nodes[n]["osmnxid"],
             popularity=random.random(),
-            vehicle_num=random.randint(0, 100),
+            vehicle_num=random.randint(0, 10),
         )
 
     for edge in network.edges:
-        model.connect_agents(edge[0], edge[1])
+        if (
+            edge[0] < model._agent_factory.num_agents
+            and edge[1] < model._agent_factory.num_agents
+        ):
+            model.connect_agents(edge[0], edge[1])
     return model
 
 
@@ -71,7 +75,7 @@ if __name__ == "__main__":
     model = generate_small_world_of_agents(model, G_masked)
 
     simulate_start = time()
-    model.simulate(10, sync_workers_every_n_ticks=2)
+    model.simulate(10, sync_workers_every_n_ticks=10)
     simulate_end = time()
     simulate_duration = simulate_end - simulate_start
 
