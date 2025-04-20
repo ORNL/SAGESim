@@ -414,7 +414,7 @@ def generate_gpu_func(
     \nfrom random import random
     \nfrom cupyx import jit
     \n\n{step_sources}
-    \n\n@jit.rawkernel()
+    \n\n@jit.rawkernel(device='cuda')
 def stepfunc(
     device_global_data_vector,
     {','.join(args)},
