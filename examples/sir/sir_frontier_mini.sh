@@ -3,9 +3,10 @@
 #SBATCH -J sagesim_sir
 #SBATCH -o logs/sagesim_sir_%j.o
 #SBATCH -e logs/sagesim_sir_%j.e
-#SBATCH -t 01:00:00
+#SBATCH -t 00:30:00
 #SBATCH -p batch
-#SBATCH -N 200
+#SBATCH -q debug
+#SBATCH -N 2
 
 # Only necessary if submitting like: sbatch --export=NONE ... (recommended)
 # Do NOT include this line when submitting without --export=NONE
@@ -25,9 +26,6 @@ source activate /lustre/orion/proj-shared/csc536/envs/sagesimenv_cg
 # Point to source
 export PYTHONPATH=/lustre/orion/proj-shared/csc536/gunaratnecs/SAGESim/:$PYTHONPATH
 
-which python3
-pip show awkward
-
 # Make run dir if not exists per job id
 RUN_DIR=/lustre/orion/proj-shared/csc536/gunaratnecs/SAGESim/examples/sir
 if [ ! -d "$RUN_DIR" ]
@@ -36,17 +34,18 @@ then
 fi
 cd $RUN_DIR
 
-for num_agents in 1000000
+for num_agents in 100
 do
-    for num_nodes in 200
+    for num_nodes in 2
     do
         for num_init_connections in 10 20 30
         do
             num_mpi_ranks=$((8 * ${num_nodes}))
             # Run script
-            echo Running Python Script with ${num_nodes} nodes, ${num_agents} agents, and ${percent_init_connections} percent init connections.
-            time srun -N${num_nodes} -n${num_mpi_ranks} -c7 --gpus-per-task=1 --gpu-bind=closest python3 -u ./run.py --num_agents ${num_agents} --num_init_connections ${num_init_connections} --num_nodes ${num_nodes}
-            echo Run Finished
+            echo Running. Python Script with ${num_nodes} nodes, ${num_agents} agents, and ${percent_init_connections} percent init connections.
+            #time srun -N${num_nodes} -n${num_mpi_ranks} -c7 --ntasks-per-gpu=1 --gpu-bind=closest python3 -u ./run.py --num_agents ${num_agents} --num_init_connections ${num_init_connections} --num_nodes ${num_nodes}
+            #time srun -N${num_nodes} -n${num_mpi_ranks} -c7 --gpus-per-task=1 --gpu-bind=closest /bin/bash -c 'echo $(hostname) $(grep Cpus_allowed_list /proc/self/status) GPUS: $ROCR_VISIBLE_DEVICES' | sort
+            echo Run finished. Python Script with ${num_nodes} nodes, ${num_agents} agents, and ${percent_init_connections} percent init connections.
             date
         done
     done

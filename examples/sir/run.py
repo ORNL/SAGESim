@@ -6,6 +6,7 @@ from mpi4py import MPI
 
 from random import sample
 
+import cupy as cp
 import networkx as nx
 
 comm = MPI.COMM_WORLD
@@ -77,6 +78,14 @@ if __name__ == "__main__":
         type=int,
     )
     args = parser.parse_args()
+
+    num_cuda = cp.cuda.runtime.getDeviceCount()
+    devices = []
+    for i in range(0, num_cuda):
+        devices += [f'cuda:{i}']
+    print("rank", worker, "devices", devices, flush=True)
+    import socket
+    print(socket.gethostname())
 
     model = SIRModel()
     model.setup(use_gpu=True)
