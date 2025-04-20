@@ -75,7 +75,7 @@ if __name__ == "__main__":
     model = generate_small_world_of_agents(model, G_masked)
 
     simulate_start = time()
-    model.simulate(10, sync_workers_every_n_ticks=10)
+    model.simulate(10, sync_workers_every_n_ticks=1)
     simulate_end = time()
     simulate_duration = simulate_end - simulate_start
 

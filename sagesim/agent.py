@@ -42,7 +42,6 @@ class AgentFactory:
             "breed": 0,
             "locations": 1,
         }
-        self._agent_connectivity: Dict[int, Dict[int, float]] = {}
         self._agent2rank = {}  # global
         self._rank2agentids = {}  # global
         self._this_rank_agent2subcontextidx = OrderedDict()  # local
@@ -260,7 +259,7 @@ class AgentFactory:
                 required by agents of agent_ids_chunks to be processed by a worker
         """
         start_time = time.time()
-        agentandneighbors = dict(zip(agent_ids_chunk, all_neighbors))
+        """agentandneighbors = dict(zip(agent_ids_chunk, all_neighbors))
         agentandneighbors = [
             (k, x.item())
             for k, v in agentandneighbors.items()
@@ -291,9 +290,33 @@ class AgentFactory:
 
         for rank, adts in send_info.items():
             # send_adts = [list(v) for v in list(zip(*adts))]
-            send_info[rank] = (adts, neighborrank2agentids[rank])
+            send_info[rank] = (adts, neighborrank2agentids[rank])"""
 
-        print(f"Time to prepare what to send: {time.time() - start_time:.6f} seconds")
+        send_info = {}
+
+        for i in range(len(agent_ids_chunk)):
+            agent_id = agent_ids_chunk[i]
+            for neighbor_id in all_neighbors[i]:
+                if cp.isnan(neighbor_id):
+                    break
+                neighbor_rank = self._agent2rank[int(neighbor_id)]
+                if neighbor_rank == worker:
+                    # Don't send to self
+                    continue
+                if neighbor_rank not in send_info:
+                    send_info[neighbor_rank] = {}
+                agent_adts = [adt[i] for adt in agent_data_tensors]
+                send_info[neighbor_rank][agent_id] = agent_adts
+
+        print(
+            worker,
+            [(neighbor_rank, len(info)) for neighbor_rank, info in send_info.items()],
+            flush=True,
+        )
+
+        print(
+            f"Time to process agentandneighbors: {time.time() - start_time:.6f} seconds"
+        )
 
         start_time = time.time()
 
@@ -309,16 +332,16 @@ class AgentFactory:
 
                     if to_rank in send_info:
                         # Send the data for this rank
-                        agent_data_tensor_to_send = send_info[to_rank]
+                        agent_data_info_to_send = list(send_info[to_rank].items())
                     else:
                         # Send None for ranks without agent data
-                        agent_data_tensor_to_send = None
+                        agent_data_info_to_send = None
 
-                    if agent_data_tensor_to_send is not None:
+                    if agent_data_info_to_send is not None:
                         # Break the data into chunks
-                        chunk_size = 1024  # Define a fixed chunk size
-                        num_chunks = len(agent_data_tensor_to_send) // chunk_size + (
-                            1 if len(agent_data_tensor_to_send) % chunk_size > 0 else 0
+                        chunk_size = 3000  # Define a fixed chunk size
+                        num_chunks = len(agent_data_info_to_send) // chunk_size + (
+                            1 if len(agent_data_info_to_send) % chunk_size > 0 else 0
                         )
                         comm.send(
                             num_chunks,
@@ -326,7 +349,7 @@ class AgentFactory:
                             tag=(worker * num_workers) + to_rank,
                         )
                         for i in range(num_chunks):
-                            chunk = agent_data_tensor_to_send[
+                            chunk = agent_data_info_to_send[
                                 i * chunk_size : (i + 1) * chunk_size
                             ]
                             comm.send(
@@ -344,17 +367,20 @@ class AgentFactory:
                     source=from_rank, tag=(from_rank * num_workers) + worker
                 )
                 if num_chunks > 0:
-                    received_data_chunks = []
                     for i in range(num_chunks):
                         chunk = comm.recv(
                             source=from_rank, tag=(from_rank * num_workers) + worker + i
                         )
-                        received_data_chunks.extend(chunk)
-                    received_neighbor_adts.extend(received_data_chunks[0])
-                    received_neighbor_ids.extend(received_data_chunks[1])
+                        chunk = dict(chunk)
+
+                        received_neighbor_adts.extend(chunk.values())
+                        received_neighbor_ids.extend(chunk.keys())
 
             comm.barrier()
 
+        print(f"Time to send and recv: {time.time() - start_time:.6f} seconds")
+
+        start_time = time.time()
         received_neighbor_adts = [list(v) for v in list(zip(*received_neighbor_adts))]
 
         if len(received_neighbor_adts) == 0:
@@ -370,7 +396,7 @@ class AgentFactory:
             self._rank2agentids.get(worker, []) + received_neighbor_ids
         )
 
-        print(f"Time to send and recv: {time.time() - start_time:.6f} seconds")
+        print(f"Time to postprocess recv: {time.time() - start_time:.6f} seconds")
 
         return (
             agent_and_neighbor_ids,
