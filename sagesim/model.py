@@ -131,16 +131,6 @@ class Model:
         sync_workers_every_n_ticks: int = 1,
     ) -> None:
 
-        # Import the package using module package
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            step_func_module = importlib.import_module(
-                os.path.splitext(self._step_function_file_path)[0]
-            )
-
-        # Access the step function using the module
-        self._step_func = step_func_module.stepfunc
-
         # TODO Remove the following commeneted code once Summit-tested
         # Generate agent data tensors
         self._worker_agent_data_tensors = (
@@ -210,6 +200,15 @@ class Model:
             the simulation by
         :param agent_ids: agents to process by this cudakernel call
         """
+        # Import the package using module package
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            step_func_module = importlib.import_module(
+                os.path.splitext(self._step_function_file_path)[0]
+            )
+
+        # Access the step function using the module
+        self._step_func = step_func_module.stepfunc
         if worker == 0:
             start_time = time.time()
         agent_ids_chunk = list(
