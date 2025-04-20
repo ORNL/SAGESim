@@ -19,7 +19,6 @@ class SIRBreed(Breed):
         self.register_step_func(step_func)
 
 
-@jit.rawkernel(device="cuda")
 def step_func(id, globals, breeds, locations, states):
     # agent_index = step_func_helper_get_agent_index(id, id2index)
     # nan checked by inequality to self. Unfortunate limitation of cupyx

@@ -117,20 +117,22 @@ class Model:
 
         # Generate global data tensor
         self._global_data_vector = cp.array(list(self._globals.values()))
-        with open(self._step_function_file_path, "w") as f:
-            f.write(
-                generate_gpu_func(
-                    self._agent_factory.num_properties,
-                    self._breed_idx_2_step_func_by_priority,
+        if worker == 0:
+            with open(self._step_function_file_path, "w") as f:
+                f.write(
+                    generate_gpu_func(
+                        self._agent_factory.num_properties,
+                        self._breed_idx_2_step_func_by_priority,
+                    )
                 )
-            )
+        comm.barrier()
 
     def simulate(
         self,
         ticks: int,
         sync_workers_every_n_ticks: int = 1,
     ) -> None:
-
+        comm.barrier()
         # Import the package using module package
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")

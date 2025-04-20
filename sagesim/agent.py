@@ -339,7 +339,7 @@ class AgentFactory:
 
                     if agent_data_info_to_send is not None:
                         # Break the data into chunks
-                        chunk_size = 3000  # Define a fixed chunk size
+                        chunk_size = 1024  # Define a fixed chunk size
                         num_chunks = len(agent_data_info_to_send) // chunk_size + (
                             1 if len(agent_data_info_to_send) % chunk_size > 0 else 0
                         )
