@@ -258,7 +258,7 @@ class AgentFactory:
             3. agent_data_tensors_subcontexts: subcontext of agent_data_tensors
                 required by agents of agent_ids_chunks to be processed by a worker
         """
-        start_time = time.time()
+
         """agentandneighbors = dict(zip(agent_ids_chunk, all_neighbors))
         agentandneighbors = [
             (k, x.item())
@@ -291,6 +291,9 @@ class AgentFactory:
         for rank, adts in send_info.items():
             # send_adts = [list(v) for v in list(zip(*adts))]
             send_info[rank] = (adts, neighborrank2agentids[rank])"""
+        if worker == 0:
+            start_time = time.time()
+            print(agent_data_tensors[0].shape, len(agent_ids_chunk), flush=True)
 
         send_info = {}
 
@@ -308,17 +311,13 @@ class AgentFactory:
                 agent_adts = [adt[i] for adt in agent_data_tensors]
                 send_info[neighbor_rank][agent_id] = agent_adts
 
-        print(
-            worker,
-            [(neighbor_rank, len(info)) for neighbor_rank, info in send_info.items()],
-            flush=True,
-        )
+        if worker == 0:
+            print(
+                f"Time to process agentandneighbors: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
 
-        print(
-            f"Time to process agentandneighbors: {time.time() - start_time:.6f} seconds"
-        )
-
-        start_time = time.time()
+            start_time = time.time()
 
         received_neighbor_adts = []
         received_neighbor_ids = []
@@ -378,7 +377,11 @@ class AgentFactory:
 
             comm.barrier()
 
-        print(f"Time to send and recv: {time.time() - start_time:.6f} seconds")
+        if worker == 0:
+            print(
+                f"Time to send and recv: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
 
         start_time = time.time()
         received_neighbor_adts = [list(v) for v in list(zip(*received_neighbor_adts))]
@@ -396,7 +399,11 @@ class AgentFactory:
             self._rank2agentids.get(worker, []) + received_neighbor_ids
         )
 
-        print(f"Time to postprocess recv: {time.time() - start_time:.6f} seconds")
+        if worker == 0:
+            print(
+                f"Time to postprocess recv: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
 
         return (
             agent_and_neighbor_ids,

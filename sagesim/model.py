@@ -213,44 +213,64 @@ class Model:
         :param agent_ids: agents to process by this cudakernel call
         """
 
-        start_time = time.time()
+        if worker == 0:
+            start_time = time.time()
         agent_ids_chunk = self._agent_factory._rank2agentids[worker]
-        print(f"Time to get agent_ids_chunk: {time.time() - start_time:.6f} seconds")
+        if worker == 0:
+            print(
+                f"Time to get agent_ids_chunk: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
 
-        start_time = time.time()
+        if worker == 0:
+            start_time = time.time()
         threadsperblock = 32
         blockspergrid = int(math.ceil(len(agent_ids_chunk) / threadsperblock))
-        print(
-            f"Time to calculate blockspergrid: {time.time() - start_time:.6f} seconds"
-        )
+        if worker == 0:
+            print(
+                f"Time to calculate blockspergrid: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
 
-        start_time = time.time()
+        if worker == 0:
+            start_time = time.time()
         agent_subcontextidxs = [
             self._agent_factory._this_rank_agent2subcontextidx[agent_id]
             for agent_id in agent_ids_chunk
         ]
-        print(
-            f"Time to get agent_subcontextidxs: {time.time() - start_time:.6f} seconds"
-        )
+        if worker == 0:
+            print(
+                f"Time to get agent_subcontextidxs: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
 
-        start_time = time.time()
+        if worker == 0:
+            start_time = time.time()
         all_neighbors = self.get_space()._neighbor_compute_func(
             self._worker_agent_data_tensors[1], agent_subcontextidxs
         )
-        print(f"Time to compute all_neighbors: {time.time() - start_time:.6f} seconds")
+        if worker == 0:
+            print(
+                f"Time to compute all_neighbors: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
 
-        start_time = time.time()
+        if worker == 0:
+            start_time = time.time()
         (
             agent_and_neighbor_ids_in_subcontext,
             worker_agent_and_neighbor_data_tensors,
         ) = self._agent_factory.contextualize_agent_data_tensors(
             self._worker_agent_data_tensors, agent_ids_chunk, all_neighbors
         )
-        print(
-            f"Time to contextualize agent data tensors: {time.time() - start_time:.6f} seconds"
-        )
+        if worker == 0:
+            print(
+                f"Time to contextualize agent data tensors: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
 
-        start_time = time.time()
+        if worker == 0:
+            start_time = time.time()
         self._step_func[blockspergrid, threadsperblock](
             self._global_data_vector,
             *worker_agent_and_neighbor_data_tensors,
@@ -259,9 +279,14 @@ class Model:
                 agent_ids_chunk, dtype=cp.int32
             ),  # agent_ids_chunk is a numpy array, convert to cupy array
         )
-        print(f"Time to execute CUDA kernel: {time.time() - start_time:.6f} seconds")
+        if worker == 0:
+            print(
+                f"Time to execute CUDA kernel: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
 
-        start_time = time.time()
+        if worker == 0:
+            start_time = time.time()
         worker_agent_and_neighbor_data_tensors = (
             self._agent_factory.reduce_agent_data_tensors(
                 worker_agent_and_neighbor_data_tensors,
@@ -269,24 +294,34 @@ class Model:
                 self._reduce_func,
             )
         )
-        print(
-            f"Time to reduce agent data tensors: {time.time() - start_time:.6f} seconds"
-        )
+        if worker == 0:
+            print(
+                f"Time to reduce agent data tensors: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
 
-        start_time = time.time()
+        if worker == 0:
+            start_time = time.time()
         self._worker_agent_data_tensors = [
             andt[: len(agent_ids_chunk)]
             for andt in worker_agent_and_neighbor_data_tensors
         ]
-        print(
-            f"Time to remove neighbor information: {time.time() - start_time:.6f} seconds"
-        )
+        if worker == 0:
+            print(
+                f"Time to remove neighbor information: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
 
-        start_time = time.time()
+        if worker == 0:
+            start_time = time.time()
         self._global_data_vector = comm.allreduce(
             self._global_data_vector, op=reduce_global_data_vector
         )
-        print(f"Time to reduce globals: {time.time() - start_time:.6f} seconds")
+        if worker == 0:
+            print(
+                f"Time to reduce globals: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
 
 
 def reduce_global_data_vector(A, B):
