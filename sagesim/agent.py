@@ -250,7 +250,11 @@ class AgentFactory:
             ] = value
 
     def contextualize_agent_data_tensors(
-        self, agent_data_tensors, agent_ids_chunk, all_neighbors
+        self,
+        agent_data_tensors,
+        agent_ids_chunk,
+        all_neighbors,
+        first_tick: bool = False,
     ) -> Tuple[Set[int], List[cp.array]]:
         """
         Chunks agent data tensors so that each distributed worker does not
@@ -270,14 +274,15 @@ class AgentFactory:
         # Write agent_data_tensors to a file
         # Create a temporary directory if it does not exist
         temp_dir = Path(f"./tmp/")
-        for agent_idx, agent_id in enumerate(agent_ids_chunk):
-            agent_info = [
-                agent_data_tensors[prop_idx][agent_idx].tolist()
-                for prop_idx in range(self.num_properties)
-            ]
-            with open(temp_dir / f"{int(agent_id)}.pkl", "wb") as f:
-                pickle.dump(agent_info, f)
-
+        if first_tick:
+            # Only write if first tick, after that the files are updated upon reduce anyway.
+            for agent_idx, agent_id in enumerate(agent_ids_chunk):
+                agent_info = [
+                    agent_data_tensors[prop_idx][agent_idx].tolist()
+                    for prop_idx in range(self.num_properties)
+                ]
+                with open(temp_dir / f"{int(agent_id)}.pkl", "wb") as f:
+                    pickle.dump(agent_info, f)
         comm.barrier()
 
         if worker == 0:
@@ -312,8 +317,12 @@ class AgentFactory:
             print(len(neighbor_ids), len(found_neighbors), flush=True)
         for neighbor_id in neighbor_ids:
             # Read neighbor data from file
-            with open(temp_dir / f"{int(agent_id)}.pkl", "rb") as f:
-                neighbor_data = pickle.load(f)
+            with open(temp_dir / f"{int(neighbor_id)}.pkl", "rb") as f:
+                try:
+                    neighbor_data = pickle.load(f)
+                except EOFError:
+                    print(neighbor_id, "EOFError", flush=True)
+                    exit()
                 for prop_idx in range(self.num_properties):
                     neighbor_adts[prop_idx].append(neighbor_data[prop_idx])
 
@@ -333,12 +342,13 @@ class AgentFactory:
             for i in range(self.num_properties)
         ]
         agent_and_neighbor_ids = agent_ids_chunk + neighbor_ids
-
+        comm.barrier()
         if worker == 0:
             print(
                 f"Time to postprocess recv: {time.time() - start_time:.6f} seconds",
                 flush=True,
             )
+
         return (
             agent_and_neighbor_ids,
             agent_and_neighbor_adts,
@@ -346,41 +356,63 @@ class AgentFactory:
 
     def reduce_agent_data_tensors(
         self,
-        agent_data_tensors,
-        agent_ids_in_subcontext,
-        all_neighbors,
+        agent_and_neighbor_data_tensors,
+        agent_and_neighbor_ids_in_subcontext,
         reduce_func: Callable = None,
     ) -> List[cp.ndarray]:
-        # Worker knows which neighbors it has data for
-        # Send neighbors data along with neighbor ids to responsible rank
-        # Recv your agents data based on neighboring ranks
-        # Reduce and integrate versions of your agents if there are duplicates received
 
-        if worker == 0:
-            start_time = time.time()
         num_agents_this_rank = len(self._rank2agentid2agentidx.get(worker).keys())
-        neighbor_ids = agent_ids_in_subcontext[num_agents_this_rank:]
+        agent_ids = agent_and_neighbor_ids_in_subcontext[:num_agents_this_rank]
+        neighbor_ids = agent_and_neighbor_ids_in_subcontext[num_agents_this_rank:]
 
+        agent_data_tensors = [
+            agent_and_neighbor_data_tensors[prop_idx][:num_agents_this_rank].tolist()
+            for prop_idx in range(self.num_properties)
+        ]
         neighbor_adts = [
-            agent_data_tensors[i][num_agents_this_rank:].tolist()
+            agent_and_neighbor_data_tensors[i][num_agents_this_rank:].tolist()
             for i in range(self.num_properties)
         ]
+
         temp_dir = Path(f"./tmp/")
-        # Write neighbor adts to a file
-        # Create a temporary directory if it does not exist
+        # First write this rank agents data to files
+        if worker == 0:
+            start_time = time.time()
+        for agent_idx, agent_id in enumerate(agent_ids):
+            agent_info = [
+                agent_data_tensors[prop_idx][agent_idx]
+                for prop_idx in range(self.num_properties)
+            ]
+            # write agent data reduce and write back
+            with open(temp_dir / f"{int(agent_id)}.pkl", "wb") as f:
+                pickle.dump(agent_info, f)
+        comm.barrier()
+        if worker == 0:
+            print(
+                f"Time to write agent data to prep for reduce: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
+
+        # Next, read, reduce, and write neighbor data to files
+        if worker == 0:
+            start_time = time.time()
         for neighbor_idx, neighbor_id in enumerate(neighbor_ids):
-            neighbor_info = [
+            neighbor_info_new = [
                 neighbor_adts[prop_idx][neighbor_idx]
                 for prop_idx in range(self.num_properties)
             ]
-            with open(temp_dir / f"{int(neighbor_id)}_v{int(worker)}.pkl", "wb") as f:
-                pickle.dump(neighbor_info, f)
-
+            # read agent data reduce and write back
+            with open(temp_dir / f"{int(neighbor_id)}.pkl", "rb+") as f:
+                neighbor_info_original = pickle.load(f)
+                # reduce
+                neighbor_info_reduced = reduce_func(
+                    neighbor_info_original, neighbor_info_new
+                )
+                pickle.dump(neighbor_info_reduced, f)
         comm.barrier()
-
         if worker == 0:
             print(
-                f"Time to write neighbor data for reduce: {time.time() - start_time:.6f} seconds",
+                f"Time to reduce and write neighbors: {time.time() - start_time:.6f} seconds",
                 flush=True,
             )
 
@@ -388,41 +420,17 @@ class AgentFactory:
             start_time = time.time()
 
         # Read version of your agents that other ranks have written
-        """# Find ranks that have data for your agents
-        agent_neighbor_ranks = []
-        for neighbor_ids in all_neighbors:
-            agent_neighbor_ranks.append([])
-            for neighbor_id in neighbor_ids.tolist():
-                if cp.isnan(neighbor_id):
-                    # Last neighbor reached
-                    break
-                neighbor_rank = self._agent2rank[int(neighbor_id)]
-                if neighbor_rank != worker:
-                    agent_neighbor_ranks[-1].append(neighbor_rank)"""
-
-        agent_data_tensors = [
-            agent_data_tensors[prop_idx][:num_agents_this_rank]
-            for prop_idx in range(self.num_properties)
-        ]
         for agent_id, agent_idx in self._rank2agentid2agentidx.get(worker).items():
-            original_adts = [
-                agent_data_tensors[prop_idx][agent_idx]
-                for prop_idx in range(self.num_properties)
-            ]
-            # Glob agent version files
-            agent_version_files = temp_dir.glob(f"{int(agent_id)}_v*.pkl")
-            # Read agent data from file
-            for agent_version_file in agent_version_files:
-                with open(agent_version_file, "rb") as f:
-                    agent_data_version = pickle.load(f)
-                    reduce_result = reduce_func(original_adts, agent_data_version)
-                    for prop_idx in range(self.num_properties):
-                        agent_data_tensors[prop_idx][agent_idx] = reduce_result[
-                            prop_idx
-                        ]
+            with open(temp_dir / f"{int(agent_id)}.pkl", "rb") as f:
+                agent_data_reduced = pickle.load(f)
+                for prop_idx in range(self.num_properties):
+                    agent_data_tensors[prop_idx][agent_idx] = agent_data_reduced[
+                        prop_idx
+                    ]
+        comm.barrier()
         if worker == 0:
             print(
-                f"Time to read and reduce adt version: {time.time() - start_time:.6f} seconds",
+                f"Time to read reduced adt version: {time.time() - start_time:.6f} seconds",
                 flush=True,
             )
 

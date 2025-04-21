@@ -274,13 +274,17 @@ class Model:
             agent_and_neighbor_ids_in_subcontext,
             worker_agent_and_neighbor_data_tensors,
         ) = self._agent_factory.contextualize_agent_data_tensors(
-            self._worker_agent_data_tensors, agent_ids_chunk, all_neighbors
+            self._worker_agent_data_tensors,
+            agent_ids_chunk,
+            all_neighbors,
+            (self._global_data_vector[0] == 0),
         )
         if worker == 0:
             print(
                 f"Time to contextualize agent data tensors: {time.time() - start_time:.6f} seconds",
                 flush=True,
             )
+
         if worker == 0:
             start_time = time.time()
         self._step_func[blockspergrid, threadsperblock](
@@ -303,7 +307,6 @@ class Model:
             self._agent_factory.reduce_agent_data_tensors(
                 worker_agent_and_neighbor_data_tensors,
                 agent_and_neighbor_ids_in_subcontext,
-                all_neighbors,
                 self._reduce_func,
             )
         )
@@ -311,35 +314,6 @@ class Model:
             print(
                 f"Time to reduce agent data tensors: {time.time() - start_time:.6f} seconds",
                 flush=True,
-            )
-
-        """if worker == 0:
-            start_time = time.time()
-        comm.barrier()
-        if worker == 0:
-            for item in temp_dir.iterdir():
-                if item.is_file():
-                    item.unlink()
-                elif item.is_dir():
-                    for sub_item in item.iterdir():
-                        sub_item.unlink()
-                    item.rmdir()
-            temp_dir.rmdir()
-        comm.barrier()
-        if worker == 0:
-            print(
-                f"Time to remove tmp dir: {time.time() - start_time:.6f} seconds",
-                flush=True,
-            )"""
-        if worker == 0:
-            start_time = time.time()
-        self._worker_agent_data_tensors = [
-            andt[: len(agent_ids_chunk)]
-            for andt in worker_agent_and_neighbor_data_tensors
-        ]
-        if worker == 0:
-            print(
-                f"Time to remove neighbor information: {time.time() - start_time:.6f} seconds"
             )
 
         if worker == 0:
