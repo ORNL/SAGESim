@@ -346,7 +346,11 @@ class AgentFactory:
         )
 
     def reduce_agent_data_tensors(
-        self, agent_data_tensors, agent_ids_in_subcontext, reduce_func: Callable = None
+        self,
+        agent_data_tensors,
+        agent_ids_in_subcontext,
+        all_neighbors,
+        reduce_func: Callable = None,
     ) -> List[cp.ndarray]:
         # Worker knows which neighbors it has data for
         # Send neighbors data along with neighbor ids to responsible rank
@@ -361,94 +365,58 @@ class AgentFactory:
             for i in range(self.num_properties)
         ]
 
-        to_ranks = [self._agent2rank[nid] for nid in neighbor_ids]
+        # Write neighbor adts to a file
+        # Create a temporary directory if it does not exist
+        temp_dir = Path(f"./tmp/")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        for neighbor_idx, neighbor_id in enumerate(neighbor_ids):
+            neighbor_info = [
+                neighbor_adts[prop_idx][neighbor_idx].tolist()
+                for prop_idx in range(self.num_properties)
+            ]
+            with open(temp_dir / f"{neighbor_id}_v{worker}.pkl", "wb") as f:
+                pickle.dump(neighbor_info, f)
 
-        neighborrankandidandadts = list(
-            zip(
-                to_ranks,
-                neighbor_ids,
-                list(
-                    zip(
-                        *neighbor_adts,
-                    )
-                ),
-            ),
-        )
+        comm.barrier()
 
-        # Find rank of neighbors
+        if worker == 0:
+            print(
+                f"Time to write neighbor data: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
 
-        neighborrank2neighborids = OrderedDict()
-        send_info = OrderedDict()
-        for rank, neighbor_id, adts in neighborrankandidandadts:
-            if neighbor_id not in neighborrank2neighborids.get(rank, []):
-                neighborrank2neighborids.setdefault(rank, []).append(neighbor_id)
-                send_info.setdefault(rank, []).append([adt for adt in adts])
+        if worker == 0:
+            start_time = time.time()
 
-        for rank, adts in send_info.items():
-            # send_adts = [list(v) for v in list(zip(*adts))]
-            send_info[rank] = dict(zip(neighborrank2neighborids[rank], adts))
+        # Read version of your agents that other ranks have written
+        # Find ranks that have data for your agents
+        agent_neighbor_ranks = []
+        for agent_idx, neighbor_ids in all_neighbors.items():
+            for neighbor_id in neighbor_ids.tolist():
+                if cp.isnan(neighbor_id):
+                    # Last neighbor reached
+                    break
+                neighbor_rank = self._agent2rank[int(neighbor_id)]
+                if neighbor_rank != worker:
+                    agent_neighbor_ranks.append(neighbor_rank)
 
-        receivedagentcopies2adts = {}
-        for from_rank in range(num_workers):
-            if from_rank == worker:
-                for to_rank in range(num_workers):
-                    if to_rank != worker:
-                        if to_rank in send_info:
-                            data_to_send = send_info[to_rank]
-                            chunk_size = 1024  # Define a fixed chunk size
-                            num_chunks = len(data_to_send) // chunk_size + (
-                                1 if len(data_to_send) % chunk_size > 0 else 0
-                            )
-                            comm.send(
-                                num_chunks,
-                                dest=to_rank,
-                                tag=(from_rank * num_workers) + to_rank,
-                            )
-                            for i in range(num_chunks):
-                                chunk = {
-                                    k: v
-                                    for k, v in list(data_to_send.items())[
-                                        i * chunk_size : (i + 1) * chunk_size
-                                    ]
-                                }
-                                comm.send(
-                                    chunk,
-                                    dest=to_rank,
-                                    tag=(from_rank * num_workers) + to_rank + i,
-                                )
-                        else:
-                            comm.send(
-                                0, dest=to_rank, tag=(from_rank * num_workers) + to_rank
-                            )
-            else:
-                num_chunks = comm.recv(
-                    source=from_rank, tag=(from_rank * num_workers) + worker
-                )
-                if num_chunks > 0:
-                    received_data = {}
-                    for i in range(num_chunks):
-                        chunk = comm.recv(
-                            source=from_rank,
-                            tag=(from_rank * num_workers) + worker + i,
-                        )
-                        received_data.update(chunk)
-                    for neighbor_id, adts in received_data.items():
-                        receivedagentcopies2adts.setdefault(neighbor_id, []).append(
-                            adts
-                        )
-
-            comm.barrier()
-
-        for agent_id, adts_versions in receivedagentcopies2adts.items():
-            if agent_id not in self._rank2agentid2agentidx.get(worker):
-                raise ValueError(
-                    f"Fatal: agent_id {agent_id} not found in rank {worker}'s subcontext"
-                )
-            subcontextidx = self._rank2agentid2agentidx.get(worker)[agent_id]
-            for adts_version in adts_versions:
-                original_adts = [adt[subcontextidx] for adt in agent_data_tensors]
-                reduce_result = reduce_func(original_adts, adts_version)
-                for prop_idx, adt in enumerate(agent_data_tensors):
-                    adt[subcontextidx] = reduce_result[prop_idx]
+        agent_data_tensors = [
+            agent_data_tensors[prop_idx][:num_agents_this_rank]
+            for prop_idx in range(self.num_properties)
+        ]
+        for agent_id, agent_idx in self._rank2agentid2agentidx.get(worker).items():
+            original_adts = [
+                agent_data_tensors[prop_idx][agent_idx]
+                for prop_idx in range(self.num_properties)
+            ]
+            # Read agent data from file
+            for neighbor_rank in agent_neighbor_ranks[agent_idx]:
+                with open(temp_dir / f"{agent_id}_v{neighbor_rank}.pkl", "rb") as f:
+                    agent_data_version = pickle.load(f)
+                    reduce_result = reduce_func(original_adts, agent_data_version)
+                    for prop_idx in range(self.num_properties):
+                        agent_data_tensors[agent_idx][prop_idx] = reduce_result[
+                            prop_idx
+                        ]
 
         return agent_data_tensors
