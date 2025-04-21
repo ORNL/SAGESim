@@ -313,7 +313,7 @@ class Model:
                 flush=True,
             )
 
-        if worker == 0:
+        """if worker == 0:
             start_time = time.time()
         comm.barrier()
         if worker == 0:
@@ -330,7 +330,7 @@ class Model:
             print(
                 f"Time to remove tmp dir: {time.time() - start_time:.6f} seconds",
                 flush=True,
-            )
+            )"""
         if worker == 0:
             start_time = time.time()
         self._worker_agent_data_tensors = [
