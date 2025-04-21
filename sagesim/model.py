@@ -11,6 +11,7 @@ import pickle
 import math
 import heapq
 import warnings
+from pathlib import Path
 
 import cupy as cp
 import numpy as np
@@ -258,6 +259,17 @@ class Model:
 
         if worker == 0:
             start_time = time.time()
+
+        temp_dir = Path(f"./tmp/")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        if worker == 0:
+            print(
+                f"Time to create tmp dir: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
+        if worker == 0:
+            start_time = time.time()
         (
             agent_and_neighbor_ids_in_subcontext,
             worker_agent_and_neighbor_data_tensors,
@@ -269,7 +281,6 @@ class Model:
                 f"Time to contextualize agent data tensors: {time.time() - start_time:.6f} seconds",
                 flush=True,
             )
-
         if worker == 0:
             start_time = time.time()
         self._step_func[blockspergrid, threadsperblock](
@@ -302,6 +313,24 @@ class Model:
                 flush=True,
             )
 
+        if worker == 0:
+            start_time = time.time()
+        comm.barrier()
+        if worker == 0:
+            for item in temp_dir.iterdir():
+                if item.is_file():
+                    item.unlink()
+                elif item.is_dir():
+                    for sub_item in item.iterdir():
+                        sub_item.unlink()
+                    item.rmdir()
+            temp_dir.rmdir()
+        comm.barrier()
+        if worker == 0:
+            print(
+                f"Time to remove tmp dir: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
         if worker == 0:
             start_time = time.time()
         self._worker_agent_data_tensors = [
