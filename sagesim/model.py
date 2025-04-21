@@ -292,6 +292,7 @@ class Model:
             self._agent_factory.reduce_agent_data_tensors(
                 worker_agent_and_neighbor_data_tensors,
                 agent_and_neighbor_ids_in_subcontext,
+                all_neighbors,
                 self._reduce_func,
             )
         )
