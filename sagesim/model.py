@@ -164,6 +164,7 @@ class Model:
                 sync_workers_every_n_ticks = ticks % sync_workers_every_n_ticks
 
             self.worker_coroutine(
+                time_chunk,
                 sync_workers_every_n_ticks,
             )
 
@@ -194,6 +195,7 @@ class Model:
     # ------------------------------------------------------
     def worker_coroutine(
         self,
+        time_chunk: int,
         sync_workers_every_n_ticks,
     ):
         """
@@ -277,7 +279,7 @@ class Model:
             self._worker_agent_data_tensors,
             agent_ids_chunk,
             all_neighbors,
-            (self._global_data_vector[0] == 0),
+            (time_chunk == 0),
         )
         if worker == 0:
             print(
