@@ -280,6 +280,7 @@ class Model:
                 agent_ids_chunk, dtype=cp.int32
             ),  # agent_ids_chunk is a numpy array, convert to cupy array
         )
+        cp.get_default_memory_pool().free_all_blocks()
         if worker == 0:
             print(
                 f"Time to execute CUDA kernel: {time.time() - start_time:.6f} seconds",
