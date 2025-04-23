@@ -48,8 +48,8 @@ class Space:
         pass
 
 
-def _network_space_compute_neighbors(agent_locations, agent_id):
-    agents_current_neighbors = agent_locations[agent_id]
+def _network_space_compute_neighbors(agent_locations):
+    agents_current_neighbors = agent_locations
     return agents_current_neighbors
 
 

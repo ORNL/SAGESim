@@ -218,7 +218,7 @@ class AgentFactory:
     def _generate_agent_data_tensors(
         self,
     ) -> Union[List[cp.ndarray],]:
-        converted_agent_data_tensors = []
+        """converted_agent_data_tensors = []
         for property_name in self._property_name_2_agent_data_tensor.keys():
             converted_agent_data_tensors.append(
                 convert_to_equal_side_tensor(
@@ -226,7 +226,8 @@ class AgentFactory:
                 )
             )
 
-        return converted_agent_data_tensors
+        return converted_agent_data_tensors"""
+        return list(self._property_name_2_agent_data_tensor.values())
 
     def _update_agent_property(
         self,
@@ -264,9 +265,9 @@ class AgentFactory:
 
         if worker == 0:
             start_time = time.time()
-            print(agent_data_tensors[0].shape, len(agent_ids_chunk), flush=True)
+            print(len(agent_data_tensors[0]), len(agent_ids_chunk), flush=True)
 
-        agent_data_tensors = [adt.tolist() for adt in agent_data_tensors]
+        agent_data_tensors = [adt for adt in agent_data_tensors]
         neighborrank2agentidandadt = {}
         neighborrankandagentidsvisited = set()
         num_agents_this_rank = len(agent_ids_chunk)
@@ -537,9 +538,9 @@ class AgentFactory:
                 for prop_idx in range(self.num_properties):
                     agent_data_tensors[prop_idx][agent_idx] = reduce_result[prop_idx]
 
-        agent_data_tensors = [
+        """agent_data_tensors = [
             convert_to_equal_side_tensor(adt) for adt in agent_data_tensors
-        ]
+        ]"""
         if worker == 0:
             print(
                 f"Time to reduce chunks: {time.time() - start_time:.6f} seconds",

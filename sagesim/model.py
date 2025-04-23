@@ -236,19 +236,8 @@ class Model:
 
         if worker == 0:
             start_time = time.time()
-        agent_subcontextidxs = list(
-            self._agent_factory._rank2agentid2agentidx[worker].values()
-        )
-        if worker == 0:
-            print(
-                f"Time to get agent_subcontextidxs: {time.time() - start_time:.6f} seconds",
-                flush=True,
-            )
-
-        if worker == 0:
-            start_time = time.time()
         all_neighbors = self.get_space()._neighbor_compute_func(
-            self._worker_agent_data_tensors[1], agent_subcontextidxs
+            self._worker_agent_data_tensors[1]
         )
         if worker == 0:
             print(
