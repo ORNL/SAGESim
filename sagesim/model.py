@@ -215,7 +215,9 @@ class Model:
 
         if worker == 0:
             start_time = time.time()
-        agent_ids_chunk = self._agent_factory._rank2agentids[worker]
+        agent_ids_chunk = list(
+            self._agent_factory._rank2agentid2agentidx[worker].keys()
+        )
         if worker == 0:
             print(
                 f"Time to get agent_ids_chunk: {time.time() - start_time:.6f} seconds",
@@ -234,10 +236,9 @@ class Model:
 
         if worker == 0:
             start_time = time.time()
-        agent_subcontextidxs = [
-            self._agent_factory._this_rank_agent2subcontextidx[agent_id]
-            for agent_id in agent_ids_chunk
-        ]
+        agent_subcontextidxs = list(
+            self._agent_factory._rank2agentid2agentidx[worker].values()
+        )
         if worker == 0:
             print(
                 f"Time to get agent_subcontextidxs: {time.time() - start_time:.6f} seconds",
