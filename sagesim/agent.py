@@ -274,7 +274,7 @@ class AgentFactory:
         for agent_idx in range(num_agents_this_rank):
             agent_id = agent_ids_chunk[agent_idx]
             for neighbor_id in all_neighbors[agent_idx]:
-                if cp.isnan(neighbor_id):
+                if np.isnan(neighbor_id):
                     break
                 neighbor_rank = self._agent2rank[int(neighbor_id)]
                 if neighbor_rank == worker:
@@ -312,7 +312,7 @@ class AgentFactory:
                 sample_value
             )  # Approximate size in bytes
             chunk_size = max(
-                1, 128 // estimated_value_size
+                1, 2 ^ 8 // estimated_value_size
             )  # Ensure at least one value per chunk
         else:
             chunk_size = 1  # Default to 1 if no data is present
@@ -460,7 +460,7 @@ class AgentFactory:
                 sample_value
             )  # Approximate size in bytes
             chunk_size = max(
-                1, 128 // estimated_value_size
+                1, 2 ^ 8 // estimated_value_size
             )  # Ensure at least one value per chunk
 
         # Send chunk nums

@@ -261,7 +261,6 @@ class Model:
 
         if worker == 0:
             start_time = time.time()
-            os.system("rocm-smi")
         self._step_func[blockspergrid, threadsperblock](
             self._global_data_vector,
             *worker_agent_and_neighbor_data_tensors,
