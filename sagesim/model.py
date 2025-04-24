@@ -215,7 +215,9 @@ class Model:
 
         if worker == 0:
             start_time = time.time()
-        agent_ids_chunk = self._agent_factory._rank2agentids[worker]
+        agent_ids_chunk = list(
+            self._agent_factory._rank2agentid2agentidx[worker].keys()
+        )
         if worker == 0:
             print(
                 f"Time to get agent_ids_chunk: {time.time() - start_time:.6f} seconds",
@@ -234,20 +236,8 @@ class Model:
 
         if worker == 0:
             start_time = time.time()
-        agent_subcontextidxs = [
-            self._agent_factory._this_rank_agent2subcontextidx[agent_id]
-            for agent_id in agent_ids_chunk
-        ]
-        if worker == 0:
-            print(
-                f"Time to get agent_subcontextidxs: {time.time() - start_time:.6f} seconds",
-                flush=True,
-            )
-
-        if worker == 0:
-            start_time = time.time()
         all_neighbors = self.get_space()._neighbor_compute_func(
-            self._worker_agent_data_tensors[1], agent_subcontextidxs
+            self._worker_agent_data_tensors[1]
         )
         if worker == 0:
             print(
@@ -279,6 +269,7 @@ class Model:
                 agent_ids_chunk, dtype=cp.int32
             ),  # agent_ids_chunk is a numpy array, convert to cupy array
         )
+        cp.get_default_memory_pool().free_all_blocks()
         if worker == 0:
             print(
                 f"Time to execute CUDA kernel: {time.time() - start_time:.6f} seconds",
