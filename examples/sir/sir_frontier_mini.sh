@@ -6,7 +6,7 @@
 #SBATCH -t 00:30:00
 #SBATCH -p batch
 #SBATCH -q debug
-#SBATCH -N 2
+#SBATCH -N 10
 
 # Only necessary if submitting like: sbatch --export=NONE ... (recommended)
 # Do NOT include this line when submitting without --export=NONE
@@ -24,21 +24,22 @@ module load craype-accel-amd-gfx90a
 source activate /lustre/orion/proj-shared/csc536/envs/sagesimenv_cg
 
 # Point to source
-export PYTHONPATH=/lustre/orion/proj-shared/csc536/gunaratnecs/SAGESim/:$PYTHONPATH
+export PYTHONPATH=/lustre/orion/proj-shared/csc536/gunaratnecs/mpisync/SAGESim/:$PYTHONPATH
 
 # Make run dir if not exists per job id
-RUN_DIR=/lustre/orion/proj-shared/csc536/gunaratnecs/SAGESim/examples/sir
+RUN_DIR=/lustre/orion/proj-shared/csc536/gunaratnecs/mpisync/SAGESim/examples/sir
 if [ ! -d "$RUN_DIR" ]
 then
         mkdir -p $RUN_DIR
 fi
 cd $RUN_DIR
 
-for num_agents in 100
+
+for num_agents in 100000
 do
-    for num_nodes in 2
+    for num_nodes in 10
     do
-        for num_init_connections in 10 20 30
+        for num_init_connections in 20
         do
             num_mpi_ranks=$((8 * ${num_nodes}))
             # Run script
