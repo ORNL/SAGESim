@@ -303,6 +303,7 @@ class AgentFactory:
         # Send chunk nums
         sends_num_chunks = []
         torank2numchunks = {}
+        total_num_chunks = 0
         other_ranks = [(worker + i) % num_workers for i in range(1, num_workers)]
         # Calculate chunk_size to ensure each chunk is <= 128 bytes
         # Estimate the size of a single value in neighborrank2agentidandadt
@@ -330,6 +331,7 @@ class AgentFactory:
                 num_chunks = len(data_to_send_to_rank) // chunk_size + (
                     1 if len(data_to_send_to_rank) % chunk_size > 0 else 0
                 )
+                total_num_chunks += num_chunks
                 torank2numchunks[to_rank] = num_chunks
                 sends_num_chunks.append(
                     comm.isend(
@@ -343,6 +345,8 @@ class AgentFactory:
         for from_rank in other_ranks:
             recvs_num_chunks_requests.append(comm.irecv(source=from_rank, tag=0))
 
+        if worker == 0:
+            print(f"Total number of chunks to send: {total_num_chunks}", flush=True)
         MPI.Request.waitall(sends_num_chunks)
         recv_chunk_sizes = MPI.Request.waitall(recvs_num_chunks_requests)
 
