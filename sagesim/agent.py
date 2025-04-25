@@ -368,21 +368,28 @@ class AgentFactory:
                 num_chunks = torank2numchunks[to_rank]
                 for i in range(num_chunks):
                     chunk = data_to_send_to_rank[i * chunk_size : (i + 1) * chunk_size]
-                    send_chunk_requests.append(
-                        comm.isend(
-                            chunk,
-                            dest=to_rank,
-                            tag=i + 1,
-                        )
+                    send_chunk_request = comm.isend(
+                        chunk,
+                        dest=to_rank,
+                        tag=i + 1,
                     )
+                    if i >= len(send_chunk_requests):
+                        send_chunk_requests.append([])
+                    send_chunk_requests[i].append(send_chunk_request)
         # Receive the chunks
         received_chunk_requests = []
         for i, from_rank in enumerate(other_ranks):
             num_chunks = recv_chunk_sizes[i]
             for j in range(num_chunks):
-                received_chunk_requests.append(comm.irecv(source=from_rank, tag=j + 1))
-        MPI.Request.waitall(send_chunk_requests)
-        received_chunks = MPI.Request.waitall(received_chunk_requests)
+                received_chunk_request = comm.irecv(source=from_rank, tag=j + 1)
+                if j >= len(received_chunk_requests):
+                    received_chunk_requests.append([])
+                received_chunk_requests[i].append(received_chunk_request)
+
+        received_chunks = []
+        for i in range(len(send_chunk_requests)):
+            MPI.Request.waitall(send_chunk_requests[i])
+            received_chunks.extend(MPI.Request.waitall(received_chunk_requests[i]))
 
         if worker == 0:
             print(
@@ -515,21 +522,28 @@ class AgentFactory:
                 num_chunks = torank2numchunks[to_rank]
                 for i in range(num_chunks):
                     chunk = data_to_send_to_rank[i * chunk_size : (i + 1) * chunk_size]
-                    send_chunk_requests.append(
-                        comm.isend(
-                            chunk,
-                            dest=to_rank,
-                            tag=i + 1,
-                        )
+                    send_chunk_request = comm.isend(
+                        chunk,
+                        dest=to_rank,
+                        tag=i + 1,
                     )
+                    if i >= len(send_chunk_requests):
+                        send_chunk_requests.append([])
+                    send_chunk_requests[i].append(send_chunk_request)
         # Receive the chunks
         received_chunk_requests = []
         for i, from_rank in enumerate(other_ranks):
             num_chunks = recv_chunk_nums[i]
             for j in range(num_chunks):
-                received_chunk_requests.append(comm.irecv(source=from_rank, tag=j + 1))
-        MPI.Request.waitall(send_chunk_requests)
-        received_chunks = MPI.Request.waitall(received_chunk_requests)
+                received_chunk_request = comm.irecv(source=from_rank, tag=j + 1)
+                if j >= len(received_chunk_requests):
+                    received_chunk_requests.append([])
+                received_chunk_requests[i].append(received_chunk_request)
+
+        received_chunks = []
+        for i in range(len(send_chunk_requests)):
+            MPI.Request.waitall(send_chunk_requests[i])
+            received_chunks.extend(MPI.Request.waitall(received_chunk_requests[i]))
         if worker == 0:
             print(
                 f"Time to send and recv reduce chunks: {time.time() - start_time:.6f} seconds",
