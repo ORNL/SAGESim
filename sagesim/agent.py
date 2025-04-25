@@ -313,10 +313,12 @@ class AgentFactory:
                 sample_value
             )  # Approximate size in bytes
             chunk_size = max(
-                1, 2 ^ 8 // estimated_value_size
+                1, 1048576 // estimated_value_size
             )  # Ensure at least one value per chunk
         else:
             chunk_size = 1  # Default to 1 if no data is present
+        if worker == 0:
+            print(f"chunk size is {chunk_size}", flush)
         for to_rank in other_ranks:
             if to_rank in neighborrank2agentidandadt:
                 # Send the data for this rank
@@ -464,9 +466,10 @@ class AgentFactory:
                 sample_value
             )  # Approximate size in bytes
             chunk_size = max(
-                1, 2 ^ 8 // estimated_value_size
+                1, 1048576 // estimated_value_size
             )  # Ensure at least one value per chunk
-
+        if worker == 0:
+            print(f"chunk size is {chunk_size}", flush=True)
         # Send chunk nums
         sends_num_chunks = []
         torank2numchunks = {}
