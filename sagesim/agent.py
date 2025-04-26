@@ -442,7 +442,6 @@ class AgentFactory:
         num_agents_this_rank = len(self._rank2agentid2agentidx.get(worker).keys())
         agent_ids = agent_and_neighbor_ids_in_subcontext[:num_agents_this_rank]
         neighbor_ids = agent_and_neighbor_ids_in_subcontext[num_agents_this_rank:]
-        print(len(neighbor_ids), len(set(neighbor_ids)), flush=True)
 
         agent_data_tensors = [
             agent_and_neighbor_data_tensors[prop_idx][:num_agents_this_rank].tolist()
