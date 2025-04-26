@@ -464,7 +464,9 @@ class AgentFactory:
                     continue
                 neighbors_visited.add(neighbor_id)
                 neighbor_rank = self._agent2rank[neighbor_id]
-                neighbor_adt = [neighbor_adt[i] for neighbor_adt in neighbor_adts]
+                neighbor_adt = [
+                    neighbor_adt[neighbor_idx] for neighbor_adt in neighbor_adts
+                ]
                 if neighbor_rank not in neighborrank2neighboridandadt:
                     neighborrank2neighboridandadt[neighbor_rank] = []
                 neighborrank2neighboridandadt[neighbor_rank].append(
@@ -529,7 +531,6 @@ class AgentFactory:
                 flush=True,
             )
             start_time = time.time()
-        exit()
 
         # Send the chunks
         send_chunk_requests = []
