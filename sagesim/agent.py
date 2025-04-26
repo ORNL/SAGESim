@@ -458,14 +458,16 @@ class AgentFactory:
         # Find rank of neighbors
         neighbors_visited = set()
         neighborrank2neighboridandadt = OrderedDict()
-        for i, neighbor_id in enumerate(neighbor_ids):
+        for neighbor_idx, neighbor_id in enumerate(neighbor_ids):
             if neighbor_id not in neighbors_visited:
                 if np.isnan(neighbor_id):
                     continue
                 neighbors_visited.add(neighbor_id)
                 neighbor_rank = self._agent2rank[neighbor_id]
                 neighbor_adt = [neighbor_adt[i] for neighbor_adt in neighbor_adts]
-                neighborrank2neighboridandadt.setdefault(neighbor_rank, []).append(
+                if neighbor_rank not in neighborrank2neighboridandadt:
+                    neighborrank2neighboridandadt[neighbor_rank] = []
+                neighborrank2neighboridandadt[neighbor_rank].append(
                     (neighbor_id, neighbor_adt)
                 )
         if worker == 0:
