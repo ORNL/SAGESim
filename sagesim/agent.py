@@ -519,9 +519,6 @@ class AgentFactory:
         recvs_num_chunks_requests = []
         for from_rank in other_ranks:
             recvs_num_chunks_requests.append(comm.irecv(source=from_rank, tag=0))
-        print(
-            len(sends_num_chunks_requests), len(recvs_num_chunks_requests), flush=True
-        )
         MPI.Request.waitall(sends_num_chunks_requests)
         recv_chunk_nums = MPI.Request.waitall(recvs_num_chunks_requests)
 

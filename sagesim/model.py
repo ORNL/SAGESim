@@ -162,9 +162,7 @@ class Model:
             elif ticks % sync_workers_every_n_ticks:
                 sync_workers_every_n_ticks = ticks % sync_workers_every_n_ticks
 
-            self.worker_coroutine(
-                sync_workers_every_n_ticks,
-            )
+            self.worker_coroutine(sync_workers_every_n_ticks)
 
     def save(self, app: "Model", fpath: str) -> None:
         """
