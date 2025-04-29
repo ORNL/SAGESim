@@ -7,7 +7,6 @@ import time
 import sys
 
 import numpy as np
-import cupy as cp
 from mpi4py import MPI
 
 from sagesim.breed import Breed
@@ -217,7 +216,7 @@ class AgentFactory:
 
     def _generate_agent_data_tensors(
         self,
-    ) -> Union[List[cp.ndarray],]:
+    ) -> List[List[Any]]:
         """converted_agent_data_tensors = []
         for property_name in self._property_name_2_agent_data_tensor.keys():
             converted_agent_data_tensors.append(
@@ -231,7 +230,7 @@ class AgentFactory:
 
     def _update_agent_property(
         self,
-        regularized_agent_data_tensors: List[cp.ndarray],
+        regularized_agent_data_tensors,
         agent_id: int,
         property_name: str,
     ) -> None:
@@ -251,7 +250,7 @@ class AgentFactory:
 
     def contextualize_agent_data_tensors(
         self, agent_data_tensors, agent_ids_chunk, all_neighbors
-    ) -> Tuple[Set[int], List[cp.array]]:
+    ):
         """
         Chunks agent data tensors so that each distributed worker does not
         get more data than the agents that worker processes actually need.
@@ -414,14 +413,6 @@ class AgentFactory:
             for prop_idx in range(self.num_properties):
                 received_neighbor_adts[prop_idx].append(adts[prop_idx])
 
-        agent_and_neighbor_adts = [
-            convert_to_equal_side_tensor(
-                agent_data_tensors[i] + received_neighbor_adts[i]
-            )
-            for i in range(self.num_properties)
-        ]
-        agent_and_neighbor_ids = agent_ids_chunk + received_neighbor_ids
-
         if worker == 0:
             print(
                 f"Time to postprocess recv: {time.time() - start_time:.6f} seconds",
@@ -429,8 +420,10 @@ class AgentFactory:
             )
 
         return (
-            agent_and_neighbor_ids,
-            agent_and_neighbor_adts,
+            agent_data_tensors,
+            agent_ids_chunk,
+            received_neighbor_ids,
+            received_neighbor_adts,
         )
 
     def reduce_agent_data_tensors(
@@ -438,7 +431,7 @@ class AgentFactory:
         agent_and_neighbor_data_tensors,
         agent_and_neighbor_ids_in_subcontext,
         reduce_func: Callable = None,
-    ) -> List[cp.ndarray]:
+    ):
 
         num_agents_this_rank = len(self._rank2agentid2agentidx.get(worker).keys())
         agent_ids = agent_and_neighbor_ids_in_subcontext[:num_agents_this_rank]

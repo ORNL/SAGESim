@@ -21,6 +21,7 @@ from sagesim.agent import (
     Breed,
 )
 from sagesim.space import Space
+from sagesim.util import convert_to_equal_side_tensor, compress_tensor
 import time
 
 comm = MPI.COMM_WORLD
@@ -246,8 +247,10 @@ class Model:
         if worker == 0:
             start_time = time.time()
         (
-            agent_and_neighbor_ids_in_subcontext,
-            worker_agent_and_neighbor_data_tensors,
+            agent_data_tensors,
+            agent_ids_chunk,
+            received_neighbor_ids,
+            received_neighbor_adts,
         ) = self._agent_factory.contextualize_agent_data_tensors(
             self._worker_agent_data_tensors, agent_ids_chunk, all_neighbors
         )
@@ -259,13 +262,28 @@ class Model:
 
         if worker == 0:
             start_time = time.time()
+        agent_and_neighbor_adts = [
+            convert_to_equal_side_tensor(
+                agent_data_tensors[i] + received_neighbor_adts[i]
+            )
+            for i in range(self._agent_factory.num_properties)
+        ]
+        agent_and_neighbor_ids = agent_ids_chunk + received_neighbor_ids
+        if worker == 0:
+            print(
+                f"Time to convert_to_equal_side_tensors: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
+
+        if worker == 0:
+            start_time = time.time()
         self._step_func[blockspergrid, threadsperblock](
             self._global_data_vector,
-            *worker_agent_and_neighbor_data_tensors,
+            *agent_and_neighbor_adts,
             sync_workers_every_n_ticks,
             cp.array(
                 agent_ids_chunk, dtype=cp.int32
-            ),  # agent_ids_chunk is a numpy array, convert to cupy array
+            ),  # agent_ids_chunk is a list, convert to cupy array
         )
         cp.get_default_memory_pool().free_all_blocks()
         if worker == 0:
@@ -275,6 +293,18 @@ class Model:
             )
 
         if worker == 0:
+            start_time = time.time()
+        num_agents = len(received_neighbor_ids)
+        agent_data_tensors = [
+            compress_tensor(agent_and_neighbor_adts[i][:num_agents])
+            for i in range(self._agent_factory.num_properties)
+        ]
+        if worker == 0:
+            print(
+                f"Time to compress tensors: {time.time() - start_time:.6f} seconds",
+            )
+
+        """if worker == 0:
             start_time = time.time()
         worker_agent_and_neighbor_data_tensors = (
             self._agent_factory.reduce_agent_data_tensors(
@@ -287,19 +317,7 @@ class Model:
             print(
                 f"Time to reduce agent data tensors: {time.time() - start_time:.6f} seconds",
                 flush=True,
-            )
-
-        if worker == 0:
-            start_time = time.time()
-        self._worker_agent_data_tensors = [
-            andt[: len(agent_ids_chunk)]
-            for andt in worker_agent_and_neighbor_data_tensors
-        ]
-        if worker == 0:
-            print(
-                f"Time to remove neighbor information: {time.time() - start_time:.6f} seconds",
-                flush=True,
-            )
+            )"""
 
         if worker == 0:
             start_time = time.time()

@@ -1,10 +1,11 @@
 from typing import List, Any
 
 import awkward as ak
+import numpy as np
 import cupy as cp
 
 
-def convert_to_equal_side_tensor(ragged_list: List[Any]) -> cp.ndarray:
+def convert_to_equal_side_tensor(ragged_list: List[Any]) -> cp.array:
     awkward_array = ak.from_iter(ragged_list)
     assert (
         awkward_array.layout.minmax_depth[0] == awkward_array.layout.minmax_depth[1]
@@ -19,12 +20,12 @@ def convert_to_equal_side_tensor(ragged_list: List[Any]) -> cp.ndarray:
         )
         i += 1
 
-    awkward_array = ak.fill_none(awkward_array, cp.nan, axis=-1)
+    awkward_array = ak.fill_none(awkward_array, np.nan, axis=-1)
 
-    return ak.to_cupy(awkward_array).astype(cp.float32)
+    return ak.to_cupy(awkward_array).astype(np.float32)
 
 
-def compress_tensor(regular_tensor: cp.ndarray, min_axis: int = 1) -> List[Any]:
+def compress_tensor(regular_tensor: cp.array, min_axis: int = 1) -> List[Any]:
     awkward_tensor = ak.from_cupy(regular_tensor)
     awkward_tensor = ak.nan_to_none(awkward_tensor)
     awkward_tensor = ak.drop_none(awkward_tensor)
