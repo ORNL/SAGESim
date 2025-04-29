@@ -296,7 +296,7 @@ class Model:
             start_time = time.time()
         num_agents = len(received_neighbor_ids)
         agent_data_tensors = [
-            compress_tensor(agent_and_neighbor_adts[i][:num_agents])
+            agent_and_neighbor_adts[i][:num_agents].tolist()
             for i in range(self._agent_factory.num_properties)
         ]
         if worker == 0:
