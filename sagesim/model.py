@@ -117,7 +117,7 @@ class Model:
                 last_priority = priority
 
         # Generate global data tensor
-        self._global_data_vector = cp.array(list(self._globals.values()))
+        self._global_data_vector = list(self._globals.values())
         if worker == 0:
             with open(self._step_function_file_path, "w") as f:
                 f.write(
@@ -274,12 +274,20 @@ class Model:
                 f"Time to convert_to_equal_side_tensors: {time.time() - start_time:.6f} seconds",
                 flush=True,
             )
+        if worker == 0:
+            start_time = time.time()
 
+        if worker == 0:
+            print(
+                f"Time to convert_to_equal_side_tensors: {time.time() - start_time:.6f} seconds",
+                flush=True,
+            )
+        self._global_data_vector = cp.array(self._global_data_vector)
         if worker == 0:
             start_time = time.time()
         try:
             self._step_func[blockspergrid, threadsperblock](
-                self._global_data_vector,
+                cp.array(self._global_data_vector),
                 *agent_and_neighbor_adts,
                 sync_workers_every_n_ticks,
                 cp.array(
@@ -327,7 +335,7 @@ class Model:
         if worker == 0:
             start_time = time.time()
         self._global_data_vector = comm.allreduce(
-            self._global_data_vector, op=reduce_global_data_vector
+            self._global_data_vector.tolist(), op=reduce_global_data_vector
         )
         if worker == 0:
             print(
