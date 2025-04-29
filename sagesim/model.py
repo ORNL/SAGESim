@@ -277,14 +277,19 @@ class Model:
 
         if worker == 0:
             start_time = time.time()
-        self._step_func[blockspergrid, threadsperblock](
-            self._global_data_vector,
-            *agent_and_neighbor_adts,
-            sync_workers_every_n_ticks,
-            cp.array(
-                agent_ids_chunk, dtype=cp.int32
-            ),  # agent_ids_chunk is a list, convert to cupy array
-        )
+        try:
+            self._step_func[blockspergrid, threadsperblock](
+                self._global_data_vector,
+                *agent_and_neighbor_adts,
+                sync_workers_every_n_ticks,
+                cp.array(
+                    agent_ids_chunk, dtype=cp.int32
+                ),  # agent_ids_chunk is a list, convert to cupy array
+            )
+        except Exception as e:
+            print(
+                blockspergrid, threadsperblock, agent_and_neighbor_adts, agent_ids_chunk
+            )
         cp.get_default_memory_pool().free_all_blocks()
         if worker == 0:
             print(
