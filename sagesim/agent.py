@@ -349,7 +349,7 @@ class AgentFactory:
 
         if worker == 0:
             print(f"Total number of chunks to send: {total_num_chunks}", flush=True)
-        print(len(sends_num_chunks), len(recvs_num_chunks_requests), flush=True)
+
         MPI.Request.waitall(sends_num_chunks)
         recvs_num_chunks = MPI.Request.waitall(recvs_num_chunks_requests)
 
