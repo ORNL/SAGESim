@@ -314,7 +314,7 @@ class AgentFactory:
             if worker == 0:
                 print(f"Estimated value size: {estimated_value_size} bytes", flush=True)
             chunk_size = max(
-                1, 1024 // estimated_value_size
+                1, 512 // estimated_value_size
             )  # Ensure at least one value per chunk
         else:
             chunk_size = 1  # Default to 1 if no data is present
@@ -581,4 +581,3 @@ class AgentFactory:
                 flush=True,
             )
 
-        return agent_data_tensors
