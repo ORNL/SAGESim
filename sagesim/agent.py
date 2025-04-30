@@ -302,7 +302,8 @@ class AgentFactory:
         sends_num_chunks = []
         torank2numchunks = {}
         total_num_chunks = 0
-        other_ranks = [(worker + i) % num_workers for i in range(1, num_workers)]
+        other_ranks_to = [(worker + i) % num_workers for i in range(1, num_workers)]
+        other_ranks_from = [(worker + i) % num_workers for i in range(1, num_workers)]
         # Calculate chunk_size to ensure each chunk is <= 128 bytes
         # Estimate the size of a single value in neighborrank2agentidandadt
         if neighborrank2agentidandadt:
@@ -319,7 +320,7 @@ class AgentFactory:
             chunk_size = 1  # Default to 1 if no data is present
         if worker == 0:
             print(f"chunk size is {chunk_size}", flush=True)
-        for to_rank in other_ranks:
+        for to_rank in other_ranks_to:
             if to_rank in neighborrank2agentidandadt:
                 # Send the data for this rank
                 data_to_send_to_rank = neighborrank2agentidandadt[to_rank]
@@ -344,7 +345,7 @@ class AgentFactory:
                 )
         # Receive num_chunks from all ranks
         recvs_num_chunks_requests = []
-        for from_rank in other_ranks:
+        for from_rank in other_ranks_from:
             recvs_num_chunks_requests.append(comm.irecv(source=from_rank, tag=0))
 
         if worker == 0:
@@ -361,7 +362,7 @@ class AgentFactory:
             start_time = time.time()
         # Send the chunks
         send_chunk_requests = []
-        for to_rank in other_ranks:
+        for to_rank in other_ranks_to:
             if to_rank in neighborrank2agentidandadt:
                 # Send the data for this rank
                 data_to_send_to_rank = neighborrank2agentidandadt[to_rank]
@@ -378,7 +379,7 @@ class AgentFactory:
                     send_chunk_requests[i].append(send_chunk_request)
         # Receive the chunks
         recv_chunk_requests = []
-        for i, from_rank in enumerate(other_ranks):
+        for i, from_rank in enumerate(other_ranks_from):
             num_chunks = recvs_num_chunks[i]
             for j in range(num_chunks):
                 received_chunk_request = comm.irecv(source=from_rank, tag=j + 1)
