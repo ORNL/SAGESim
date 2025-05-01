@@ -18,7 +18,7 @@ class SIRBreed(Breed):
         name = "SIR"
         super().__init__(name)
         self.register_property("state", SIRState.SUSCEPTIBLE.value)
-        self.register_property("preventative_measures", [-1 for _ in range(1000)])
+        self.register_property("preventative_measures", [-1 for _ in range(100)])
         self.register_step_func(step_func)
 
 
@@ -44,12 +44,14 @@ def step_func(
             neighbor_state = int(states[neighbor_index])
             neighbor_preventative_measures = preventative_measures[neighbor_index]
             abs_safety_of_interaction = 0.0
-            for j in range(len(agent_preventative_measures)):
-                abs_safety_of_interaction += (
-                    agent_preventative_measures[j] + neighbor_preventative_measures[j]
-                )
+            for n in range(len(agent_preventative_measures)):
+                for m in range(len(neighbor_preventative_measures)):
+                    abs_safety_of_interaction += (
+                        agent_preventative_measures[n]
+                        * neighbor_preventative_measures[m]
+                    )
             normalized_safety_of_interaction = abs_safety_of_interaction / (
-                2 * len(agent_preventative_measures)
+                len(agent_preventative_measures) ** 2
             )
             if neighbor_state == 2 and rand < p_infection * (
                 1 - normalized_safety_of_interaction
