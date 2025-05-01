@@ -18,7 +18,7 @@ class SIRBreed(Breed):
         name = "SIR"
         super().__init__(name)
         self.register_property("state", SIRState.SUSCEPTIBLE.value)
-        self.register_property("preventative_measures", [-1 for _ in range(100)])
+        self.register_property("preventative_measures", [-1 for _ in range(10000)])
         self.register_step_func(step_func)
 
 

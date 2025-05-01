@@ -336,7 +336,7 @@ class AgentFactory:
             """if worker == 0:
                 print(f"Estimated value size: {estimated_value_size} bytes", flush=True)"""
             chunk_size = max(
-                1, 512 // estimated_value_size
+                1, 128 // estimated_value_size
             )  # Ensure at least one value per chunk
         else:
             chunk_size = 0  # Default to 1 if no data is present

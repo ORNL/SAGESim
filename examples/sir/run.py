@@ -34,7 +34,7 @@ def generate_small_world_of_agents(
 ) -> SIRModel:
     network = generate_small_world_network(num_agents, num_init_connections, 0.2)
     for n in network.nodes:
-        preventative_measures = [random() for _ in range(100)]
+        preventative_measures = [random() for _ in range(1000)]
         model.create_agent(SIRState.SUSCEPTIBLE.value, preventative_measures)
 
     """print(f"Number of infected agents: {num_infected}")"""
