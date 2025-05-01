@@ -25,8 +25,10 @@ class SIRModel(Model):
         self.register_global_property("p_infection", p_infection)
         self.register_reduce_function(reduce_agent_data_tensors_)
 
-    def create_agent(self, state):
-        agent_id = self.create_agent_of_breed(self._sir_breed, state=state)
+    def create_agent(self, state, preventative_measures):
+        agent_id = self.create_agent_of_breed(
+            self._sir_breed, state=state, preventative_measures=preventative_measures
+        )
         self.get_space().add_agent(agent_id)
         return agent_id
 

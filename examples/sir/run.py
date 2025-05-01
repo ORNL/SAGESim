@@ -3,6 +3,7 @@ import argparse
 from sir_model import SIRModel
 from state import SIRState
 from mpi4py import MPI
+from random import random
 
 from random import sample
 
@@ -28,30 +29,13 @@ def generate_small_world_network(n, k, p):
     return nx.watts_strogatz_graph(n, k, p)
 
 
-def test_network():
-    network = nx.Graph()
-    network.add_nodes_from(range(8))
-    network.add_edges_from(
-        [(0, 1), (0, 4), (2, 3), (3, 4), (4, 5), (4, 7), (6, 5), (7, 6)]
-    )
-
-    for n in network.nodes:
-        if n == 0:
-            model.create_agent(SIRState.INFECTED.value)
-        else:
-            model.create_agent(SIRState.SUSCEPTIBLE.value)
-
-    for edge in network.edges:
-        model.connect_agents(edge[0], edge[1])
-    return model
-
-
 def generate_small_world_of_agents(
     model, num_agents: int, num_init_connections: int, num_infected: int
 ) -> SIRModel:
     network = generate_small_world_network(num_agents, num_init_connections, 0.2)
     for n in network.nodes:
-        model.create_agent(SIRState.SUSCEPTIBLE.value)
+        preventative_measures = [random() for _ in range(100)]
+        model.create_agent(SIRState.SUSCEPTIBLE.value, preventative_measures)
 
     print(f"Number of infected agents: {num_infected}")
     for n in sample(sorted(network.nodes), num_infected):
