@@ -54,7 +54,7 @@ class Model:
 
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
         self._agent_factory._update_agent_property(
-            self._worker_agent_data_tensors, id, property_name
+            self.__rank_local_agent_data_tensors, id, property_name
         )
         return self._agent_factory.get_agent_property_value(
             property_name=property_name, agent_id=id
@@ -146,7 +146,7 @@ class Model:
 
         # TODO Remove the following commeneted code once Summit-tested
         # Generate agent data tensors
-        self._worker_agent_data_tensors = (
+        self.__rank_local_agent_data_tensors = (
             self._agent_factory._generate_agent_data_tensors()
         )
 
@@ -214,7 +214,7 @@ class Model:
 
         if worker == 0:
             start_time = time.time()
-        agent_ids_chunk = list(
+        self.__rank_local_agent_ids = list(
             self._agent_factory._rank2agentid2agentidx[worker].keys()
         )
         if worker == 0:
@@ -226,7 +226,9 @@ class Model:
         if worker == 0:
             start_time = time.time()
         threadsperblock = 32
-        blockspergrid = int(math.ceil(len(agent_ids_chunk) / threadsperblock))
+        blockspergrid = int(
+            math.ceil(len(self.__rank_local_agent_ids) / threadsperblock)
+        )
         if worker == 0:
             print(
                 f"Time to calculate blockspergrid: {time.time() - start_time:.6f} seconds",
@@ -235,8 +237,8 @@ class Model:
 
         if worker == 0:
             start_time = time.time()
-        all_neighbors = self.get_space()._neighbor_compute_func(
-            self._worker_agent_data_tensors[1]
+        rank_local_agents_neighbors = self.get_space()._neighbor_compute_func(
+            self.__rank_local_agent_data_tensors[1]
         )
         if worker == 0:
             print(
@@ -247,13 +249,16 @@ class Model:
         if worker == 0:
             start_time = time.time()
         (
-            agent_data_tensors,
-            agent_ids_chunk,
+            self.__rank_local_agent_ids,
+            self.__rank_local_agent_data_tensors,
             received_neighbor_ids,
             received_neighbor_adts,
         ) = self._agent_factory.contextualize_agent_data_tensors(
-            self._worker_agent_data_tensors, agent_ids_chunk, all_neighbors
+            self.__rank_local_agent_data_tensors,
+            self.__rank_local_agent_ids,
+            rank_local_agents_neighbors,
         )
+
         if worker == 0:
             print(
                 f"Time to contextualize agent data tensors: {time.time() - start_time:.6f} seconds",
@@ -262,42 +267,55 @@ class Model:
 
         if worker == 0:
             start_time = time.time()
-        agent_and_neighbor_adts = [
+        rank_local_agent_and_neighbor_adts = [
             convert_to_equal_side_tensor(
-                agent_data_tensors[i] + received_neighbor_adts[i]
+                self.__rank_local_agent_data_tensors[i] + received_neighbor_adts[i]
             )
             for i in range(self._agent_factory.num_properties)
         ]
-        agent_and_neighbor_ids = agent_ids_chunk + received_neighbor_ids
         if worker == 0:
             print(
                 f"Time to convert_to_equal_side_tensors: {time.time() - start_time:.6f} seconds",
                 flush=True,
             )
-        if worker == 0:
-            start_time = time.time()
 
-        if worker == 0:
-            print(
-                f"Time to convert_to_equal_side_tensors: {time.time() - start_time:.6f} seconds",
-                flush=True,
-            )
         self._global_data_vector = cp.array(self._global_data_vector)
         if worker == 0:
             start_time = time.time()
-            print(
-                    blockspergrid, threadsperblock, [len(adt) for adt in agent_and_neighbor_adts], [adt[0] for adt in agent_and_neighbor_adts], len(agent_ids_chunk), agent_ids_chunk[0],
-            )        
+
+        rank_local_agent_and_non_local_neighbor_ids = cp.array(
+            self.__rank_local_agent_ids + received_neighbor_ids
+        )
+
+        # Capture the state of rank_local_agent_and_neighbor_adts before the step function call
+        """before_step_func = [
+            cp.asnumpy(adt.copy()) for adt in rank_local_agent_and_neighbor_adts
+        ]"""
+
         self._step_func[blockspergrid, threadsperblock](
             self._global_data_vector,
-            *agent_and_neighbor_adts,
+            *rank_local_agent_and_neighbor_adts,
             sync_workers_every_n_ticks,
-            cp.array(
-                agent_ids_chunk, dtype=cp.int32
-            ),  # agent_ids_chunk is a list, convert to cupy array
+            cp.float32(len(self.__rank_local_agent_ids)),
+            rank_local_agent_and_non_local_neighbor_ids,
         )
-        
-        
+
+        # Capture the state of rank_local_agent_and_neighbor_adts after the step function call
+        """after_step_func = [
+            cp.asnumpy(adt.copy()) for adt in rank_local_agent_and_neighbor_adts
+        ]"""
+
+        # Compare and print the changes
+        """for prop_idx in range(self._agent_factory.num_properties):
+            if not np.array_equal(
+                before_step_func[prop_idx], after_step_func[prop_idx], equal_nan=True
+            ):
+                print(
+                    worker,
+                    f"Property {prop_idx} changed: {before_step_func[prop_idx]} -> {after_step_func[prop_idx]}",
+                    flush=True,
+                )"""
+
         cp.get_default_memory_pool().free_all_blocks()
         if worker == 0:
             print(
@@ -307,9 +325,9 @@ class Model:
 
         if worker == 0:
             start_time = time.time()
-        num_agents = len(received_neighbor_ids)
-        agent_data_tensors = [
-            agent_and_neighbor_adts[i][:num_agents].tolist()
+        num_agents = len(self.__rank_local_agent_ids)
+        self.__rank_local_agent_data_tensors = [
+            rank_local_agent_and_neighbor_adts[i][:num_agents].tolist()
             for i in range(self._agent_factory.num_properties)
         ]
         if worker == 0:
@@ -347,18 +365,6 @@ class Model:
 def reduce_global_data_vector(A, B):
     values = np.stack([A, B], axis=1)
     return np.max(values, axis=1)
-
-
-def reduce_agent_data_tensors_(adts_A, adts_B):
-    result = []
-    # breed would be same as first
-    result.append(adts_A[0])
-    # network would be same as first
-    result.append(adts_A[1])
-    # state would be max value. Infected superceeds susceptible.
-    states_A, states_B = adts_A[2], adts_B[2]
-    result.append(max(states_A, states_B))
-    return result
 
 
 def generate_gpu_func(
@@ -420,7 +426,7 @@ def generate_gpu_func(
         for breedidx, breed_step_func in breed_idx_2_step_func.items():
             step_source = inspect.getsource(breed_step_func)
             step_sources += (
-                "\n\nimport cupy as cp\nimport math\n\n@jit.rawkernel(device='cuda')\n"
+                "\n\nimport cupy as cp\nimport math\nimport bisect\n\n@jit.rawkernel(device='cuda')\n"
                 + step_source
             )
             step_func_name = getattr(breed_step_func, "__name__", repr(callable))
@@ -428,7 +434,8 @@ def generate_gpu_func(
             sim_loop += f"""
             \n\t\t\t\tif breed_id == {breedidx}:
             \t\t{step_func_name}(
-            \t\t\tagent_id,
+            \t\t\tagent_ids,
+            \t\t\tagent_index,
             \t\t\tdevice_global_data_vector,
             \t\t\t{','.join(args)},
             \t\t)
@@ -444,16 +451,17 @@ def stepfunc(
     device_global_data_vector,
     {','.join(args)},
     sync_workers_every_n_ticks,
+    num_rank_local_agents,
     agent_ids,
     ):
         thread_id = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x
         #g = cuda.cg.this_grid()
-        agent_id = thread_id        
-        if agent_id < agent_ids.shape[0]:
-            breed_id = a0[agent_id]                
+        agent_index = thread_id        
+        if agent_index < num_rank_local_agents:
+            breed_id = a0[agent_index]                
             for tick in range(sync_workers_every_n_ticks):
                 {sim_loop}                
-                if thread_id == 0:
+                if agent_index == 0:
                     device_global_data_vector[0] += 1
     """
     func = func.replace("\t", "    ")

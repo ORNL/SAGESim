@@ -2,7 +2,7 @@ from __future__ import annotations
 import math
 from typing import Any, Callable, Iterable, List, Dict, Union, Tuple, Set
 from collections import OrderedDict
-from copy import copy
+from copy import copy, deepcopy
 import time
 import sys
 
@@ -46,6 +46,8 @@ class AgentFactory:
         self._rank2agentid2agentidx = {}  # global
 
         self._current_rank = 0
+
+        self._prev_agent_data = {}
 
     @property
     def breeds(self) -> List[Breed]:
@@ -271,6 +273,26 @@ class AgentFactory:
         num_agents_this_rank = len(agent_ids_chunk)
         for agent_idx in range(num_agents_this_rank):
             agent_id = agent_ids_chunk[agent_idx]
+            agent_adts = [adt[agent_idx] for adt in agent_data_tensors]
+            if agent_id not in self._prev_agent_data:
+                self._prev_agent_data[agent_id] = agent_adts
+            else:
+                # If the agent data has not changed, skip sending it
+                agent_changed = False
+                for prop_idx in range(self.num_properties):
+                    if not np.array_equal(
+                        agent_adts[prop_idx],
+                        self._prev_agent_data[agent_id][prop_idx],
+                        equal_nan=True,
+                    ):
+                        agent_changed = True
+                        break
+                if agent_changed:
+                    continue
+                else:
+                    # Update the previous agent data
+                    self._prev_agent_data[agent_id] = agent_adts
+
             for neighbor_id in all_neighbors[agent_idx]:
                 if np.isnan(neighbor_id):
                     break
@@ -283,7 +305,6 @@ class AgentFactory:
                     neighborrankandagentidsvisited.add((neighbor_rank, agent_id))
                     if neighbor_rank not in neighborrank2agentidandadt.keys():
                         neighborrank2agentidandadt[neighbor_rank] = []
-                    agent_adts = [adt[agent_idx] for adt in agent_data_tensors]
                     neighborrank2agentidandadt[neighbor_rank].append(
                         (agent_id, agent_adts)
                     )
@@ -317,18 +338,13 @@ class AgentFactory:
                 1, 512 // estimated_value_size
             )  # Ensure at least one value per chunk
         else:
-            chunk_size = 1  # Default to 1 if no data is present
+            chunk_size = 0  # Default to 1 if no data is present
         if worker == 0:
             print(f"chunk size is {chunk_size}", flush=True)
         for to_rank in other_ranks_to:
             if to_rank in neighborrank2agentidandadt:
                 # Send the data for this rank
                 data_to_send_to_rank = neighborrank2agentidandadt[to_rank]
-            else:
-                # Send None for ranks without agent data
-                data_to_send_to_rank = None
-
-            if data_to_send_to_rank is not None:
                 # Break the data into chunks
 
                 num_chunks = len(data_to_send_to_rank) // chunk_size + (
@@ -339,6 +355,16 @@ class AgentFactory:
                 sends_num_chunks.append(
                     comm.isend(
                         num_chunks,
+                        dest=to_rank,
+                        tag=0,
+                    )
+                )
+            else:
+                # No data to send to this rank
+                torank2numchunks[to_rank] = 0
+                sends_num_chunks.append(
+                    comm.isend(
+                        0,
                         dest=to_rank,
                         tag=0,
                     )
@@ -409,7 +435,7 @@ class AgentFactory:
         # Process received chunks
         received_neighbor_adts = [[] for _ in range(self.num_properties)]
         received_neighbor_ids = []
-        for neighbor_id, adts in received_data:
+        for neighbor_idx, (neighbor_id, adts) in enumerate(received_data):
             received_neighbor_ids.append(neighbor_id)
             for prop_idx in range(self.num_properties):
                 received_neighbor_adts[prop_idx].append(adts[prop_idx])
@@ -421,8 +447,8 @@ class AgentFactory:
             )
 
         return (
-            agent_data_tensors,
             agent_ids_chunk,
+            agent_data_tensors,
             received_neighbor_ids,
             received_neighbor_adts,
         )
@@ -580,4 +606,3 @@ class AgentFactory:
                 f"Time to reduce chunks: {time.time() - start_time:.6f} seconds",
                 flush=True,
             )
-

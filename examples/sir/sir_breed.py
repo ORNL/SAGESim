@@ -3,6 +3,8 @@ from random import random
 from sagesim.breed import Breed
 from state import SIRState
 from cupyx import jit
+import cupy as cp
+import bisect
 
 global INFECTED
 INFECTED = SIRState.INFECTED.value
@@ -19,22 +21,20 @@ class SIRBreed(Breed):
         self.register_step_func(step_func)
 
 
-def step_func(id, globals, breeds, locations, states):
-    # agent_index = step_func_helper_get_agent_index(id, id2index)
-    # nan checked by inequality to self. Unfortunate limitation of cupyx
-    if id == id:
-        agent_index = int(id)
+def step_func(agent_ids, agent_index, globals, breeds, locations, states):
 
-        neighbors = locations[agent_index]  # network location is defined by neighbors
-        rand = random()  # 0.1#step_func_helper_get_random_float(rng_states, id)
+    neighbor_ids = locations[agent_index]  # network location is defined by neighbors
+    rand = random()  # 0.1#step_func_helper_get_random_float(rng_states, id)
 
-        p_infection = globals[1]
+    p_infection = globals[1]
+    for i in range(len(neighbor_ids)):
 
-        for i in range(len(neighbors)):
-            neighbor_id = neighbors[i]
-            # neighbor_index = step_func_helper_get_agent_index(neighbor_id, id2index)
-            if (neighbor_id == neighbor_id) and (int(neighbor_id) == int(neighbor_id)):
-                neighbor_index = int(neighbor_id)
-                neighbor_state = states[neighbor_index]
-                if neighbor_state == 2 and rand < p_infection:
-                    states[agent_index] = 2
+        neighbor_index = -1
+        i = 0
+        while i < len(agent_ids) and agent_ids[i] != neighbor_ids[0]:
+            i += 1
+        if i < len(agent_ids):
+            neighbor_index = i
+            neighbor_state = int(states[neighbor_index])
+            if neighbor_state == 2 and rand < p_infection:
+                states[agent_index] = 2
