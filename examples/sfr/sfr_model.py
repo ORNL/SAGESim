@@ -27,10 +27,9 @@ class SFRModel(Model):
         self.register_breed(breed=self._sfr_breed)
         self.register_reduce_function(reduce_agent_data_tensors_)
 
-    def create_agent(self, osmnxid, popularity, vehicle_num):
+    def create_agent(self, popularity, vehicle_num):
         agent_id = self.create_agent_of_breed(
             self._sfr_breed,
-            osmnxid=osmnxid,
             popularity=popularity,
             vehicle_num=vehicle_num,
         )
