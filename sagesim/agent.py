@@ -264,9 +264,9 @@ class AgentFactory:
                 required by agents of agent_ids_chunks to be processed by a worker
         """
 
-        if worker == 0:
+        """if worker == 0:
             start_time = time.time()
-            print(len(agent_data_tensors[0]), len(agent_ids_chunk), flush=True)
+            print(len(agent_data_tensors[0]), len(agent_ids_chunk), flush=True)"""
 
         neighborrank2agentidandadt = {}
         neighborrankandagentidsvisited = set()
@@ -288,10 +288,11 @@ class AgentFactory:
                         agent_changed = True
                         break
                 if agent_changed:
-                    continue
-                else:
                     # Update the previous agent data
                     self._prev_agent_data[agent_id] = agent_adts
+                else:
+                    # Skip sending this agent if its data has not changed
+                    continue
 
             for neighbor_id in all_neighbors[agent_idx]:
                 if np.isnan(neighbor_id):
@@ -309,13 +310,13 @@ class AgentFactory:
                         (agent_id, agent_adts)
                     )
 
-        if worker == 0:
+        """if worker == 0:
             print(
                 f"Time to process agentandneighbors: {time.time() - start_time:.6f} seconds",
                 flush=True,
             )
 
-            start_time = time.time()
+            start_time = time.time()"""
 
         received_neighbor_adts = []
         received_neighbor_ids = []
@@ -332,15 +333,15 @@ class AgentFactory:
             estimated_value_size = sys.getsizeof(
                 sample_value
             )  # Approximate size in bytes
-            if worker == 0:
-                print(f"Estimated value size: {estimated_value_size} bytes", flush=True)
+            """if worker == 0:
+                print(f"Estimated value size: {estimated_value_size} bytes", flush=True)"""
             chunk_size = max(
                 1, 512 // estimated_value_size
             )  # Ensure at least one value per chunk
         else:
             chunk_size = 0  # Default to 1 if no data is present
-        if worker == 0:
-            print(f"chunk size is {chunk_size}", flush=True)
+        """if worker == 0:
+            print(f"chunk size is {chunk_size}", flush=True)"""
         for to_rank in other_ranks_to:
             if to_rank in neighborrank2agentidandadt:
                 # Send the data for this rank
@@ -374,18 +375,18 @@ class AgentFactory:
         for from_rank in other_ranks_from:
             recvs_num_chunks_requests.append(comm.irecv(source=from_rank, tag=0))
 
-        if worker == 0:
-            print(f"Total number of chunks to send: {total_num_chunks}", flush=True)
+        # if worker == 0:
+        """print(f"Total number of chunks to send: {total_num_chunks}", flush=True)"""
 
         MPI.Request.waitall(sends_num_chunks)
         recvs_num_chunks = MPI.Request.waitall(recvs_num_chunks_requests)
 
-        if worker == 0:
+        """if worker == 0:
             print(
                 f"Time to send and recv num_chunks: {time.time() - start_time:.6f} seconds",
                 flush=True,
             )
-            start_time = time.time()
+            start_time = time.time()"""
         # Send the chunks
         send_chunk_requests = []
         for to_rank in other_ranks_to:
@@ -424,13 +425,13 @@ class AgentFactory:
                 for received_data_rank_chunk in received_data_ranks_chunk:
                     received_data.extend(received_data_rank_chunk)
 
-        if worker == 0:
+        """if worker == 0:
             print(
                 f"Time to send and recv: {time.time() - start_time:.6f} seconds",
                 flush=True,
             )
 
-        start_time = time.time()
+        start_time = time.time()"""
 
         # Process received chunks
         received_neighbor_adts = [[] for _ in range(self.num_properties)]
@@ -440,11 +441,11 @@ class AgentFactory:
             for prop_idx in range(self.num_properties):
                 received_neighbor_adts[prop_idx].append(adts[prop_idx])
 
-        if worker == 0:
+        """if worker == 0:
             print(
                 f"Time to postprocess recv: {time.time() - start_time:.6f} seconds",
                 flush=True,
-            )
+            )"""
 
         return (
             agent_ids_chunk,

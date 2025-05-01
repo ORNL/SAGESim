@@ -164,6 +164,7 @@ class Model:
                 sync_workers_every_n_ticks = ticks % sync_workers_every_n_ticks
 
             self.worker_coroutine(sync_workers_every_n_ticks)
+        # print(self.__rank_local_agent_data_tensors[2])
 
     def save(self, app: "Model", fpath: str) -> None:
         """
@@ -212,42 +213,42 @@ class Model:
         :param agent_ids: agents to process by this cudakernel call
         """
 
-        if worker == 0:
-            start_time = time.time()
+        """if worker == 0:
+            start_time = time.time()"""
         self.__rank_local_agent_ids = list(
             self._agent_factory._rank2agentid2agentidx[worker].keys()
         )
-        if worker == 0:
+        """if worker == 0:
             print(
                 f"Time to get agent_ids_chunk: {time.time() - start_time:.6f} seconds",
                 flush=True,
-            )
+            )"""
 
-        if worker == 0:
-            start_time = time.time()
+        """if worker == 0:
+            start_time = time.time()"""
         threadsperblock = 32
         blockspergrid = int(
             math.ceil(len(self.__rank_local_agent_ids) / threadsperblock)
         )
-        if worker == 0:
+        """if worker == 0:
             print(
                 f"Time to calculate blockspergrid: {time.time() - start_time:.6f} seconds",
                 flush=True,
-            )
+            )"""
 
-        if worker == 0:
-            start_time = time.time()
+        """if worker == 0:
+            start_time = time.time()"""
         rank_local_agents_neighbors = self.get_space()._neighbor_compute_func(
             self.__rank_local_agent_data_tensors[1]
         )
-        if worker == 0:
+        """if worker == 0:
             print(
                 f"Time to compute all_neighbors: {time.time() - start_time:.6f} seconds",
                 flush=True,
-            )
+            )"""
 
-        if worker == 0:
-            start_time = time.time()
+        """if worker == 0:
+            start_time = time.time()"""
         (
             self.__rank_local_agent_ids,
             self.__rank_local_agent_data_tensors,
@@ -259,29 +260,29 @@ class Model:
             rank_local_agents_neighbors,
         )
 
-        if worker == 0:
+        """if worker == 0:
             print(
                 f"Time to contextualize agent data tensors: {time.time() - start_time:.6f} seconds",
                 flush=True,
-            )
+            )"""
 
-        if worker == 0:
-            start_time = time.time()
+        """if worker == 0:
+            start_time = time.time()"""
         rank_local_agent_and_neighbor_adts = [
             convert_to_equal_side_tensor(
                 self.__rank_local_agent_data_tensors[i] + received_neighbor_adts[i]
             )
             for i in range(self._agent_factory.num_properties)
         ]
-        if worker == 0:
+        """if worker == 0:
             print(
                 f"Time to convert_to_equal_side_tensors: {time.time() - start_time:.6f} seconds",
                 flush=True,
-            )
+            )"""
 
         self._global_data_vector = cp.array(self._global_data_vector)
-        if worker == 0:
-            start_time = time.time()
+        """if worker == 0:
+            start_time = time.time()"""
 
         rank_local_agent_and_non_local_neighbor_ids = cp.array(
             self.__rank_local_agent_ids + received_neighbor_ids
@@ -317,23 +318,23 @@ class Model:
                 )"""
 
         cp.get_default_memory_pool().free_all_blocks()
-        if worker == 0:
+        """if worker == 0:
             print(
                 f"Time to execute CUDA kernel: {time.time() - start_time:.6f} seconds",
                 flush=True,
-            )
+            )"""
 
-        if worker == 0:
-            start_time = time.time()
+        """if worker == 0:
+            start_time = time.time()"""
         num_agents = len(self.__rank_local_agent_ids)
         self.__rank_local_agent_data_tensors = [
             rank_local_agent_and_neighbor_adts[i][:num_agents].tolist()
             for i in range(self._agent_factory.num_properties)
         ]
-        if worker == 0:
+        """if worker == 0:
             print(
                 f"Time to compress tensors: {time.time() - start_time:.6f} seconds",
-            )
+            )"""
 
         """if worker == 0:
             start_time = time.time()
@@ -350,16 +351,16 @@ class Model:
                 flush=True,
             )"""
 
-        if worker == 0:
-            start_time = time.time()
+        """if worker == 0:
+            start_time = time.time()"""
         self._global_data_vector = comm.allreduce(
             self._global_data_vector.tolist(), op=reduce_global_data_vector
         )
-        if worker == 0:
+        """if worker == 0:
             print(
                 f"Time to reduce globals: {time.time() - start_time:.6f} seconds",
                 flush=True,
-            )
+            )"""
 
 
 def reduce_global_data_vector(A, B):

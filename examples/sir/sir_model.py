@@ -17,7 +17,7 @@ def reduce_agent_data_tensors_(adts_A, adts_B):
 
 class SIRModel(Model):
 
-    def __init__(self, p_infection=0.5) -> None:
+    def __init__(self, p_infection=1.0) -> None:
         space = NetworkSpace()
         super().__init__(space)
         self._sir_breed = SIRBreed()

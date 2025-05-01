@@ -37,7 +37,7 @@ def generate_small_world_of_agents(
         preventative_measures = [random() for _ in range(100)]
         model.create_agent(SIRState.SUSCEPTIBLE.value, preventative_measures)
 
-    print(f"Number of infected agents: {num_infected}")
+    """print(f"Number of infected agents: {num_infected}")"""
     for n in sample(sorted(network.nodes), num_infected):
         model.set_agent_property_value(n, "state", SIRState.INFECTED.value)
 
