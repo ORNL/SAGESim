@@ -53,6 +53,7 @@ def generate_small_world_of_agents(
     for n in network.nodes:
         model.create_agent(SIRState.SUSCEPTIBLE.value)
 
+    print(f"Number of infected agents: {num_infected}")
     for n in sample(sorted(network.nodes), num_infected):
         model.set_agent_property_value(n, "state", SIRState.INFECTED.value)
 
