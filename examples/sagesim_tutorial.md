@@ -93,60 +93,86 @@ class Custom_Model(Model):
 ````
 
 
-## Defining a Custom Model Class
+### 1. **Breed Class**
 
-Builiding a custom model class that subclasses the base `Model` class provided by `sagesim`, is the core part of using `sagesim`, as this enables access to the built-in `simulate()` method to execute your simulations. 
+Every agent in a `sagesim` model belongs to a specific *breed*. To define a breed, you must subclass the `Breed` class provided by `sagesim`. Each breed class is responsible for:
 
-This model class is repsonsible for 
-- **Define and Register Breeds**: Register the breed inside the model’s `__init__()` method using `register_breed()`.
-- **Define and Register the Reduce Function**: If a reduce function is needed, register it in the model’s `__init__()` method using the `register_reduce_function()` method.
-- **Register global properties**: If you have any global properties, they should be registered in the model class's `__init__()` method using `register_global_property()`.
-- **Create class methods to create and connect Agents**
-    - Specify which breed each agent belongs to and assign initial values for the agent's attributes using `create_agent_of_breed()`, which takes the breed object along with user-defined breed properties. It returns the unique ID of the newly created agent.
-    - Connect two agents, that is, to create neighborship between two agents, using `connect_agents()`.
+- Registering agent-specific properties using `self.register_property()`.
+- Defining and registering one or more step functions using `self.register_step_func()` to specify the agent’s behavior at each simulation step.
 
-The example `Custom_Model` below demonstrates a model class with:
+#### Example: `Custom_Breed_1`
 
-- Two breeds, each having two user-defined properties
-- One global property
-- A registered reduce function
+```python
+class Custom_Breed_1(Breed):
 
-````python
+    def __init__(self) -> None:
+        name = "Custom_Breed_1"
+        super().__init__(name)
+        self.register_property("breed_1_property_1")
+        self.register_property("breed_1_property_2")
+        self.register_step_func(step_func_1)
+```
 
-from sagesim.model import Model
-from sagesim.space import NetworkSpace
+##### **`Step Function`**
 
-class Custom_Model(Model):
+A step function defines how an agent behaves during each simulation tick. Every breed must register at least one step function. Multiple step functions can be registered with different priorities.
 
-    def __init__(self, global_property_value, **kwargs) -> None:
-        space = NetworkSpace()
-        super().__init__(space)
-        # register your breeds
-        self.Custom_Bread_1 = Custom_Bread_1
-        self.Custom_Bread_2 = Custom_Bread_2
-        self.register_breed(breed=self.Custom_Bread_1)
-        self.register_breed(breed=self.Custom_Bread_2)
-        # register your global property
-        self.register_global_property("global_property_1", global_property_value)
-        # register reduce function if needed
-        self.register_reduce_function(reduce_function)
+Below is the general structure of a `sagesim` step function:
 
-    def create_agent_1(self, breed_1_property_1, breed_1_property_2):
-        agent_id = self.create_agent_of_breed(
-            self.Custom_Bread_1, breed_1_property_1, breed_1_property_2
-        )
-        self.get_space().add_agent(agent_id)
-        return agent_id
-        
-    def create_agent_2(self, breed_2_property_1, breed_2_property_2):
-        agent_id = self.create_agent_of_breed(
-            self.Custom_Bread_2, breed_2_property_1, breed_2_property_2
-        )
-        self.get_space().add_agent(agent_id)
-        return agent_id
-    def connect_agents(self, agent_0, agent_1):
-        self.get_space().connect_agents(agent_0, agent_1)
-````
+```python
+def step_func_1(
+    agent_ids, agent_index, globals, breeds, locations,
+    breed_1_property_1_adt, breed_1_property_2_adt,
+    breed_2_property_1_adt, breed_2_property_2_adt
+):
+    """
+    Defines the logic for the agent at the given index in the current simulation step.
+
+    Parameters
+    ----------
+    agent_ids : list[int]
+        An agent data tensor (ADT) containing the IDs of all agents assigned to the current rank (n agents)
+        and their neighbors from other ranks.
+
+    agent_index : int
+        The index of the currently executing agent within the current rank's partition.
+        This value directly corresponds to the GPU thread index, where the `agent_index`-th thread operates on the
+        `agent_index`-th agent in `agent_ids`. If `agent_index` exceeds the number of agents assigned to this rank (n),
+        the step function will not execute for that thread. This behavior is automatically handled by `sagesim`.
+
+    globals : list
+        A list of global parameters shared across all agents. The first element is always the current simulation tick,
+        followed by user-defined global values.
+
+    breeds : list or list[int]
+        An ADT representing the breed type of each agent, either as a list of breed objects or encoded integers.
+
+    locations : list[list[int]]
+        An ADT in adjacency list format where each sublist contains the neighboring agent IDs for the corresponding agent.
+
+    breed_1_property_1_adt : list[any]
+        An ADT containing a user-defined `breed_1_property_1` property.
+
+    breed_1_property_2_adt : list[any]
+        An ADT containing a user-defined `breed_1_property_2` property.
+
+    breed_2_property_1_adt : list[any]
+        An ADT containing a user-defined `breed_2_property_1` property.
+
+    breed_2_property_2_adt : list[any]
+        An ADT containing a user-defined `breed_2_property_2` property.
+    """
+```
+
+> **Note:**
+>
+> * The input parameters `agent_ids`, `agent_index`, `globals`, `breeds`, and `locations` **must always be included in the function signature, and in this exact order**, even if they are not used in the function body. For example, if all agents belong to the same breed, the `breeds` parameter may not be necessary, but it must still be present.
+> * All step functions across registered breeds **must have identical input signatures** in both parameter order and count. For instance, in the `step_func_1()` example, even though it is the step function for `Custom_Breed_1`, the properties for `Custom_Breed_2` (like `breed_2_property_1_adt` and `breed_2_property_2_adt`) must still be included in the function signature, even if they are not used.
+> * The order of user-defined properties must follow these rules:
+>
+>   1. The order in which the breeds are registered in the `Custom_Model`. For example, `Custom_Breed_1` properties are listed first, followed by `Custom_Breed_2` properties.
+>   2. The order in which properties are defined within each breed. For example, `breed_1_property_1` should come before `breed_1_property_2`, and `breed_2_property_1` should come before `breed_2_property_2`.
+
 
 
 ### 2. **The Reduce Function**
@@ -191,4 +217,91 @@ As a result, when implementing your own `step functions` and `reduce functions`,
 - Variables cannot be reassigned within `if` or `for` blocks. Declare and assign them at the top level or within new subscopes.
 - Negative indexing (e.g., `array[-1]`) may not work as expected; it can access memory outside the logical bounds of the array. Use `len(array) - 1` instead.
 
+---
 
+## **High-Performance Computing (HPC) with `sagesim`**
+
+`sagesim` is designed to efficiently utilize High-Performance Computing (HPC) systems. Below is an example submission script tailored for the **Frontier** system at **Oak Ridge National Laboratory (ORNL)**.
+
+To maximize performance, it's ideal to match the number of **MPI ranks** to the number of available **GPUs**. For instance, if you request `num_nodes` compute nodes, and each node has 8 GPUs, then set the number of MPI ranks to `8 * num_nodes`. This setup ensures optimal workload distribution, where each MPI rank is bound to a GPU, and agent simulations are executed in parallel using multithreaded GPU execution.
+
+
+### **Sample HPC Launch Command with Slurm**
+
+You can run your simulation using the following `srun` command:
+
+```bash
+time srun \
+  -N ${num_nodes} \
+  -n ${num_mpi_ranks} \
+  -c 7 \
+  --ntasks-per-gpu=1 \
+  --gpu-bind=closest \
+  python3 -u ./run.py
+```
+
+**Explanation of flags:**
+
+* `-N ${num_nodes}`: Number of compute nodes to use.
+* `-n ${num_mpi_ranks}`: Total number of MPI ranks (should equal `8 * num_nodes`).
+* `-c 7`: Number of CPU cores allocated per task (can be tuned based on node architecture).
+* `--ntasks-per-gpu=1`: Assign exactly one MPI task per GPU.
+* `--gpu-bind=closest`: Bind each task to the closest GPU to reduce communication overhead.
+* `python3 -u ./run.py`: Executes the simulation script in unbuffered mode.
+
+
+### **Sample SLURM Submission Script (Frontier)**
+
+```bash
+#!/bin/bash
+#SBATCH -A csc536
+#SBATCH -J sagesim_sir
+#SBATCH -o logs/sagesim_sir_%j.out
+#SBATCH -e logs/sagesim_sir_%j.err
+#SBATCH -t 00:30:00
+#SBATCH -p batch
+#SBATCH -q debug
+#SBATCH -N 10
+
+# Optional: Reset environment (recommended with --export=NONE)
+unset SLURM_EXPORT_ENV
+
+# Load required modules (Frontier-specific)
+module load PrgEnv-gnu/8.6.0
+module load miniforge3/23.11.0-0
+module load rocm/5.7.1
+module load craype-accel-amd-gfx90a
+
+# Activate your conda environment
+source activate your_env_name
+
+# Define source and output directories
+export SAGESIM_SRC_DIR=/path/to/sagesim
+export PYTHONPATH=${SAGESIM_SRC_DIR}:$PYTHONPATH
+
+# Define unique run directory per job
+RUN_DIR=/your/output/path/sagesim_run_${SLURM_JOB_ID}
+if [ ! -d "$RUN_DIR" ]
+then
+        mkdir -p $RUN_DIR
+fi
+cd $RUN_DIR
+
+# Define runtime parameters
+num_nodes=10
+num_mpi_ranks=$((8 * num_nodes))
+
+# Execute the simulation
+echo "Starting SAGESim run..."
+srun -N${num_nodes} -n${num_mpi_ranks} -c7 --ntasks-per-gpu=1 --gpu-bind=closest \
+     python3 -u ${SAGESIM_SRC_DIR}/tutorial_run.py
+echo "SAGESim run finished."
+```
+
+
+### ✅ Best Practices
+
+* **Log Management**: Use `%j` in log file names to capture the job ID and avoid overwriting logs from different runs.
+* **Run Directory**: Isolate each run using a job-specific directory like `sagesim_run_${SLURM_JOB_ID}`.
+* **Modularity**: Define paths and environment variables clearly for easier debugging and portability.
+* **GPU Binding**: `--gpu-bind=closest` helps minimize memory latency between CPU and GPU tasks.
