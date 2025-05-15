@@ -1,10 +1,16 @@
 from random import random
+import cupy as cp
+from cupyx import jit
+
 
 from sagesim.breed import Breed
+from sagesim.utils import (
+    get_this_agent_data_from_tensor,
+    set_this_agent_data_from_tensor,
+    get_neighbor_data_from_tensor,
+)
+
 from state import SIRState
-from cupyx import jit
-import cupy as cp
-from random import random
 
 global INFECTED
 INFECTED = SIRState.INFECTED.value
@@ -19,41 +25,42 @@ class SIRBreed(Breed):
         super().__init__(name)
         self.register_property("state", SIRState.SUSCEPTIBLE.value)
         self.register_property("preventative_measures", [-1 for _ in range(100)])
-        self.register_step_func(step_func)
+        self.register_step_func(step_func, __file__)
 
 
+@jit.rawkernel(device="cuda")
 def step_func(
-    agent_ids, agent_index, globals, breeds, locations, states, preventative_measures
+    agent_index, globals, agent_ids, breeds, locations, states, preventative_measures
 ):
-
-    neighbor_ids = locations[agent_index]  # network location is defined by neighbors
+    my_state = get_this_agent_data_from_tensor(agent_index, states)
+    my_preventative_measures = get_this_agent_data_from_tensor(
+        agent_index, preventative_measures
+    )
+    neighbor_ids = locations[agent_index]
     rand = random()  # 0.1#step_func_helper_get_random_float(rng_states, id)
 
     p_infection = globals[1]
 
-    agent_preventative_measures = preventative_measures[agent_index]
-
     for i in range(len(neighbor_ids)):
+        neighbor_id = neighbor_ids[i]
+        if not cp.isnan(neighbor_id):
+            neighbor_state = get_neighbor_data_from_tensor(
+                agent_ids, neighbor_id, states
+            )
+            neighbor_preventative_measures = get_neighbor_data_from_tensor(
+                agent_ids, neighbor_id, preventative_measures
+            )
 
-        neighbor_index = -1
-        i = 0
-        while i < len(agent_ids) and agent_ids[i] != neighbor_ids[0]:
-            i += 1
-        if i < len(agent_ids):
-            neighbor_index = i
-            neighbor_state = int(states[neighbor_index])
-            neighbor_preventative_measures = preventative_measures[neighbor_index]
             abs_safety_of_interaction = 0.0
-            for n in range(len(agent_preventative_measures)):
+            for n in range(len(my_preventative_measures)):
                 for m in range(len(neighbor_preventative_measures)):
                     abs_safety_of_interaction += (
-                        agent_preventative_measures[n]
-                        * neighbor_preventative_measures[m]
+                        my_preventative_measures[n] * neighbor_preventative_measures[m]
                     )
             normalized_safety_of_interaction = abs_safety_of_interaction / (
-                len(agent_preventative_measures) ** 2
+                len(my_preventative_measures) ** 2
             )
             if neighbor_state == 2 and rand < p_infection * (
                 1 - normalized_safety_of_interaction
             ):
-                states[agent_index] = 2
+                set_this_agent_data_from_tensor(agent_index, states, 2)

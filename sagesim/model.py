@@ -4,9 +4,9 @@ SuperNeuroABM basic Model class
 """
 
 from typing import Dict, List, Callable, Set, Any, Union
-import inspect
-import importlib
 import os
+from pathlib import Path
+import importlib
 import pickle
 import math
 import heapq
@@ -16,13 +16,9 @@ import cupy as cp
 import numpy as np
 from mpi4py import MPI
 
-from sagesim.agent import (
-    AgentFactory,
-    Breed,
-)
+from sagesim.agent import AgentFactory, Breed
 from sagesim.space import Space
-from sagesim.util import convert_to_equal_side_tensor, compress_tensor
-import time
+from sagesim.internal_utils import convert_to_equal_side_tensor
 
 comm = MPI.COMM_WORLD
 num_workers = comm.Get_size()
@@ -164,7 +160,6 @@ class Model:
                 sync_workers_every_n_ticks = ticks % sync_workers_every_n_ticks
 
             self.worker_coroutine(sync_workers_every_n_ticks)
-        # print(self.__rank_local_agent_data_tensors[2])
 
     def save(self, app: "Model", fpath: str) -> None:
         """
@@ -213,42 +208,16 @@ class Model:
         :param agent_ids: agents to process by this cudakernel call
         """
 
-        """if worker == 0:
-            start_time = time.time()"""
         self.__rank_local_agent_ids = list(
             self._agent_factory._rank2agentid2agentidx[worker].keys()
         )
-        """if worker == 0:
-            print(
-                f"Time to get agent_ids_chunk: {time.time() - start_time:.6f} seconds",
-                flush=True,
-            )"""
-
-        """if worker == 0:
-            start_time = time.time()"""
         threadsperblock = 32
         blockspergrid = int(
             math.ceil(len(self.__rank_local_agent_ids) / threadsperblock)
         )
-        """if worker == 0:
-            print(
-                f"Time to calculate blockspergrid: {time.time() - start_time:.6f} seconds",
-                flush=True,
-            )"""
-
-        """if worker == 0:
-            start_time = time.time()"""
         rank_local_agents_neighbors = self.get_space()._neighbor_compute_func(
             self.__rank_local_agent_data_tensors[1]
         )
-        """if worker == 0:
-            print(
-                f"Time to compute all_neighbors: {time.time() - start_time:.6f} seconds",
-                flush=True,
-            )"""
-
-        """if worker == 0:
-            start_time = time.time()"""
         (
             self.__rank_local_agent_ids,
             self.__rank_local_agent_data_tensors,
@@ -259,40 +228,16 @@ class Model:
             self.__rank_local_agent_ids,
             rank_local_agents_neighbors,
         )
-
-        """if worker == 0:
-            print(
-                f"Time to contextualize agent data tensors: {time.time() - start_time:.6f} seconds",
-                flush=True,
-            )"""
-
-        """if worker == 0:
-            start_time = time.time()"""
         rank_local_agent_and_neighbor_adts = [
             convert_to_equal_side_tensor(
                 self.__rank_local_agent_data_tensors[i] + received_neighbor_adts[i]
             )
             for i in range(self._agent_factory.num_properties)
         ]
-        """if worker == 0:
-            print(
-                f"Time to convert_to_equal_side_tensors: {time.time() - start_time:.6f} seconds",
-                flush=True,
-            )"""
-
         self._global_data_vector = cp.array(self._global_data_vector)
-        """if worker == 0:
-            start_time = time.time()"""
-
         rank_local_agent_and_non_local_neighbor_ids = cp.array(
             self.__rank_local_agent_ids + received_neighbor_ids
         )
-
-        # Capture the state of rank_local_agent_and_neighbor_adts before the step function call
-        """before_step_func = [
-            cp.asnumpy(adt.copy()) for adt in rank_local_agent_and_neighbor_adts
-        ]"""
-
         self._step_func[blockspergrid, threadsperblock](
             self._global_data_vector,
             *rank_local_agent_and_neighbor_adts,
@@ -300,67 +245,23 @@ class Model:
             cp.float32(len(self.__rank_local_agent_ids)),
             rank_local_agent_and_non_local_neighbor_ids,
         )
-
-        # Capture the state of rank_local_agent_and_neighbor_adts after the step function call
-        """after_step_func = [
-            cp.asnumpy(adt.copy()) for adt in rank_local_agent_and_neighbor_adts
-        ]"""
-
-        # Compare and print the changes
-        """for prop_idx in range(self._agent_factory.num_properties):
-            if not np.array_equal(
-                before_step_func[prop_idx], after_step_func[prop_idx], equal_nan=True
-            ):
-                print(
-                    worker,
-                    f"Property {prop_idx} changed: {before_step_func[prop_idx]} -> {after_step_func[prop_idx]}",
-                    flush=True,
-                )"""
-
         cp.get_default_memory_pool().free_all_blocks()
-        """if worker == 0:
-            print(
-                f"Time to execute CUDA kernel: {time.time() - start_time:.6f} seconds",
-                flush=True,
-            )"""
-
-        """if worker == 0:
-            start_time = time.time()"""
         num_agents = len(self.__rank_local_agent_ids)
         self.__rank_local_agent_data_tensors = [
             rank_local_agent_and_neighbor_adts[i][:num_agents].tolist()
             for i in range(self._agent_factory.num_properties)
         ]
-        """if worker == 0:
-            print(
-                f"Time to compress tensors: {time.time() - start_time:.6f} seconds",
-            )"""
-
-        """if worker == 0:
-            start_time = time.time()
-        worker_agent_and_neighbor_data_tensors = (
+        """worker_agent_and_neighbor_data_tensors = (
             self._agent_factory.reduce_agent_data_tensors(
                 worker_agent_and_neighbor_data_tensors,
                 agent_and_neighbor_ids_in_subcontext,
                 self._reduce_func,
             )
         )
-        if worker == 0:
-            print(
-                f"Time to reduce agent data tensors: {time.time() - start_time:.6f} seconds",
-                flush=True,
-            )"""
-
-        """if worker == 0:
-            start_time = time.time()"""
+        """
         self._global_data_vector = comm.allreduce(
             self._global_data_vector.tolist(), op=reduce_global_data_vector
         )
-        """if worker == 0:
-            print(
-                f"Time to reduce globals: {time.time() - start_time:.6f} seconds",
-                flush=True,
-            )"""
 
 
 def reduce_global_data_vector(A, B):
@@ -373,9 +274,9 @@ def generate_gpu_func(
     breed_idx_2_step_func_by_priority: List[List[Union[int, Callable]]],
 ) -> str:
     """
-    Numba cuda jit does not like us passing *args into
-    cuda kernels. This is because the Python function
-    will be compiled by cuda.jit and the parameter arguments
+    cupy jit.rawkernel does not like us passing *args into
+    them. This is because the Python function
+    will be compiled by cupy.jit and the parameter arguments
     type and count must be set at jit compilation time.
     However, SAGESim users will have varying numbers of
     properties in their step functions, which means
@@ -384,20 +285,24 @@ def generate_gpu_func(
     due to the above constraints we have to infer the number of
     arguments from the user defined breed step functions,
     rewrite the overall stepfunc as a string and then pass it
-    into cuda.jit to be compiled.
+    into cupy.jit to be compiled.
 
-    This function returns a str representation of stepfunc cuda kernal
-        that can be compiled using exec as below:
+    This function returns a str representation of stepfunc cupy jit.rawkernel:
 
         step_funcs_code = generate_gpu_func(
                     len(agent_data_tensors),
                     breed_idx_2_step_func_by_priority,
                 )
-                exec(step_funcs_code)
-    And run using exec as below:
+    This function can then be directly loaded using importlib or written to a
+    file and imported. For example, if you write the code to a file
+    called step_func_code.py, you can import it as below:
 
-        exec(
-            cuda.jit(stepfunc)[blockspergrid, threadsperblock](
+        import importlib
+        step_func_module = importlib.import_module("step_func_code")
+        stepfunc = step_func_module.stepfunc
+    Then you can run the stepfunc as a jit.rawkernel as below:
+
+        stepfunc[blockspergrid, threadsperblock](
                 device_global_data_vector,
                 *agent_data_tensors,
                 current_tick,
@@ -405,65 +310,62 @@ def generate_gpu_func(
             )
         )
 
-    Note: exec will pick up your current context so when you call
-    exec to run the cuda kernel device_global_data_vector, agent_data_tensors,
-    current_tick, sync_workers_every_n_ticks, must have been defined
-    within the current scope.
-
     :param n_properties: int total number of agent properties
     :param breed_idx_2_step_func_by_priority: List of List. Each inner List
-        first element is the breedidx and second element is the user defined
-        step function. The major list elements are ordered in decreasing
-        order of priority
-    :param agent_ids: list of agents to execute this stepfunc kernel on
+        first element is the breedidx and second element is a tuple of the user defined
+        step function, and the file where it is defined.
+        The major list elements are ordered in decreasing order of execution
+        priority
     :return: str representation of stepfunc cuda kernal
-        that can be compiled using exec
+        that can be written to file or imported directly.
 
     """
     args = [f"a{i}" for i in range(n_properties)]
-    sim_loop = ""
-    step_sources = ""
+    sim_loop = []
+    step_sources = ["import os", "import sys"]
+    imported_modules = set()
     for breed_idx_2_step_func in breed_idx_2_step_func_by_priority:
-        for breedidx, breed_step_func in breed_idx_2_step_func.items():
-            step_source = inspect.getsource(breed_step_func)
-            step_sources += (
-                "\n\nimport cupy as cp\nimport math\nimport bisect\n\n@jit.rawkernel(device='cuda')\n"
-                + step_source
-            )
-            step_func_name = getattr(breed_step_func, "__name__", repr(callable))
-            # step_source = step_source.splitlines(True)
-            sim_loop += f"""
-            \n\t\t\t\tif breed_id == {breedidx}:
-            \t\t{step_func_name}(
-            \t\t\tagent_ids,
-            \t\t\tagent_index,
-            \t\t\tdevice_global_data_vector,
-            \t\t\t{','.join(args)},
-            \t\t)
-            #cuda.syncthreads()
-
-            """
-    func = f"""
-    \nfrom random import random
-    \nfrom cupyx import jit
-    \n\n{step_sources}
-    \n\n@jit.rawkernel()
-def stepfunc(
-    device_global_data_vector,
-    {','.join(args)},
-    sync_workers_every_n_ticks,
-    num_rank_local_agents,
-    agent_ids,
-    ):
-        thread_id = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x
-        #g = cuda.cg.this_grid()
-        agent_index = thread_id        
-        if agent_index < num_rank_local_agents:
-            breed_id = a0[agent_index]                
-            for tick in range(sync_workers_every_n_ticks):
-                {sim_loop}                
-                if agent_index == 0:
-                    device_global_data_vector[0] += 1
-    """
-    func = func.replace("\t", "    ")
-    return func  # compile(func, "<string>", "exec")
+        for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
+            breed_step_func_impl, module_fpath = breed_step_func_info
+            module_fpath = Path(module_fpath).absolute()
+            module_name = module_fpath.stem
+            step_func_name = getattr(breed_step_func_impl, "__name__", repr(callable))
+            if module_fpath not in imported_modules:
+                step_sources += [
+                    f"module_path = os.path.abspath('{module_fpath}')",
+                    "if module_path not in sys.path:",
+                    "\tsys.path.append(module_path)",
+                    f"from {module_name} import *",
+                ]
+            sim_loop += [
+                f"if breed_id == {breedidx}:",
+                f"\t{step_func_name}(",
+                "\t\tagent_index,",
+                "\t\tdevice_global_data_vector,",
+                "\t\tagent_ids,",
+                f"\t\t{','.join(args)},",
+                "\t)",
+            ]
+    step_sources = "\n".join(step_sources)
+    func = [
+        "from cupyx import jit",
+        f"{step_sources}",
+        "\n\n@jit.rawkernel(device='cuda')",
+        "def stepfunc(",
+        "device_global_data_vector,",
+        f"{','.join(args)},",
+        "sync_workers_every_n_ticks,",
+        "num_rank_local_agents,",
+        "agent_ids,",
+        "):",
+        "\tthread_id = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x",
+        "\tagent_index = thread_id",
+        "\tif agent_index < num_rank_local_agents:",
+        "\t\tbreed_id = a0[agent_index]",
+        "\t\tfor tick in range(sync_workers_every_n_ticks):",
+        f"\n\t\t\t{'\n\t\t\t'.join(sim_loop)}",
+        "\t\t\tif agent_index == 0:",
+        "\t\t\t\tdevice_global_data_vector[0] += 1",
+    ]
+    func = "\n".join(func)
+    return func
