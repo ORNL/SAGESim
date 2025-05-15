@@ -9,8 +9,6 @@ workers, which is the crux of load balancing...
 
 from typing import List, Any
 
-import networkx as nx
-
 
 class Space:
     """

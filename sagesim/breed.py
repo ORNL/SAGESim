@@ -1,6 +1,5 @@
 from typing import Any, Callable, List, Dict, Optional, Union
 from collections import OrderedDict
-
 from math import nan
 
 
