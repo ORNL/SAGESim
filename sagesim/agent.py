@@ -10,7 +10,7 @@ import numpy as np
 from mpi4py import MPI
 
 from sagesim.breed import Breed
-from sagesim.util import (
+from sagesim.internal_utils import (
     compress_tensor,
     convert_to_equal_side_tensor,
 )
