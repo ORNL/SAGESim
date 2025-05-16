@@ -3,6 +3,7 @@ import argparse
 from sir_model import SIRModel
 from state import SIRState
 from mpi4py import MPI
+from random import random
 
 from random import sample
 
@@ -28,32 +29,15 @@ def generate_small_world_network(n, k, p):
     return nx.watts_strogatz_graph(n, k, p)
 
 
-def test_network():
-    network = nx.Graph()
-    network.add_nodes_from(range(8))
-    network.add_edges_from(
-        [(0, 1), (0, 4), (2, 3), (3, 4), (4, 5), (4, 7), (6, 5), (7, 6)]
-    )
-
-    for n in network.nodes:
-        if n == 0:
-            model.create_agent(SIRState.INFECTED.value)
-        else:
-            model.create_agent(SIRState.SUSCEPTIBLE.value)
-
-    for edge in network.edges:
-        model.connect_agents(edge[0], edge[1])
-        print(edge[0], "->", edge[1])
-    return model
-
-
 def generate_small_world_of_agents(
     model, num_agents: int, num_init_connections: int, num_infected: int
 ) -> SIRModel:
     network = generate_small_world_network(num_agents, num_init_connections, 0.2)
     for n in network.nodes:
-        model.create_agent(SIRState.SUSCEPTIBLE.value)
+        preventative_measures = [random() for _ in range(100)]
+        model.create_agent(SIRState.SUSCEPTIBLE.value, preventative_measures)
 
+    """print(f"Number of infected agents: {num_infected}")"""
     for n in sample(sorted(network.nodes), num_infected):
         model.set_agent_property_value(n, "state", SIRState.INFECTED.value)
 
@@ -70,7 +54,7 @@ if __name__ == "__main__":
         type=int,
     )
     parser.add_argument(
-        "--percent_init_connections",
+        "--num_init_connections",
         type=float,
     )
     parser.add_argument(
@@ -82,7 +66,7 @@ if __name__ == "__main__":
     model = SIRModel()
     model.setup(use_gpu=True)
     num_agents = args.num_agents
-    num_init_connections = int(args.percent_init_connections * num_agents)
+    num_init_connections = int(args.num_init_connections)
     num_nodes = args.num_nodes
 
     model_creation_start = time()
@@ -99,7 +83,7 @@ if __name__ == "__main__":
     )"""
 
     simulate_start = time()
-    model.simulate(10, sync_workers_every_n_ticks=2)
+    model.simulate(10, sync_workers_every_n_ticks=1)
     simulate_end = time()
     simulate_duration = simulate_end - simulate_start
 
@@ -109,7 +93,13 @@ if __name__ == "__main__":
                 f"{num_agents}, {num_init_connections}, {num_nodes}, {num_workers}, {model_creation_duration}, {simulate_duration}\n"
             )
 
-    if worker == 0:
+    result = [
+        SIRState(model.get_agent_property_value(agent_id, property_name="state"))
+        for agent_id in range(num_agents)
+        if model.get_agent_property_value(agent_id, property_name="state") is not None
+    ]
+
+    """if worker == 0:
         print(
             [
                 SIRState(
@@ -118,3 +108,5 @@ if __name__ == "__main__":
                 for agent_id in range(num_agents)
             ]
         )
+
+        print(result)"""
