@@ -1,6 +1,5 @@
 from typing import Any, Callable, List, Dict, Optional, Union
 from collections import OrderedDict
-
 from math import nan
 
 
@@ -40,9 +39,11 @@ class Breed:
         self._num_properties += 1
         self._prop2maxdims[name] = max_dims
 
-    def register_step_func(self, step_func: Callable, priority: int = 0):
+    def register_step_func(
+        self, step_func: Callable, module_fpath: str, priority: int = 0
+    ):
         """
         What the agent is supposed to do during a simulation step.
 
         """
-        self._step_funcs[priority] = step_func
+        self._step_funcs[priority] = (step_func, module_fpath)

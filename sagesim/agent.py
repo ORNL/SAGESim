@@ -1,8 +1,7 @@
 from __future__ import annotations
-import math
-from typing import Any, Callable, Iterable, List, Dict, Union, Tuple, Set
+from typing import Any, Callable, Iterable, List, Dict
 from collections import OrderedDict
-from copy import copy, deepcopy
+from copy import copy
 import time
 import sys
 
@@ -10,11 +9,10 @@ import numpy as np
 from mpi4py import MPI
 
 from sagesim.breed import Breed
-from sagesim.util import (
+from sagesim.internal_utils import (
     compress_tensor,
-    convert_to_equal_side_tensor,
 )
-from sagesim.space import Space, NetworkSpace
+from sagesim.space import Space
 
 
 comm = MPI.COMM_WORLD
