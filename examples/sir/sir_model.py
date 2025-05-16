@@ -1,5 +1,5 @@
 from sagesim.model import Model
-from sagesim.space import NetworkSpace  # hopefully, we can avoid this import
+from sagesim.space import NetworkSpace
 from sir_breed import SIRBreed
 
 
