@@ -44,8 +44,10 @@ class Model:
             raise Exception(f"All breeds must be registered before agents are created!")
         self._agent_factory.register_breed(breed)
 
-    def create_agent_of_breed(self, breed: Breed, **kwargs) -> int:
+    def create_agent_of_breed(self, breed: Breed, add_to_space=True, **kwargs) -> int:
         agent_id = self._agent_factory.create_agent(breed, **kwargs)
+        if add_to_space:
+            self.get_space().add_agent(agent_id)
         return agent_id
 
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
@@ -327,9 +329,9 @@ def generate_gpu_func(
     for breed_idx_2_step_func in breed_idx_2_step_func_by_priority:
         for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
             breed_step_func_impl, module_fpath = breed_step_func_info
+            step_func_name = getattr(breed_step_func_impl, "__name__", repr(callable))
             module_fpath = Path(module_fpath).absolute()
             module_name = module_fpath.stem
-            step_func_name = getattr(breed_step_func_impl, "__name__", repr(callable))
             if module_fpath not in imported_modules:
                 step_sources += [
                     f"module_path = os.path.abspath('{module_fpath}')",
