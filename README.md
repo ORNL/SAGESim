@@ -1,4 +1,4 @@
-# SAGESim
+![# SAGESim](SAGESim-inline-tag-color.png)
 
 Scalable Agent-based GPU Enabled Simulator
 
