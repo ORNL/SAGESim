@@ -97,8 +97,12 @@ class Custom_Model(Model):
 
 Every agent in a `sagesim` model belongs to a specific *breed*. To define a breed, you must subclass the `Breed` class provided by `sagesim`. Each breed class is responsible for:
 
-- Registering agent-specific properties using `self.register_property()`.
-- Defining and registering one or more step functions using `self.register_step_func()` to specify the agent’s behavior at each simulation step.
+- **Register agent-specific properties** using `self.register_property()`.  
+  This method allows you to define properties that each agent of the breed will have. You can optionally specify an initial value, which will be assigned to all agents of this breed. If no initial value is provided, the default is `nan`. This default can also be overridden when creating individual agents.
+
+- **Define and register step functions** using `self.register_step_func()`.  
+  Step functions specify the agent's behavior during each simulation step. You can register one or more such functions per breed. Each function can be assigned an execution priority; by default, the priority is `0`, which corresponds to the highest execution priority.
+
 
 #### Example: `Custom_Breed_1`
 
