@@ -20,7 +20,7 @@ module load rocm/5.7.1
 module load craype-accel-amd-gfx90a
 
 # make sure it runs the correct code
-export SRC_DIR=/lustre/orion/proj-shared/csc536/SAGESim/examples/sir/
+export SRC_DIR=/lustre/orion/proj-shared/csc536/xiz/SAGESim/examples/sir/
 # Activate your environment
 source activate /lustre/orion/proj-shared/csc536/envs/sagesimenv_xi
 
