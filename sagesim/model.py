@@ -349,13 +349,18 @@ def generate_gpu_func(
                 "\t)",
             ]
     step_sources = "\n".join(step_sources)
+
+    # Preprocess parts that would break in f-strings
+    joined_sim_loop = '\n\t\t\t'.join(sim_loop)
+    joined_args = ','.join(args)
+
     func = [
         "from cupyx import jit",
-        f"{step_sources}",
+        step_sources,
         "\n\n@jit.rawkernel(device='cuda')",
         "def stepfunc(",
         "device_global_data_vector,",
-        f"{','.join(args)},",
+        joined_args + ",",
         "sync_workers_every_n_ticks,",
         "num_rank_local_agents,",
         "agent_ids,",
@@ -365,9 +370,10 @@ def generate_gpu_func(
         "\tif agent_index < num_rank_local_agents:",
         "\t\tbreed_id = a0[agent_index]",
         "\t\tfor tick in range(sync_workers_every_n_ticks):",
-        f"\n\t\t\t{'\n\t\t\t'.join(sim_loop)}",
+        f"\n\t\t\t{joined_sim_loop}",
         "\t\t\tif agent_index == 0:",
         "\t\t\t\tdevice_global_data_vector[0] += 1",
     ]
+
     func = "\n".join(func)
     return func
