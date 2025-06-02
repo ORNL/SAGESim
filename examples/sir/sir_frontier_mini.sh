@@ -27,13 +27,13 @@ source activate /lustre/orion/proj-shared/csc536/envs/sagesimenv_xi
 # Point to source
 export PYTHONPATH=/lustre/orion/proj-shared/csc536/xiz/SAGESim/:$PYTHONPATH
 
-# Make run dir if not exists per job id
-RUN_DIR=/lustre/orion/proj-shared/csc536/SAGESim/examples/sir
-if [ ! -d "$RUN_DIR" ]
-then
-        mkdir -p $RUN_DIR
-fi
-cd $RUN_DIR
+# # Make run dir if not exists per job id
+# RUN_DIR=/lustre/orion/proj-shared/csc536/xiz/SAGESim/examples/sir
+# if [ ! -d "$RUN_DIR" ]
+# then
+#         mkdir -p $RUN_DIR
+# fi
+# cd $RUN_DIR
 
 
 num_agents=100000
