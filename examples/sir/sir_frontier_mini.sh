@@ -27,7 +27,7 @@ source activate /lustre/orion/proj-shared/csc536/envs/sagesimenv_xi
 export PYTHONPATH=/lustre/orion/proj-shared/csc536/xiz/SAGESim/:$PYTHONPATH
 
 # Make run dir if not exists per job id
-RUN_DIR=/lustre/orion/proj-shared/csc536/gunaratnecs/mpiasync/SAGESim/examples/sir
+RUN_DIR=/lustre/orion/proj-shared/csc536/SAGESim/examples/sir
 if [ ! -d "$RUN_DIR" ]
 then
         mkdir -p $RUN_DIR
