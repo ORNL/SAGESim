@@ -19,7 +19,8 @@ module load miniforge3/23.11.0-0
 module load rocm/5.7.1
 module load craype-accel-amd-gfx90a
 
-
+# make sure it runs the correct code
+export SRC_DIR=/lustre/orion/proj-shared/csc536/SAGESim/examples/sir/
 # Activate your environment
 source activate /lustre/orion/proj-shared/csc536/envs/sagesimenv_xi
 
@@ -41,10 +42,10 @@ num_init_connections=20
 
 num_mpi_ranks=$((8 * ${num_nodes}))
 # Run script
-echo Running. Python Script with ${num_nodes} nodes, ${num_agents} agents, and ${percent_init_connections} percent init connections.
-time srun -N${num_nodes} -n${num_mpi_ranks} -c7 --ntasks-per-gpu=1 --gpu-bind=closest python3 -u ./run.py --num_agents ${num_agents} --num_init_connections ${num_init_connections} --num_nodes ${num_nodes}
+echo Running. Python Script with ${num_nodes} nodes, ${num_agents} agents, and ${num_init_connections} init connections.
+time srun -N${num_nodes} -n${num_mpi_ranks} -c7 --ntasks-per-gpu=1 --gpu-bind=closest python3 -u ${SRC_DIR}/run.py --num_agents ${num_agents} --num_init_connections ${num_init_connections} --num_nodes ${num_nodes}
 #time srun -N${num_nodes} -n${num_mpi_ranks} -c7 --gpus-per-task=1 --gpu-bind=closest /bin/bash -c 'echo $(hostname) $(grep Cpus_allowed_list /proc/self/status) GPUS: $ROCR_VISIBLE_DEVICES' | sort
-echo Run finished. Python Script with ${num_nodes} nodes, ${num_agents} agents, and ${percent_init_connections} percent init connections.
+echo Run finished. Python Script with ${num_nodes} nodes, ${num_agents} agents, and ${num_init_connections} init connections.
 date
 
 
