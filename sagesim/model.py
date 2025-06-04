@@ -36,6 +36,7 @@ class Model:
         self._threads_per_block = threads_per_block
         self._step_function_file_path = step_function_file_path
         self._agent_factory = AgentFactory(space)
+        self._is_setup = False
         self._globals = {"tick": 0}
         # following may be set later in setup if distributed execution
 
@@ -51,9 +52,10 @@ class Model:
         return agent_id
 
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
-        self._agent_factory._update_agent_property(
-            self.__rank_local_agent_data_tensors, id, property_name
-        )
+        if self._is_setup:
+            self._agent_factory._update_agent_property(
+                self.__rank_local_agent_data_tensors, id, property_name
+            )
         return self._agent_factory.get_agent_property_value(
             property_name=property_name, agent_id=id
         )
@@ -129,6 +131,7 @@ class Model:
         self.__rank_local_agent_data_tensors = (
             self._agent_factory._generate_agent_data_tensors()
         )
+        self._is_setup = True
 
     def simulate(
         self,
