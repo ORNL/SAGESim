@@ -125,6 +125,10 @@ class Model:
                     )
                 )
         comm.barrier()
+        # Generate agent data tensors
+        self.__rank_local_agent_data_tensors = (
+            self._agent_factory._generate_agent_data_tensors()
+        )
 
     def simulate(
         self,
@@ -140,13 +144,7 @@ class Model:
             )
 
         # Access the step function using the module
-        self._step_func = step_func_module.stepfunc
-
-        # TODO Remove the following commeneted code once Summit-tested
-        # Generate agent data tensors
-        self.__rank_local_agent_data_tensors = (
-            self._agent_factory._generate_agent_data_tensors()
-        )
+        self._step_func = step_func_module.stepfunc       
 
         # Repeatedly execute worker coroutine untill simulation
         # has run for the right amount of ticks
