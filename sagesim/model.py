@@ -147,7 +147,7 @@ class Model:
             )
 
         # Access the step function using the module
-        self._step_func = step_func_module.stepfunc       
+        self._step_func = step_func_module.stepfunc
 
         # Repeatedly execute worker coroutine untill simulation
         # has run for the right amount of ticks
@@ -335,11 +335,12 @@ def generate_gpu_func(
             module_name = module_fpath.stem
             if module_fpath not in imported_modules:
                 step_sources += [
-                    f"module_path = os.path.abspath('{module_fpath}')",
+                    f"module_path = os.path.abspath('{module_fpath.parent}')",
                     "if module_path not in sys.path:",
                     "\tsys.path.append(module_path)",
                     f"from {module_name} import *",
                 ]
+                imported_modules.add(module_fpath)
             sim_loop += [
                 f"if breed_id == {breedidx}:",
                 f"\t{step_func_name}(",
@@ -352,8 +353,8 @@ def generate_gpu_func(
     step_sources = "\n".join(step_sources)
 
     # Preprocess parts that would break in f-strings
-    joined_sim_loop = '\n\t\t\t'.join(sim_loop)
-    joined_args = ','.join(args)
+    joined_sim_loop = "\n\t\t\t".join(sim_loop)
+    joined_args = ",".join(args)
 
     func = [
         "from cupyx import jit",
