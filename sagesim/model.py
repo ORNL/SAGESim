@@ -76,7 +76,9 @@ class Model:
     ) -> None:
         self.globals[property_name] = value
 
-    def set_global_property(self, property_name: str, value: Union[float, int]) -> None:
+    def set_global_property_value(
+        self, property_name: str, value: Union[float, int]
+    ) -> None:
         self.globals[property_name] = value
 
     def get_global_property_value(self, property_name: str) -> Union[float, int]:
