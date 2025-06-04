@@ -201,10 +201,6 @@ class AgentFactory:
         :return: Dict of agent_id: List of properties
 
         """
-        raise NotImplementedError(
-            "get_agents_with not implemented in base AgentFactory class. "
-            "This should be implemented in subclasses."
-        )
         matching_agents = {}
         property_names = self._property_name_2_agent_data_tensor.keys()
         for agent_id in range(self._num_agents):
