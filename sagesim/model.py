@@ -37,7 +37,7 @@ class Model:
         self._step_function_file_path = step_function_file_path
         self._agent_factory = AgentFactory(space)
         self._is_setup = False
-        self._globals = {"tick": 0}
+        self.globals = {"tick": 0}
         # following may be set later in setup if distributed execution
 
     def register_breed(self, breed: Breed) -> None:
@@ -74,10 +74,13 @@ class Model:
     def register_global_property(
         self, property_name: str, value: Union[float, int]
     ) -> None:
-        self._globals[property_name] = value
+        self.globals[property_name] = value
+
+    def set_global_property(self, property_name: str, value: Union[float, int]) -> None:
+        self.globals[property_name] = value
 
     def get_global_property_value(self, property_name: str) -> Union[float, int]:
-        return self._globals[property_name]
+        return self.globals[property_name]
 
     def register_reduce_function(self, reduce_func: Callable) -> None:
         self._reduce_func = reduce_func
@@ -117,7 +120,7 @@ class Model:
                 last_priority = priority
 
         # Generate global data tensor
-        self._global_data_vector = list(self._globals.values())
+        self._global_data_vector = list(self.globals.values())
         if worker == 0:
             with open(self._step_function_file_path, "w") as f:
                 f.write(
