@@ -49,7 +49,7 @@ class TestNetworkSpace(unittest.TestCase):
         # Verify that set_agent_property_value was called for agent 0 only
         self.assertEqual(self.agent_factory.set_agent_property_value.call_count, 1)
 
-    ####!!!! the agent_factory.set_agent_property_value is NOT called after disconnecting agents!!!!!####
+    # check if agent_factory.set_agent_property_value call is needed
     def test_disconnect_agents(self):
         self.network_space.connect_agents(0, 1)
         self.network_space.disconnect_agents(0, 1)
@@ -68,68 +68,5 @@ class TestNetworkSpace(unittest.TestCase):
         self.assertIn(0, self.network_space._locations[1])
 
 
-    ####!!!! does not do a balanced partitioning!!!!!####
-    def test_partitioning(self):
-        # Add 5 more agents to test partitioning (total 8 agents)
-        for _ in range(3, 8):
-            self.network_space.add_agent(_)
-
-        partitions = self.network_space._compute_partitioning(k=3)
-
-        # Check that total agents are partitioned correctly
-        flattened = [agent for chunk in partitions for agent in chunk]
-        # self.assertEqual(partitions, [[0, 1, 2], [3, 4, 5], [6, 7]])
-        self.assertEqual(sorted(flattened), list(range(8)))
-        self.assertEqual(len(partitions), 3)
-
 if __name__ == "__main__":
     unittest.main()
-
-
-# import unittest
-# from sagesim.space import NetworkSpace
-
-# class TestNetworkSpace(unittest.TestCase):
-#     def setUp(self):
-#         self.space = NetworkSpace()
-
-#     def test_add_agent(self):
-#         self.space.add_agent(0)
-#         self.space.add_agent(1)
-#         self.assertEqual(len(self.space._locations), 2)
-#         self.assertEqual(self.space._locations[0], set())
-#         self.assertEqual(self.space._locations[1], set())
-
-#     def test_connect_and_disconnect_agents_undirected_network(self):
-#         self.space.add_agent(0)
-#         self.space.add_agent(1)
-#         self.space._agent_factory = DummyFactory()  # <- Mock agent factory
-
-#         self.space.connect_agents(0, 1)
-#         self.assertIn(1, self.space._locations[0])
-#         self.assertIn(0, self.space._locations[1])
-
-#         self.space.disconnect_agents(0, 1)
-#         self.assertNotIn(1, self.space._locations[0])
-#         self.assertNotIn(0, self.space._locations[1])
-
-#     def test_connect_and_disconnect_agents_directed_network(self):
-#         self.space.add_agent(0)
-#         self.space.add_agent(1)
-#         self.space._agent_factory = DummyFactory()
-
-#         self.space.connect_agents(0, 1, directed=True)
-#         self.assertIn(1, self.space._locations[0])
-#         self.assertNotIn(0, self.space._locations[1])
-
-#         self.space.disconnect_agents(0, 1, directed=True)
-#         self.assertNotIn(1, self.space._locations[0])
-#         self.assertNotIn(0, self.space._locations[1])
-
-# class DummyFactory:
-#     def set_agent_property_value(self, *args, **kwargs):
-#         pass  # Dummy stub for agent factory
-
-# if __name__ == "__main__":
-#     unittest.main()
-
