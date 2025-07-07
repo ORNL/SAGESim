@@ -22,7 +22,7 @@ if __name__ == "__main__":
 
     # Instantiate the SIR Model
     model = SIRModel()
-    model.setup(use_gpu=True)  # Enables GPU acceleration if available
+
 
     # Create agents
     for n in network.nodes:
@@ -33,9 +33,13 @@ if __name__ == "__main__":
     for edge in network.edges:
         model.connect_agents(edge[0], edge[1])
 
+    model.get_space().disconnect_agents(0,1)
     # Infect a random sample of agents
     for n in sample(sorted(network.nodes), num_infected):
         model.set_agent_property_value(n, "state", SIRState.INFECTED.value)
+
+    model.setup(use_gpu=True)  # Enables GPU acceleration if available
+
 
     # # MPI environment setup
     comm = MPI.COMM_WORLD
