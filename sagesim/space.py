@@ -39,11 +39,8 @@ class Space:
     def get_neighbors(self, agent_id: int) -> set:
         """Returns agents neighbors"""
         return self._neighbor_compute_func(self._locations, agent_id)
-
-    def _compute_partitioning(self):
-        """Compute partitioning of the space for load balancing"""
-        # Placeholder for partitioning logic
-        pass
+    
+    ###NOTE: we need a function for load balancing
 
 
 def _network_space_compute_neighbors(agent_locations):
@@ -66,6 +63,11 @@ class NetworkSpace(Space):
 
     def add_agent(self, agent: int) -> None:
         self._locations.append(set())
+        self._agent_factory.set_agent_property_value(
+            "locations",
+            agent,
+            self._locations[agent],
+        )
 
     def connect_agents(
         self, agent_0: int, agent_1: int, directed: bool = False
@@ -73,11 +75,7 @@ class NetworkSpace(Space):
         agent_0 = int(agent_0)
         agent_1 = int(agent_1)
         self._locations[agent_0].add(agent_1)
-        self._agent_factory.set_agent_property_value(
-            "locations",
-            agent_0,
-            self._locations[agent_0],
-        )
+
         if not directed:
             self._locations[agent_1].add(agent_0)
             self._agent_factory.set_agent_property_value(
@@ -89,18 +87,12 @@ class NetworkSpace(Space):
     def disconnect_agents(
         self, agent_0: int, agent_1: int, directed: bool = False
     ) -> None:
+        
         self._locations[agent_0].remove(agent_1)
         if not directed:
             self._locations[agent_1].remove(agent_0)
 
-    def _compute_partitioning(self, k: int = 2) -> List[set]:
-        """Compute partitioning of the network space for load balancing"""
-        all_agent_ids = [int(i) for i in range(len(self._locations))]
-        chunk_size = len(all_agent_ids) // k
-        agent_ids_chunks = [
-            all_agent_ids[i * chunk_size : (i + 1) * chunk_size] for i in range(k - 1)
-        ] + [all_agent_ids[(k - 1) * chunk_size :]]
-        return agent_ids_chunks
+    ###NOTE: we need a function for load balancing
 
 
 if __name__ == "__main__":
