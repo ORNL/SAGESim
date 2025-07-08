@@ -154,18 +154,19 @@ class Model:
         # Access the step function using the module
         self._step_func = step_func_module.stepfunc
 
-        # Repeatedly execute worker coroutine untill simulation
+        # Repeatedly execute worker coroutine until simulation
         # has run for the right amount of ticks
-        for time_chunk in range((ticks // sync_workers_every_n_ticks) + 1):
-            if time_chunk == (ticks // sync_workers_every_n_ticks):
-                num_time_chunks = ticks // sync_workers_every_n_ticks
-                sync_workers_every_n_ticks = (
-                    ticks - sync_workers_every_n_ticks * num_time_chunks
-                )
-                if sync_workers_every_n_ticks == 0:
+        original_sync_workers_every_n_ticks = sync_workers_every_n_ticks
+        for time_chunk in range((ticks // original_sync_workers_every_n_ticks) + 1):
+            if time_chunk == (ticks // original_sync_workers_every_n_ticks):
+                # Final chunk: handle remaining ticks
+                remaining_ticks = ticks - (time_chunk * original_sync_workers_every_n_ticks)
+                if remaining_ticks == 0:
                     break
-            elif ticks % sync_workers_every_n_ticks:
-                sync_workers_every_n_ticks = ticks % sync_workers_every_n_ticks
+                sync_workers_every_n_ticks = remaining_ticks
+            else:
+                # Regular chunk: use original batch size
+                sync_workers_every_n_ticks = original_sync_workers_every_n_ticks
 
             self.worker_coroutine(sync_workers_every_n_ticks)
 
@@ -253,6 +254,8 @@ class Model:
             cp.float32(len(self.__rank_local_agent_ids)),
             rank_local_agent_and_non_local_neighbor_ids,
         )
+        # Update global tick counter after all threads have completed
+        self._global_data_vector[0] += sync_workers_every_n_ticks
         cp.get_default_memory_pool().free_all_blocks()
         num_agents = len(self.__rank_local_agent_ids)
         self.__rank_local_agent_data_tensors = [
@@ -349,6 +352,7 @@ def generate_gpu_func(
             sim_loop += [
                 f"if breed_id == {breedidx}:",
                 f"\t{step_func_name}(",
+                "\t\tthread_local_tick,",
                 "\t\tagent_index,",
                 "\t\tdevice_global_data_vector,",
                 "\t\tagent_ids,",
@@ -377,9 +381,9 @@ def generate_gpu_func(
         "\tif agent_index < num_rank_local_agents:",
         "\t\tbreed_id = a0[agent_index]",
         "\t\tfor tick in range(sync_workers_every_n_ticks):",
+        f"\n\t\t\tthread_local_tick = int(device_global_data_vector[0]) + tick",
         f"\n\t\t\t{joined_sim_loop}",
-        "\t\t\tif agent_index == 0:",
-        "\t\t\t\tdevice_global_data_vector[0] += 1",
+
     ]
 
     func = "\n".join(func)
