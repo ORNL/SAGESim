@@ -12,6 +12,7 @@ from sagesim.utils import (
 # Define the step function to be registered for SIRBreed
 @jit.rawkernel(device="cuda")
 def step_func(
+    tick,
     agent_index,
     globals,
     agent_ids,
@@ -27,11 +28,12 @@ def step_func(
 
     Parameters:
     ----------
+    tick : int
+        The current simulation tick, which is the first item in the globals array.
     agent_index : int
         Index of the agent being evaluated in the agent_ids list.
     globals : cupy.array
         Global parameters;
-        the zero-th global parameter is by default the simulation tick,
         the first item will be our infection probability.
         the second item will be our recovery probability.
     agent_ids : cupy.array

@@ -1,9 +1,7 @@
-from random import random
-
 from sagesim.breed import Breed
-from cupyx import jit
-import math
 import cupy as cp
+from cupyx import jit
+from pathlib import Path
 
 
 class SFRBreed(Breed):
@@ -21,13 +19,18 @@ class SFRBreed(Breed):
         # number of vehicles at the current agent/node/intersection
         self.register_property("vehicle_num", default=10)
 
-        self.register_step_func(step_func)
+        # register step function
+        curr_fpath = Path(__file__).resolve()
+        self.register_step_func(step_func, curr_fpath)
 
 
+# Define the step function to be registered for SIRBreed
+@jit.rawkernel(device="cuda")
 def step_func(
-    agent_ids,
+    tick,
     agent_index,
     globals,
+    agent_ids,
     breeds,
     locations,
     popularities,
