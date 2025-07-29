@@ -39,7 +39,7 @@ class Space:
     def get_neighbors(self, agent_id: int) -> set:
         """Returns agents neighbors"""
         return self._neighbor_compute_func(self._locations, agent_id)
-    
+
     ###NOTE: we need a function for load balancing
 
 
@@ -78,16 +78,11 @@ class NetworkSpace(Space):
 
         if not directed:
             self._locations[agent_1].add(agent_0)
-            self._agent_factory.set_agent_property_value(
-                "locations",
-                agent_1,
-                self._locations[agent_1],
-            )
 
     def disconnect_agents(
         self, agent_0: int, agent_1: int, directed: bool = False
     ) -> None:
-        
+
         self._locations[agent_0].remove(agent_1)
         if not directed:
             self._locations[agent_1].remove(agent_0)
