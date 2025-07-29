@@ -160,5 +160,3 @@ cython_debug/
 #.idea/
 
 examples/sfr/sfr.json
-
-examples/cosine_doi/data/
