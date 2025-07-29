@@ -32,8 +32,7 @@ if __name__ == "__main__":
     # Connect agents in the network
     for edge in network.edges:
         model.connect_agents(edge[0], edge[1])
-
-    model.get_space().disconnect_agents(0,1)
+    
     # Infect a random sample of agents
     for n in sample(sorted(network.nodes), num_infected):
         model.set_agent_property_value(n, "state", SIRState.INFECTED.value)
