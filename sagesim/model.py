@@ -37,7 +37,7 @@ class Model:
         self._step_function_file_path = step_function_file_path
         self._agent_factory = AgentFactory(space)
         self._is_setup = False
-        self.globals = {"tick": 0}
+        self.globals = {}
         # following may be set later in setup if distributed execution
 
     def register_breed(self, breed: Breed) -> None:
