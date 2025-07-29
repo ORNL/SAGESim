@@ -38,6 +38,7 @@ class Model:
         self._agent_factory = AgentFactory(space)
         self._is_setup = False
         self.globals = {}
+        self.tick = 0
         # following may be set later in setup if distributed execution
 
     def register_breed(self, breed: Breed) -> None:
@@ -251,6 +252,7 @@ class Model:
             self.__rank_local_agent_ids + received_neighbor_ids
         )
         self._step_func[blockspergrid, threadsperblock](
+            self.tick,
             self._global_data_vector,
             *rank_local_agent_and_neighbor_adts,
             sync_workers_every_n_ticks,
@@ -258,7 +260,7 @@ class Model:
             rank_local_agent_and_non_local_neighbor_ids,
         )
         # Update global tick counter after all threads have completed
-        self._global_data_vector[0] += sync_workers_every_n_ticks
+        self.tick += sync_workers_every_n_ticks
         cp.get_default_memory_pool().free_all_blocks()
         num_agents = len(self.__rank_local_agent_ids)
         self.__rank_local_agent_data_tensors = [
@@ -373,6 +375,7 @@ def generate_gpu_func(
         step_sources,
         "\n\n@jit.rawkernel(device='cuda')",
         "def stepfunc(",
+        "global_tick,",
         "device_global_data_vector,",
         joined_args + ",",
         "sync_workers_every_n_ticks,",
@@ -384,7 +387,7 @@ def generate_gpu_func(
         "\tif agent_index < num_rank_local_agents:",
         "\t\tbreed_id = a0[agent_index]",
         "\t\tfor tick in range(sync_workers_every_n_ticks):",
-        f"\n\t\t\tthread_local_tick = int(device_global_data_vector[0]) + tick",
+        f"\n\t\t\tthread_local_tick = int(global_tick) + tick",
         f"\n\t\t\t{joined_sim_loop}",
     ]
 
