@@ -158,9 +158,12 @@ class Model:
         # has run for the right amount of ticks
         original_sync_workers_every_n_ticks = sync_workers_every_n_ticks
         for time_chunk in range((ticks // original_sync_workers_every_n_ticks) + 1):
+
             if time_chunk == (ticks // original_sync_workers_every_n_ticks):
                 # Final chunk: handle remaining ticks
-                remaining_ticks = ticks - (time_chunk * original_sync_workers_every_n_ticks)
+                remaining_ticks = ticks - (
+                    time_chunk * original_sync_workers_every_n_ticks
+                )
                 if remaining_ticks == 0:
                     break
                 sync_workers_every_n_ticks = remaining_ticks
@@ -383,7 +386,6 @@ def generate_gpu_func(
         "\t\tfor tick in range(sync_workers_every_n_ticks):",
         f"\n\t\t\tthread_local_tick = int(device_global_data_vector[0]) + tick",
         f"\n\t\t\t{joined_sim_loop}",
-
     ]
 
     func = "\n".join(func)
