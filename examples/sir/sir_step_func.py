@@ -60,8 +60,8 @@ def step_func(
     )  # can replace with step_func_helper_get_random_float(rng_states, id)
 
     # Retrieve the global infection and recovery probabilities defined in the model
-    p_infection = globals[1]
-    p_recovery = globals[2]
+    p_infection = globals[0]
+    p_recovery = globals[1]
 
     # Get the current state of the agent (e.g., susceptible, infected, recovered)
     agent_state = int(get_this_agent_data_from_tensor(agent_index, state_tensor))
