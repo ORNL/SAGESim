@@ -10,7 +10,7 @@ from state import SIRState
 if __name__ == "__main__":
 
     num_agents = 1000
-    num_init_connections = 20
+    num_init_connections = 2
     rewiring_prob = 0.1
 
     num_infected = 10
@@ -21,8 +21,7 @@ if __name__ == "__main__":
     )
 
     # Instantiate the SIR Model
-    model = SIRModel()
-
+    model = SIRModel(p_infection=0.6, p_recovery=0.00)
 
     # Create agents
     for n in network.nodes:
@@ -32,13 +31,12 @@ if __name__ == "__main__":
     # Connect agents in the network
     for edge in network.edges:
         model.connect_agents(edge[0], edge[1])
-    
+
     # Infect a random sample of agents
     for n in sample(sorted(network.nodes), num_infected):
         model.set_agent_property_value(n, "state", SIRState.INFECTED.value)
 
     model.setup(use_gpu=True)  # Enables GPU acceleration if available
-
 
     # # MPI environment setup
     comm = MPI.COMM_WORLD
