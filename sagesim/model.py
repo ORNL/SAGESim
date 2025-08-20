@@ -39,7 +39,40 @@ class Model:
         self._is_setup = False
         self.globals = {}
         self.tick = 0
+        self._write_property_indices = set()  # Cache for write property indices
         # following may be set later in setup if distributed execution
+
+    def _analyze_step_function_for_writes(self, step_func: Callable) -> Set[int]:
+        """Analyze step function to find which property indices need write buffers."""
+        write_property_indices = set()
+        try:
+            import ast
+            import inspect
+            source = inspect.getsource(step_func)
+            tree = ast.parse(source)
+            signature = inspect.signature(step_func)
+            param_names = list(signature.parameters.keys())
+            
+            # In SAGESim, the actual agent properties are the last N parameters
+            # where N = self._agent_factory.num_properties
+            # The property parameters start after standard parameters
+            num_properties = self._agent_factory.num_properties
+            property_params = param_names[-num_properties:]  # Take last N parameters as properties
+            
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    if (isinstance(node.func, ast.Name) and 
+                        node.func.id == 'set_this_agent_data_from_tensor'):
+                        if len(node.args) >= 2:
+                            tensor_arg = node.args[1]
+                            if isinstance(tensor_arg, ast.Name):
+                                tensor_name = tensor_arg.id
+                                if tensor_name in property_params:
+                                    property_index = property_params.index(tensor_name)
+                                    write_property_indices.add(property_index)
+        except Exception:
+            pass
+        return write_property_indices
 
     def register_breed(self, breed: Breed) -> None:
         if self._agent_factory.num_agents > 0:
@@ -124,6 +157,15 @@ class Model:
 
         # Generate global data tensor
         self._global_data_vector = list(self.globals.values())
+        
+        # Determine and cache write property indices once during setup
+        self._write_property_indices = set()
+        for breed_idx_2_step_func in self._breed_idx_2_step_func_by_priority:
+            for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
+                breed_step_func_impl, module_fpath = breed_step_func_info
+                write_indices = self._analyze_step_function_for_writes(breed_step_func_impl)
+                self._write_property_indices.update(write_indices)
+        
         if worker == 0:
             with open(self._step_function_file_path, "w") as f:
                 f.write(
@@ -251,14 +293,30 @@ class Model:
         rank_local_agent_and_non_local_neighbor_ids = cp.array(
             self.__rank_local_agent_ids + received_neighbor_ids
         )
+        
+        # Create write buffers for properties that need them
+        write_buffers = []
+        for prop_idx in sorted(self._write_property_indices):
+            # Create a copy of the tensor for writing
+            write_buffer = cp.array(rank_local_agent_and_neighbor_adts[prop_idx])
+            write_buffers.append(write_buffer)
+        
+        # Prepare all arguments: read tensors + write tensors
+        all_args = list(rank_local_agent_and_neighbor_adts) + write_buffers
+        
         self._step_func[blockspergrid, threadsperblock](
             self.tick,
             self._global_data_vector,
-            *rank_local_agent_and_neighbor_adts,
+            *all_args,
             sync_workers_every_n_ticks,
             cp.float32(len(self.__rank_local_agent_ids)),
             rank_local_agent_and_non_local_neighbor_ids,
         )
+        
+        # Copy write buffers back to read buffers BEFORE extracting data
+        for i, prop_idx in enumerate(sorted(self._write_property_indices)):
+            rank_local_agent_and_neighbor_adts[prop_idx] = write_buffers[i]
+        
         # Update global tick counter after all threads have completed
         self.tick += sync_workers_every_n_ticks
         cp.get_default_memory_pool().free_all_blocks()
@@ -290,6 +348,15 @@ def generate_gpu_func(
     breed_idx_2_step_func_by_priority: List[List[Union[int, Callable]]],
 ) -> str:
     """
+    Generate GPU function string with double buffering support for race condition prevention.
+    
+    This function now includes double buffering to prevent race conditions from shared mutable 
+    agent data tensors across agents in the same rank. It:
+    1. Analyzes step functions to identify assignment operations to tensor properties
+    2. Creates write buffer parameters for properties that have assignments  
+    3. Generates modified step functions that write to separate buffers
+    4. Extracts and includes all necessary imports from original step function files
+
     cupy jit.rawkernel does not like us passing *args into
     them. This is because the Python function
     will be compiled by cupy.jit and the parameter arguments
@@ -320,7 +387,7 @@ def generate_gpu_func(
 
         stepfunc[blockspergrid, threadsperblock](
                 device_global_data_vector,
-                *agent_data_tensors,
+                *agent_data_tensors,  # Now includes write buffers
                 current_tick,
                 sync_workers_every_n_ticks,
             )
@@ -332,48 +399,256 @@ def generate_gpu_func(
         step function, and the file where it is defined.
         The major list elements are ordered in decreasing order of execution
         priority
-    :return: str representation of stepfunc cuda kernal
+    :return: str representation of stepfunc cuda kernal with double buffering
         that can be written to file or imported directly.
 
     """
-    args = [f"a{i}" for i in range(n_properties)]
+    import ast
+    import inspect
+    
+    def extract_imports_from_file(file_path: str) -> List[str]:
+        """Extract import statements from a Python file."""
+        imports = []
+        try:
+            with open(file_path, 'r') as f:
+                content = f.read()
+            tree = ast.parse(content)
+            
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.asname:
+                            imports.append(f"import {alias.name} as {alias.asname}")
+                        else:
+                            imports.append(f"import {alias.name}")
+                elif isinstance(node, ast.ImportFrom):
+                    module = node.module or ''
+                    names = []
+                    for alias in node.names:
+                        if alias.asname:
+                            names.append(f"{alias.name} as {alias.asname}")
+                        else:
+                            names.append(alias.name)
+                    
+                    if len(names) == 1:
+                        imports.append(f"from {module} import {names[0]}")
+                    else:
+                        imports.append(f"from {module} import {', '.join(names)}")
+        except Exception:
+            # If we can't parse imports, add common ones
+            imports = [
+                "import cupy as cp",
+                "import random", 
+                "from sagesim.utils import get_this_agent_data_from_tensor, set_this_agent_data_from_tensor, get_neighbor_data_from_tensor"
+            ]
+        return imports
+    
+    def analyze_step_function_for_writes(step_func: Callable) -> Set[int]:
+        """Analyze step function to find which property indices need write buffers."""
+        write_property_indices = set()
+        try:
+            source = inspect.getsource(step_func)
+            tree = ast.parse(source)
+            signature = inspect.signature(step_func)
+            param_names = list(signature.parameters.keys())
+            standard_params = {'tick', 'agent_index', 'globals', 'agent_ids', 'breeds', 'locations'}
+            property_params = [p for p in param_names if p not in standard_params]
+            
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    if (isinstance(node.func, ast.Name) and 
+                        node.func.id == 'set_this_agent_data_from_tensor'):
+                        if len(node.args) >= 2:
+                            tensor_arg = node.args[1]
+                            if isinstance(tensor_arg, ast.Name):
+                                tensor_name = tensor_arg.id
+                                if tensor_name in property_params:
+                                    property_index = property_params.index(tensor_name)
+                                    write_property_indices.add(property_index)
+        except Exception:
+            pass
+        return write_property_indices
+    
+    def generate_modified_step_func_code(step_func: Callable, write_indices: Set[int]) -> str:
+        """Generate modified step function code with write buffer parameters."""
+        try:
+            source = inspect.getsource(step_func)
+            lines = source.split('\n')
+            signature = inspect.signature(step_func)
+            param_names = list(signature.parameters.keys())
+            standard_params = {'tick', 'agent_index', 'globals', 'agent_ids', 'breeds', 'locations'}
+            property_params = [p for p in param_names if p not in standard_params]
+            
+            # Create mapping from property parameter names to write parameter names
+            param_to_write_param = {}
+            for i, param_name in enumerate(property_params):
+                if i in write_indices:
+                    param_to_write_param[param_name] = f"write_{param_name}"
+            
+            modified_lines = []
+            in_function_def = False
+            signature_complete = False
+            in_set_call = False
+            set_call_lines = []
+            
+            for line in lines:
+                # Handle function signature
+                if 'def ' in line and step_func.__name__ in line:
+                    in_function_def = True
+                    modified_lines.append(line)
+                    continue
+                    
+                if in_function_def and not signature_complete:
+                    if line.strip().endswith('):'):
+                        if modified_lines and modified_lines[-1].strip().endswith(','):
+                            # Previous line has comma, add write parameters
+                            if param_to_write_param:
+                                indent = len(line) - len(line.lstrip())
+                                for param_name, write_param_name in param_to_write_param.items():
+                                    modified_lines.append(" " * indent + write_param_name + ",")
+                                modified_lines.append(line)
+                            else:
+                                modified_lines.append(line)
+                        else:
+                            # Need to add comma and write parameters
+                            if param_to_write_param:
+                                indent = len(line) - len(line.lstrip())
+                                base_line = line.rstrip()[:-2] + ","
+                                modified_lines.append(base_line)
+                                for param_name, write_param_name in param_to_write_param.items():
+                                    modified_lines.append(" " * indent + write_param_name + ",")
+                                modified_lines.append(" " * indent + "):")
+                            else:
+                                modified_lines.append(line)
+                        signature_complete = True
+                        continue
+                    else:
+                        modified_lines.append(line)
+                        continue
+                
+                # Handle multi-line set_this_agent_data_from_tensor calls
+                if 'set_this_agent_data_from_tensor(' in line:
+                    in_set_call = True
+                    set_call_lines = [line]
+                    continue
+                elif in_set_call:
+                    set_call_lines.append(line)
+                    if ')' in line:
+                        in_set_call = False
+                        full_call = '\n'.join(set_call_lines)
+                        
+                        # Transform the call
+                        for param_name, write_param_name in param_to_write_param.items():
+                            if f', {param_name},' in full_call:
+                                full_call = full_call.replace(f', {param_name},', f', {write_param_name},')
+                            elif f'({param_name},' in full_call:
+                                full_call = full_call.replace(f'({param_name},', f'({write_param_name},')
+                            elif f', {param_name} ' in full_call:
+                                full_call = full_call.replace(f', {param_name} ', f', {write_param_name} ')
+                        
+                        modified_lines.extend(full_call.split('\n'))
+                        set_call_lines = []
+                    continue
+                
+                modified_lines.append(line)
+            
+            return '\n'.join(modified_lines)
+        except Exception:
+            return inspect.getsource(step_func)
+    
+    # Analyze which properties need write buffers across all step functions
+    all_write_property_indices = set()
+    all_imports = set() 
+    processed_files = set()
+    
+    for breed_idx_2_step_func in breed_idx_2_step_func_by_priority:
+        for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
+            breed_step_func_impl, module_fpath = breed_step_func_info
+            
+            # Analyze this step function for write operations
+            write_indices = analyze_step_function_for_writes(breed_step_func_impl)
+            all_write_property_indices.update(write_indices)
+            
+            # Extract imports from the original file
+            if str(module_fpath) not in processed_files:
+                file_imports = extract_imports_from_file(str(module_fpath))
+                all_imports.update(file_imports)
+                processed_files.add(str(module_fpath))
+    
+    # Generate read arguments (original properties)
+    read_args = [f"a{i}" for i in range(n_properties)]
+    
+    # Generate write arguments for properties that need write buffers
+    write_args = [f"write_a{i}" for i in sorted(all_write_property_indices)]
+    
+    # Combine all arguments
+    all_args = read_args + write_args
+    
+    # Generate modified step functions and simulation loop
     sim_loop = []
-    step_sources = ["import os", "import sys"]
-    imported_modules = set()
+    modified_step_functions = []
+    
     for breed_idx_2_step_func in breed_idx_2_step_func_by_priority:
         for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
             breed_step_func_impl, module_fpath = breed_step_func_info
             step_func_name = getattr(breed_step_func_impl, "__name__", repr(callable))
-            module_fpath = Path(module_fpath).absolute()
-            module_name = module_fpath.stem
-            if module_fpath not in imported_modules:
-                step_sources += [
-                    f"module_path = os.path.abspath('{module_fpath.parent}')",
-                    "if module_path not in sys.path:",
-                    "\tsys.path.append(module_path)",
-                    f"from {module_name} import *",
-                ]
-                imported_modules.add(module_fpath)
+            modified_step_func_name = f"{step_func_name}_double_buffer"
+            
+            # Generate modified step function
+            write_indices = analyze_step_function_for_writes(breed_step_func_impl)
+            modified_step_func_code = generate_modified_step_func_code(breed_step_func_impl, write_indices)
+            modified_step_func_code = modified_step_func_code.replace(
+                f"def {step_func_name}(",
+                f"def {modified_step_func_name}("
+            )
+            modified_step_functions.append(modified_step_func_code)
+            
+            # Generate step function call
             sim_loop += [
                 f"if breed_id == {breedidx}:",
-                f"\t{step_func_name}(",
+                f"\t{modified_step_func_name}(",
                 "\t\tthread_local_tick,",
                 "\t\tagent_index,",
                 "\t\tdevice_global_data_vector,",
                 "\t\tagent_ids,",
-                f"\t\t{','.join(args)},",
+                f"\t\t{','.join(all_args)},",
                 "\t)",
             ]
-    step_sources = "\n".join(step_sources)
-
+    
+    # Create clean import section
+    import_lines = []
+    basic_imports = []
+    from_imports = []
+    
+    seen = set()
+    for imp in sorted(all_imports):
+        if imp not in seen:
+            seen.add(imp)
+            if imp.startswith('import '):
+                basic_imports.append(imp)
+            elif imp.startswith('from '):
+                from_imports.append(imp)
+    
+    import_lines = basic_imports + from_imports
+    step_sources = "\n".join(import_lines)
+    
+    # Add modified step functions
+    all_modified_step_functions = "\n\n".join(modified_step_functions)
+    
     # Preprocess parts that would break in f-strings
     joined_sim_loop = "\n\t\t\t".join(sim_loop)
-    joined_args = ",".join(args)
+    joined_args = ",".join(all_args)
 
     func = [
-        "from cupyx import jit",
+        "# Auto-generated GPU kernel with double buffering",
+        "# Contains all necessary imports and modified step functions",
+        "",
         step_sources,
-        "\n\n@jit.rawkernel(device='cuda')",
+        "",
+        "# Modified step functions with double buffering", 
+        all_modified_step_functions,
+        "",
+        "@jit.rawkernel(device='cuda')",
         "def stepfunc(",
         "global_tick,",
         "device_global_data_vector,",
