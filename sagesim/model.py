@@ -12,6 +12,9 @@ import math
 import heapq
 import warnings
 
+import ast
+import inspect
+
 import cupy as cp
 import numpy as np
 from mpi4py import MPI
@@ -45,33 +48,39 @@ class Model:
     def _analyze_step_function_for_writes(self, step_func: Callable) -> Set[int]:
         """Analyze step function to find which property indices need write buffers."""
         write_property_indices = set()
-        try:
-            import ast
-            import inspect
-            source = inspect.getsource(step_func)
-            tree = ast.parse(source)
-            signature = inspect.signature(step_func)
-            param_names = list(signature.parameters.keys())
-            
-            # In SAGESim, the actual agent properties are the last N parameters
-            # where N = self._agent_factory.num_properties
-            # The property parameters start after standard parameters
-            num_properties = self._agent_factory.num_properties
-            property_params = param_names[-num_properties:]  # Take last N parameters as properties
-            
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Call):
-                    if (isinstance(node.func, ast.Name) and 
-                        node.func.id == 'set_this_agent_data_from_tensor'):
-                        if len(node.args) >= 2:
-                            tensor_arg = node.args[1]
-                            if isinstance(tensor_arg, ast.Name):
-                                tensor_name = tensor_arg.id
-                                if tensor_name in property_params:
-                                    property_index = property_params.index(tensor_name)
-                                    write_property_indices.add(property_index)
-        except Exception:
-            pass
+
+        source = inspect.getsource(step_func)
+        tree = ast.parse(source)
+        signature = inspect.signature(step_func)
+        param_names = list(signature.parameters.keys())
+        
+        # In SAGESim, the actual agent properties are the last N parameters
+        # where N = self._agent_factory.num_properties
+        # The property parameters start after standard parameters
+        num_properties = self._agent_factory.num_properties
+        property_params = param_names[-num_properties:]  # Take last N parameters as properties
+        
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if (isinstance(node.func, ast.Name) and 
+                    node.func.id == 'set_this_agent_data_from_tensor'):
+                    if len(node.args) >= 2:
+                        tensor_arg = node.args[1]
+                        if isinstance(tensor_arg, ast.Name):
+                            tensor_name = tensor_arg.id
+                            if tensor_name in property_params:
+                                property_index = property_params.index(tensor_name)
+                                write_property_indices.add(property_index)
+            elif isinstance(node, ast.Assign):
+                # Check for direct tensor assignments like state_tensor[agent_index] = value
+                for target in node.targets:
+                    if isinstance(target, ast.Subscript):
+                        if isinstance(target.value, ast.Name):
+                            tensor_name = target.value.id
+                            if tensor_name in property_params:
+                                property_index = property_params.index(tensor_name)
+                                write_property_indices.add(property_index)
+
         return write_property_indices
 
     def register_breed(self, breed: Breed) -> None:
@@ -403,9 +412,7 @@ def generate_gpu_func(
         that can be written to file or imported directly.
 
     """
-    import ast
-    import inspect
-    
+
     def extract_imports_from_file(file_path: str) -> List[str]:
         """Extract import statements from a Python file."""
         imports = []
@@ -446,27 +453,35 @@ def generate_gpu_func(
     def analyze_step_function_for_writes(step_func: Callable) -> Set[int]:
         """Analyze step function to find which property indices need write buffers."""
         write_property_indices = set()
-        try:
-            source = inspect.getsource(step_func)
-            tree = ast.parse(source)
-            signature = inspect.signature(step_func)
-            param_names = list(signature.parameters.keys())
-            standard_params = {'tick', 'agent_index', 'globals', 'agent_ids', 'breeds', 'locations'}
-            property_params = [p for p in param_names if p not in standard_params]
-            
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Call):
-                    if (isinstance(node.func, ast.Name) and 
-                        node.func.id == 'set_this_agent_data_from_tensor'):
-                        if len(node.args) >= 2:
-                            tensor_arg = node.args[1]
-                            if isinstance(tensor_arg, ast.Name):
-                                tensor_name = tensor_arg.id
-                                if tensor_name in property_params:
-                                    property_index = property_params.index(tensor_name)
-                                    write_property_indices.add(property_index)
-        except Exception:
-            pass
+
+        source = inspect.getsource(step_func)
+        tree = ast.parse(source)
+        signature = inspect.signature(step_func)
+        param_names = list(signature.parameters.keys())
+        standard_params = {'tick', 'agent_index', 'globals', 'agent_ids', 'breeds', 'locations'}
+        property_params = [p for p in param_names if p not in standard_params]
+        
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if (isinstance(node.func, ast.Name) and 
+                    node.func.id == 'set_this_agent_data_from_tensor'):
+                    if len(node.args) >= 2:
+                        tensor_arg = node.args[1]
+                        if isinstance(tensor_arg, ast.Name):
+                            tensor_name = tensor_arg.id
+                            if tensor_name in property_params:
+                                property_index = property_params.index(tensor_name)
+                                write_property_indices.add(property_index)
+            elif isinstance(node, ast.Assign):
+                # Check for direct tensor assignments like state_tensor[agent_index] = value
+                for target in node.targets:
+                    if isinstance(target, ast.Subscript):
+                        if isinstance(target.value, ast.Name):
+                            tensor_name = target.value.id
+                            if tensor_name in property_params:
+                                property_index = property_params.index(tensor_name)
+                                write_property_indices.add(property_index)
+
         return write_property_indices
     
     def generate_modified_step_func_code(step_func: Callable, write_indices: Set[int]) -> str:
@@ -550,7 +565,13 @@ def generate_gpu_func(
                         set_call_lines = []
                     continue
                 
-                modified_lines.append(line)
+                # Handle direct tensor assignments like state_tensor[agent_index] = value
+                line_modified = line
+                for param_name, write_param_name in param_to_write_param.items():
+                    if f'{param_name}[' in line:
+                        line_modified = line_modified.replace(f'{param_name}[', f'{write_param_name}[')
+                
+                modified_lines.append(line_modified)
             
             return '\n'.join(modified_lines)
         except Exception:

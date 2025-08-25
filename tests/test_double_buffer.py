@@ -58,6 +58,7 @@ def step_func(
                     set_this_agent_data_from_tensor(
                         agent_index, state_tensor, 2  # INFECTED
                     )
+                    # state_tensor[agent_index] = 2  # INFECTED
                     infected = True  # Once infected, no need to check more neighbors
             i += 1
 
