@@ -416,38 +416,6 @@ def generate_gpu_func(
         that can be written to file or imported directly.
 
     """
-
-    def extract_imports_from_file(file_path: str) -> List[str]:
-        """Extract import statements from a Python file."""
-        imports = []
-
-        with open(file_path, 'r') as f:
-            content = f.read()
-        tree = ast.parse(content)
-        
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.asname:
-                        imports.append(f"import {alias.name} as {alias.asname}")
-                    else:
-                        imports.append(f"import {alias.name}")
-            elif isinstance(node, ast.ImportFrom):
-                module = node.module or ''
-                names = []
-                for alias in node.names:
-                    if alias.asname:
-                        names.append(f"{alias.name} as {alias.asname}")
-                    else:
-                        names.append(alias.name)
-                
-                if len(names) == 1:
-                    imports.append(f"from {module} import {names[0]}")
-                else:
-                    imports.append(f"from {module} import {', '.join(names)}")
-
-        return imports
-    
     
     def generate_modified_step_func_code(step_func: Callable, write_indices: Set[int], num_properties: int) -> str:
         """Generate modified step function code with write buffer parameters."""
@@ -499,20 +467,6 @@ def generate_gpu_func(
         return modified_source
 
     
-    # Extract imports from all step function files
-    all_imports = set() 
-    processed_files = set()
-    
-    for breed_idx_2_step_func in breed_idx_2_step_func_by_priority:
-        for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
-            breed_step_func_impl, module_fpath = breed_step_func_info
-            
-            # Extract imports from the original file
-            if str(module_fpath) not in processed_files:
-                file_imports = extract_imports_from_file(str(module_fpath))
-                all_imports.update(file_imports)
-                processed_files.add(str(module_fpath))
-    
     # Generate read arguments (original properties)
     read_args = [f"a{i}" for i in range(n_properties)]
     
@@ -524,8 +478,10 @@ def generate_gpu_func(
     
     # Generate modified step functions and simulation loop
     sim_loop = []
+    step_sources = ["import os", "import sys"]
+    imported_modules = set()
+
     modified_step_functions = []
-    
     for breed_idx_2_step_func in breed_idx_2_step_func_by_priority:
         for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
             breed_step_func_impl, module_fpath = breed_step_func_info
@@ -539,6 +495,17 @@ def generate_gpu_func(
                 f"def {modified_step_func_name}("
             )
             modified_step_functions.append(modified_step_func_code)
+
+            module_fpath = Path(module_fpath).absolute()
+            module_name = module_fpath.stem
+            if module_fpath not in imported_modules:
+                step_sources += [
+                    f"module_path = os.path.abspath('{module_fpath.parent}')",
+                    "if module_path not in sys.path:",
+                    "\tsys.path.append(module_path)",
+                    f"from {module_name} import *",
+                ]
+                imported_modules.add(module_fpath)
             
             # Generate step function call
             sim_loop += [
@@ -551,24 +518,9 @@ def generate_gpu_func(
                 f"\t\t{','.join(args)},",
                 "\t)",
             ]
-    
-    # Create clean import section
-    import_lines = []
-    basic_imports = []
-    from_imports = []
-    
-    seen = set()
-    for imp in sorted(all_imports):
-        if imp not in seen:
-            seen.add(imp)
-            if imp.startswith('import '):
-                basic_imports.append(imp)
-            elif imp.startswith('from '):
-                from_imports.append(imp)
-    
-    import_lines = basic_imports + from_imports
-    step_sources = "\n".join(import_lines)
-    
+
+    step_sources = "\n".join(step_sources)
+
     # Add modified step functions
     all_modified_step_functions = "\n\n".join(modified_step_functions)
     
@@ -586,116 +538,6 @@ def generate_gpu_func(
         all_modified_step_functions,
         "",
         "@jit.rawkernel(device='cuda')",
-        "def stepfunc(",
-        "global_tick,",
-        "device_global_data_vector,",
-        joined_args + ",",
-        "sync_workers_every_n_ticks,",
-        "num_rank_local_agents,",
-        "agent_ids,",
-        "):",
-        "\tthread_id = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x",
-        "\tagent_index = thread_id",
-        "\tif agent_index < num_rank_local_agents:",
-        "\t\tbreed_id = a0[agent_index]",
-        "\t\tfor tick in range(sync_workers_every_n_ticks):",
-        f"\n\t\t\tthread_local_tick = int(global_tick) + tick",
-        f"\n\t\t\t{joined_sim_loop}",
-    ]
-
-    func = "\n".join(func)
-    return func
-
-
-def generate_gpu_func_original(
-    n_properties: int,
-    breed_idx_2_step_func_by_priority: List[List[Union[int, Callable]]],
-) -> str:
-    """
-    cupy jit.rawkernel does not like us passing *args into
-    them. This is because the Python function
-    will be compiled by cupy.jit and the parameter arguments
-    type and count must be set at jit compilation time.
-    However, SAGESim users will have varying numbers of
-    properties in their step functions, which means
-    our cuda kernel's parameter count would also be variable.
-    Normally, we'd just define the stepfunc with *args, but
-    due to the above constraints we have to infer the number of
-    arguments from the user defined breed step functions,
-    rewrite the overall stepfunc as a string and then pass it
-    into cupy.jit to be compiled.
-
-    This function returns a str representation of stepfunc cupy jit.rawkernel:
-
-        step_funcs_code = generate_gpu_func(
-                    len(agent_data_tensors),
-                    breed_idx_2_step_func_by_priority,
-                )
-    This function can then be directly loaded using importlib or written to a
-    file and imported. For example, if you write the code to a file
-    called step_func_code.py, you can import it as below:
-
-        import importlib
-        step_func_module = importlib.import_module("step_func_code")
-        stepfunc = step_func_module.stepfunc
-    Then you can run the stepfunc as a jit.rawkernel as below:
-
-        stepfunc[blockspergrid, threadsperblock](
-                device_global_data_vector,
-                *agent_data_tensors,
-                current_tick,
-                sync_workers_every_n_ticks,
-            )
-        )
-
-    :param n_properties: int total number of agent properties
-    :param breed_idx_2_step_func_by_priority: List of List. Each inner List
-        first element is the breedidx and second element is a tuple of the user defined
-        step function, and the file where it is defined.
-        The major list elements are ordered in decreasing order of execution
-        priority
-    :return: str representation of stepfunc cuda kernal
-        that can be written to file or imported directly.
-
-    """
-    args = [f"a{i}" for i in range(n_properties)]
-    sim_loop = []
-    step_sources = ["import os", "import sys"]
-    imported_modules = set()
-    for breed_idx_2_step_func in breed_idx_2_step_func_by_priority:
-        for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
-            breed_step_func_impl, module_fpath = breed_step_func_info
-            step_func_name = getattr(breed_step_func_impl, "__name__", repr(callable))
-            module_fpath = Path(module_fpath).absolute()
-            module_name = module_fpath.stem
-            if module_fpath not in imported_modules:
-                step_sources += [
-                    f"module_path = os.path.abspath('{module_fpath.parent}')",
-                    "if module_path not in sys.path:",
-                    "\tsys.path.append(module_path)",
-                    f"from {module_name} import *",
-                ]
-                imported_modules.add(module_fpath)
-            sim_loop += [
-                f"if breed_id == {breedidx}:",
-                f"\t{step_func_name}(",
-                "\t\tthread_local_tick,",
-                "\t\tagent_index,",
-                "\t\tdevice_global_data_vector,",
-                "\t\tagent_ids,",
-                f"\t\t{','.join(args)},",
-                "\t)",
-            ]
-    step_sources = "\n".join(step_sources)
-
-    # Preprocess parts that would break in f-strings
-    joined_sim_loop = "\n\t\t\t".join(sim_loop)
-    joined_args = ",".join(args)
-
-    func = [
-        "from cupyx import jit",
-        step_sources,
-        "\n\n@jit.rawkernel(device='cuda')",
         "def stepfunc(",
         "global_tick,",
         "device_global_data_vector,",
