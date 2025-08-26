@@ -28,6 +28,43 @@ num_workers = comm.Get_size()
 worker = comm.Get_rank()
 
 
+def analyze_step_function_for_writes(step_func: Callable, num_properties: int) -> Set[int]:
+    """Analyze step function to find which property indices need write buffers."""
+    write_property_indices = set()
+
+    source = inspect.getsource(step_func)
+    tree = ast.parse(source)
+    signature = inspect.signature(step_func)
+    param_names = list(signature.parameters.keys())
+    
+    # In SAGESim, the actual agent properties are the last N parameters
+    # where N = num_properties
+    property_params = param_names[-num_properties:]  # Take last N parameters as properties
+    
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if (isinstance(node.func, ast.Name) and 
+                node.func.id == 'set_this_agent_data_from_tensor'):
+                if len(node.args) >= 2:
+                    tensor_arg = node.args[1]
+                    if isinstance(tensor_arg, ast.Name):
+                        tensor_name = tensor_arg.id
+                        if tensor_name in property_params:
+                            property_index = property_params.index(tensor_name)
+                            write_property_indices.add(property_index)
+        elif isinstance(node, ast.Assign):
+            # Check for direct tensor assignments like state_tensor[agent_index] = value
+            for target in node.targets:
+                if isinstance(target, ast.Subscript):
+                    if isinstance(target.value, ast.Name):
+                        tensor_name = target.value.id
+                        if tensor_name in property_params:
+                            property_index = property_params.index(tensor_name)
+                            write_property_indices.add(property_index)
+
+    return write_property_indices
+
+
 class Model:
 
     def __init__(
@@ -45,43 +82,6 @@ class Model:
         self._write_property_indices = set()  # Cache for write property indices
         # following may be set later in setup if distributed execution
 
-    def _analyze_step_function_for_writes(self, step_func: Callable) -> Set[int]:
-        """Analyze step function to find which property indices need write buffers."""
-        write_property_indices = set()
-
-        source = inspect.getsource(step_func)
-        tree = ast.parse(source)
-        signature = inspect.signature(step_func)
-        param_names = list(signature.parameters.keys())
-        
-        # In SAGESim, the actual agent properties are the last N parameters
-        # where N = self._agent_factory.num_properties
-        # The property parameters start after standard parameters
-        num_properties = self._agent_factory.num_properties
-        property_params = param_names[-num_properties:]  # Take last N parameters as properties
-        
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                if (isinstance(node.func, ast.Name) and 
-                    node.func.id == 'set_this_agent_data_from_tensor'):
-                    if len(node.args) >= 2:
-                        tensor_arg = node.args[1]
-                        if isinstance(tensor_arg, ast.Name):
-                            tensor_name = tensor_arg.id
-                            if tensor_name in property_params:
-                                property_index = property_params.index(tensor_name)
-                                write_property_indices.add(property_index)
-            elif isinstance(node, ast.Assign):
-                # Check for direct tensor assignments like state_tensor[agent_index] = value
-                for target in node.targets:
-                    if isinstance(target, ast.Subscript):
-                        if isinstance(target.value, ast.Name):
-                            tensor_name = target.value.id
-                            if tensor_name in property_params:
-                                property_index = property_params.index(tensor_name)
-                                write_property_indices.add(property_index)
-
-        return write_property_indices
 
     def register_breed(self, breed: Breed) -> None:
         if self._agent_factory.num_agents > 0:
@@ -172,7 +172,7 @@ class Model:
         for breed_idx_2_step_func in self._breed_idx_2_step_func_by_priority:
             for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
                 breed_step_func_impl, module_fpath = breed_step_func_info
-                write_indices = self._analyze_step_function_for_writes(breed_step_func_impl)
+                write_indices = analyze_step_function_for_writes(breed_step_func_impl, self._agent_factory.num_properties)
                 self._write_property_indices.update(write_indices)
         
         if worker == 0:
@@ -450,132 +450,98 @@ def generate_gpu_func(
             ]
         return imports
     
-    def analyze_step_function_for_writes(step_func: Callable) -> Set[int]:
-        """Analyze step function to find which property indices need write buffers."""
-        write_property_indices = set()
-
+    
+    def generate_modified_step_func_code(step_func: Callable, write_indices: Set[int], num_properties: int) -> str:
+        """Generate modified step function code with write buffer parameters."""
         source = inspect.getsource(step_func)
-        tree = ast.parse(source)
+        lines = source.split('\n')
         signature = inspect.signature(step_func)
         param_names = list(signature.parameters.keys())
-        standard_params = {'tick', 'agent_index', 'globals', 'agent_ids', 'breeds', 'locations'}
-        property_params = [p for p in param_names if p not in standard_params]
         
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                if (isinstance(node.func, ast.Name) and 
-                    node.func.id == 'set_this_agent_data_from_tensor'):
-                    if len(node.args) >= 2:
-                        tensor_arg = node.args[1]
-                        if isinstance(tensor_arg, ast.Name):
-                            tensor_name = tensor_arg.id
-                            if tensor_name in property_params:
-                                property_index = property_params.index(tensor_name)
-                                write_property_indices.add(property_index)
-            elif isinstance(node, ast.Assign):
-                # Check for direct tensor assignments like state_tensor[agent_index] = value
-                for target in node.targets:
-                    if isinstance(target, ast.Subscript):
-                        if isinstance(target.value, ast.Name):
-                            tensor_name = target.value.id
-                            if tensor_name in property_params:
-                                property_index = property_params.index(tensor_name)
-                                write_property_indices.add(property_index)
-
-        return write_property_indices
-    
-    def generate_modified_step_func_code(step_func: Callable, write_indices: Set[int]) -> str:
-        """Generate modified step function code with write buffer parameters."""
-        try:
-            source = inspect.getsource(step_func)
-            lines = source.split('\n')
-            signature = inspect.signature(step_func)
-            param_names = list(signature.parameters.keys())
-            standard_params = {'tick', 'agent_index', 'globals', 'agent_ids', 'breeds', 'locations'}
-            property_params = [p for p in param_names if p not in standard_params]
-            
-            # Create mapping from property parameter names to write parameter names
-            param_to_write_param = {}
-            for i, param_name in enumerate(property_params):
-                if i in write_indices:
-                    param_to_write_param[param_name] = f"write_{param_name}"
-            
-            modified_lines = []
-            in_function_def = False
-            signature_complete = False
-            in_set_call = False
-            set_call_lines = []
-            
-            for line in lines:
-                # Handle function signature
-                if 'def ' in line and step_func.__name__ in line:
-                    in_function_def = True
+        # Use the same approach as analyze_step_function_for_writes
+        property_params = param_names[-num_properties:]  # Take last N parameters as properties
+        
+        # Create mapping from property parameter names to write parameter names
+        param_to_write_param = {}
+        for i, param_name in enumerate(property_params):
+            if i in write_indices:
+                param_to_write_param[param_name] = f"write_{param_name}"
+        
+        modified_lines = []
+        in_function_def = False
+        signature_complete = False
+        in_set_call = False
+        set_call_lines = []
+        
+        for line in lines:
+            # Handle function signature
+            if 'def ' in line and step_func.__name__ in line:
+                in_function_def = True
+                modified_lines.append(line)
+                continue
+                
+            if in_function_def and not signature_complete:
+                if line.strip().endswith('):'):
+                    if modified_lines and modified_lines[-1].strip().endswith(','):
+                        # Previous line has comma, add write parameters
+                        if param_to_write_param:
+                            indent = len(line) - len(line.lstrip())
+                            for param_name, write_param_name in param_to_write_param.items():
+                                modified_lines.append(" " * indent + write_param_name + ",")
+                            modified_lines.append(line)
+                        else:
+                            modified_lines.append(line)
+                    else:
+                        # Need to add comma and write parameters
+                        if param_to_write_param:
+                            indent = len(line) - len(line.lstrip())
+                            base_line = line.rstrip()[:-2] + ","
+                            modified_lines.append(base_line)
+                            for param_name, write_param_name in param_to_write_param.items():
+                                modified_lines.append(" " * indent + write_param_name + ",")
+                            modified_lines.append(" " * indent + "):")
+                        else:
+                            modified_lines.append(line)
+                    signature_complete = True
+                    continue
+                else:
                     modified_lines.append(line)
                     continue
-                    
-                if in_function_def and not signature_complete:
-                    if line.strip().endswith('):'):
-                        if modified_lines and modified_lines[-1].strip().endswith(','):
-                            # Previous line has comma, add write parameters
-                            if param_to_write_param:
-                                indent = len(line) - len(line.lstrip())
-                                for param_name, write_param_name in param_to_write_param.items():
-                                    modified_lines.append(" " * indent + write_param_name + ",")
-                                modified_lines.append(line)
-                            else:
-                                modified_lines.append(line)
-                        else:
-                            # Need to add comma and write parameters
-                            if param_to_write_param:
-                                indent = len(line) - len(line.lstrip())
-                                base_line = line.rstrip()[:-2] + ","
-                                modified_lines.append(base_line)
-                                for param_name, write_param_name in param_to_write_param.items():
-                                    modified_lines.append(" " * indent + write_param_name + ",")
-                                modified_lines.append(" " * indent + "):")
-                            else:
-                                modified_lines.append(line)
-                        signature_complete = True
-                        continue
-                    else:
-                        modified_lines.append(line)
-                        continue
-                
-                # Handle multi-line set_this_agent_data_from_tensor calls
-                if 'set_this_agent_data_from_tensor(' in line:
-                    in_set_call = True
-                    set_call_lines = [line]
-                    continue
-                elif in_set_call:
-                    set_call_lines.append(line)
-                    if ')' in line:
-                        in_set_call = False
-                        full_call = '\n'.join(set_call_lines)
-                        
-                        # Transform the call
-                        for param_name, write_param_name in param_to_write_param.items():
-                            if f', {param_name},' in full_call:
-                                full_call = full_call.replace(f', {param_name},', f', {write_param_name},')
-                            elif f'({param_name},' in full_call:
-                                full_call = full_call.replace(f'({param_name},', f'({write_param_name},')
-                            elif f', {param_name} ' in full_call:
-                                full_call = full_call.replace(f', {param_name} ', f', {write_param_name} ')
-                        
-                        modified_lines.extend(full_call.split('\n'))
-                        set_call_lines = []
-                    continue
-                
-                # Handle direct tensor assignments like state_tensor[agent_index] = value
-                line_modified = line
-                for param_name, write_param_name in param_to_write_param.items():
-                    if f'{param_name}[' in line:
-                        line_modified = line_modified.replace(f'{param_name}[', f'{write_param_name}[')
-                
-                modified_lines.append(line_modified)
             
-            return '\n'.join(modified_lines)
-        except Exception:
-            return inspect.getsource(step_func)
+            # Handle multi-line set_this_agent_data_from_tensor calls
+            if 'set_this_agent_data_from_tensor(' in line:
+                in_set_call = True
+                set_call_lines = [line]
+                continue
+            elif in_set_call:
+                set_call_lines.append(line)
+                if ')' in line:
+                    in_set_call = False
+                    full_call = '\n'.join(set_call_lines)
+                    
+                    # Transform the call
+                    for param_name, write_param_name in param_to_write_param.items():
+                        if f', {param_name},' in full_call:
+                            full_call = full_call.replace(f', {param_name},', f', {write_param_name},')
+                        elif f'({param_name},' in full_call:
+                            full_call = full_call.replace(f'({param_name},', f'({write_param_name},')
+                        elif f', {param_name} ' in full_call:
+                            full_call = full_call.replace(f', {param_name} ', f', {write_param_name} ')
+                    
+                    modified_lines.extend(full_call.split('\n'))
+                    set_call_lines = []
+                continue
+            
+            # Handle direct tensor assignments like state_tensor[agent_index] = value
+            line_modified = line
+            for param_name, write_param_name in param_to_write_param.items():
+                if f'{param_name}[' in line:
+                    line_modified = line_modified.replace(f'{param_name}[', f'{write_param_name}[')
+            
+            modified_lines.append(line_modified)
+        
+        return '\n'.join(modified_lines)
+
     
     # Analyze which properties need write buffers across all step functions
     all_write_property_indices = set()
@@ -587,7 +553,7 @@ def generate_gpu_func(
             breed_step_func_impl, module_fpath = breed_step_func_info
             
             # Analyze this step function for write operations
-            write_indices = analyze_step_function_for_writes(breed_step_func_impl)
+            write_indices = analyze_step_function_for_writes(breed_step_func_impl, n_properties)
             all_write_property_indices.update(write_indices)
             
             # Extract imports from the original file
@@ -616,8 +582,8 @@ def generate_gpu_func(
             modified_step_func_name = f"{step_func_name}_double_buffer"
             
             # Generate modified step function
-            write_indices = analyze_step_function_for_writes(breed_step_func_impl)
-            modified_step_func_code = generate_modified_step_func_code(breed_step_func_impl, write_indices)
+            write_indices = analyze_step_function_for_writes(breed_step_func_impl, n_properties)
+            modified_step_func_code = generate_modified_step_func_code(breed_step_func_impl, write_indices, n_properties)
             modified_step_func_code = modified_step_func_code.replace(
                 f"def {step_func_name}(",
                 f"def {modified_step_func_name}("
