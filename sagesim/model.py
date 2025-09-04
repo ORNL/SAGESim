@@ -5,6 +5,7 @@ SuperNeuroABM basic Model class
 
 from typing import Dict, List, Callable, Set, Any, Union
 import os
+import re
 from pathlib import Path
 import importlib
 import pickle
@@ -61,6 +62,8 @@ def analyze_step_function_for_writes(step_func: Callable, num_properties: int) -
                         if tensor_name in property_params:
                             property_index = property_params.index(tensor_name)
                             write_property_indices.add(property_index)
+
+    
 
     return write_property_indices
 
@@ -174,7 +177,10 @@ class Model:
                 breed_step_func_impl, module_fpath = breed_step_func_info
                 write_indices = analyze_step_function_for_writes(breed_step_func_impl, self._agent_factory.num_properties)
                 self._write_property_indices.update(write_indices)
-        
+
+        # Sort write property indices for consistent ordering
+        self._write_property_indices = sorted(self._write_property_indices)
+
         if worker == 0:
             with open(self._step_function_file_path, "w") as f:
                 f.write(
@@ -306,7 +312,7 @@ class Model:
         
         # Create write buffers for properties that need them
         write_buffers = []
-        for prop_idx in sorted(self._write_property_indices):
+        for prop_idx in self._write_property_indices:
             # Create a copy of the tensor for writing
             write_buffer = cp.array(rank_local_agent_and_neighbor_adts[prop_idx])
             write_buffers.append(write_buffer)
@@ -324,7 +330,7 @@ class Model:
         )
         
         # Copy write buffers back to read buffers BEFORE extracting data
-        for i, prop_idx in enumerate(sorted(self._write_property_indices)):
+        for i, prop_idx in enumerate(self._write_property_indices):
             rank_local_agent_and_neighbor_adts[prop_idx] = write_buffers[i]
         
         # Update global tick counter after all threads have completed
@@ -452,17 +458,27 @@ def generate_gpu_func(
 
         
         # Step 2: Replace parameter names with write parameter names in WRITE contexts only
-        import re
-        for param_name, write_param_name in param_to_write_param.items():
-            # Replace in set_this_agent_data_from_tensor calls (allow flexible spacing)
-            pattern1 = rf'set_this_agent_data_from_tensor\(\s*agent_index\s*,\s*{re.escape(param_name)}\s*,'
-            replacement1 = rf'set_this_agent_data_from_tensor(agent_index, {write_param_name},'
-            modified_source = re.sub(pattern1, replacement1, modified_source)
+        tree = ast.parse(modified_source)
+        
+        # Walk through AST and replace write operations
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                # Replace in set_this_agent_data_from_tensor calls
+                if (isinstance(node.func, ast.Name) and 
+                    node.func.id == 'set_this_agent_data_from_tensor' and
+                    len(node.args) >= 2):
+                    tensor_arg = node.args[1]
+                    if isinstance(tensor_arg, ast.Name) and tensor_arg.id in param_to_write_param:
+                        node.args[1] = ast.Name(id=param_to_write_param[tensor_arg.id], ctx=ast.Load())
             
-            # Replace in direct assignments (param_name[...] = ...)
-            pattern2 = rf'{re.escape(param_name)}\['
-            replacement2 = rf'{write_param_name}['
-            modified_source = re.sub(pattern2, replacement2, modified_source)
+            elif isinstance(node, ast.Assign):
+                # Replace in direct assignments (param_name[...] = ...)
+                for target in node.targets:
+                    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                        if target.value.id in param_to_write_param:
+                            target.value.id = param_to_write_param[target.value.id]
+        
+        modified_source = ast.unparse(tree)
         
         return modified_source
 
