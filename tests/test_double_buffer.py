@@ -24,7 +24,7 @@ def infection_step_func(
     agent_ids,
     breeds,
     locations,
-    state_tensor
+    state_tensor,
 ):
     """
     Step function for infection spread with probability p (default p=1 for testing)
@@ -59,6 +59,35 @@ def infection_step_func(
                     # state_tensor[agent_index]=  2  # INFECTED
                     infected = True  # Once infected, no need to check more neighbors
             i += 1
+
+# Define step function for infection spread
+@jit.rawkernel(device="cuda")
+def recovery_step_func(
+    tick,
+    agent_index,
+    globals,
+    agent_ids,
+    breeds,
+    locations,
+    state_tensor,
+):
+    """
+    Step function for infection spread with probability p (default p=1 for testing)
+    """
+    # Get infection probability from globals (default p=1 for testing)
+    p_recovery = globals[1]
+    
+    # Get current agent state
+    agent_state = int(get_this_agent_data_from_tensor(agent_index, state_tensor))
+    
+    # Only infected agents can be recovered
+    if agent_state == 2:  # SUSCEPTIBLE
+       
+        rand = random.random()
+        if rand < p_recovery:
+            # set_this_agent_data_from_tensor(agent_index,state_tensor,3)
+            state_tensor[agent_index] = 3  # RECOVERED
+
 
 
 class SIBreed(Breed):
@@ -98,35 +127,6 @@ class SIModel(Model):
         self.get_space().connect_agents(agent_0, agent_1)
 
 
-# Define step function for infection spread
-@jit.rawkernel(device="cuda")
-def recovery_step_func(
-    tick,
-    agent_index,
-    globals,
-    agent_ids,
-    breeds,
-    locations,
-    state_tensor,
-):
-    """
-    Step function for infection spread with probability p (default p=1 for testing)
-    """
-    # Get infection probability from globals (default p=1 for testing)
-    p_recovery = globals[1]
-    
-    # Get current agent state
-    agent_state = int(get_this_agent_data_from_tensor(agent_index, state_tensor))
-    
-    # Only infected agents can be recovered
-    if agent_state == 2:  # SUSCEPTIBLE
-       
-        rand = random.random()
-        if rand < p_recovery:
-            set_this_agent_data_from_tensor(agent_index,state_tensor,3)
-
-
-
 class SIRBreed(Breed):
     """Breed for infection and recovery spreading test"""
     
@@ -147,9 +147,10 @@ class SIRModel(Model):
     def __init__(self, p_infection=1.0, p_recovery=1.0) -> None:
         space = NetworkSpace()
         super().__init__(space)
+        self._sir_breed = SIRBreed()
         
         # Register the breed
-        self.register_breed(breed=SIRBreed())
+        self.register_breed(breed=self._sir_breed)
         
         # Register infection probability (default p=1 for testing)
         self.register_global_property("p_infection", p_infection)
@@ -158,7 +159,7 @@ class SIRModel(Model):
     
     def create_agent(self, state):
         agent_id = self.create_agent_of_breed(
-            self._infection_breed, state=state
+            self._sir_breed, state=state
         )
         return agent_id
     
@@ -274,6 +275,44 @@ class TestDoubleBuffer(unittest.TestCase):
         for agent_id in range(11, 111):
             state = self.model.get_agent_property_value(agent_id, "state")
             self.assertEqual(state, 1, f"Second layer agent {agent_id} should be susceptible after 1 tick")
+
+    def test_2_tick_spread_with_SIRModel(self):
+        """Test 2 ticks with SIR model: middle layer recovers, second layer gets infected"""
+        # Generate network and create model with both infection and recovery probabilities = 1
+        self.model = create_model_from_network(SIRModel(p_infection=1.0, p_recovery=1.0), self.network)
+        
+        # Setup model
+        self.model.setup(use_gpu=True)
+        
+        # Verify initial state: only root agent is infected
+        infected_count = 0
+        for agent_id in range(self.total_agents):
+            state = self.model.get_agent_property_value(agent_id, "state")
+            if state == 2:
+                infected_count += 1
+        self.assertEqual(infected_count, 1)  # Only root agent
+        
+        # Run simulation for 2 ticks
+        print(f"Running SIR simulation with 2 ticks, sync_workers_every_n_ticks=1")
+        self.model.simulate(2, sync_workers_every_n_ticks=1)
+        
+        # After 2 ticks with SIR model (infection and recovery prob = 1):
+        # Tick 1: Root (0) infects middle layer (1-10), then root recovers
+        # Tick 2: Middle layer (1-10) infects second layer (11-110), then middle layer recovers
+   
+        # Check that root agent (0) is recovered
+        root_state = self.model.get_agent_property_value(0, "state")
+        self.assertEqual(root_state, 3, "Root agent should be recovered after 2 ticks")
+        
+        # Check that all middle agents (1-10) are recovered
+        for agent_id in range(1, 11):
+            state = self.model.get_agent_property_value(agent_id, "state")
+            self.assertEqual(state, 3, f"Middle agent {agent_id} should be recovered after 2 ticks")
+        
+        # Check that all second layer agents (11-110) are infected
+        for agent_id in range(11, 111):
+            state = self.model.get_agent_property_value(agent_id, "state")
+            self.assertEqual(state, 2, f"Second layer agent {agent_id} should be infected after 2 ticks")
 
     
 if __name__ == "__main__":
