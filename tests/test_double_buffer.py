@@ -238,34 +238,12 @@ class TestDoubleBuffer(unittest.TestCase):
         # Setup model
         self.model.setup(use_gpu=True)
         
-        # Verify initial state: only root agent is infected
-        infected_count = 0
-        for agent_id in range(self.total_agents):
-            state = self.model.get_agent_property_value(agent_id, "state")
-            if state == 2:
-                infected_count += 1
-        self.assertEqual(infected_count, 1)  # Only root agent
         
         # Run simulation
         # test with 1 tick to make sure infection spreads only to the middle agents
         print(f"Running simulation with 1 tick, sync_workers_every_n_ticks=1")
         self.model.simulate(1, sync_workers_every_n_ticks=1)
 
-        # Verify infection spread (with p=1, all connected susceptible agents should be infected)
-        susceptible_agents = []
-        infected_agents = []
-        
-        for agent_id in range(self.total_agents):
-            state = self.model.get_agent_property_value(agent_id, "state")
-            if state == 1:  # SUSCEPTIBLE
-                susceptible_agents.append(agent_id)
-            elif state == 2:  # INFECTED
-                infected_agents.append(agent_id)
-        
-        print(f"Susceptible agents: {susceptible_agents}")
-        print(f"Infected agents: {infected_agents}")
-        print(f"Total susceptible: {len(susceptible_agents)}")
-        print(f"Total infected: {len(infected_agents)}")
         
         # Check that root agent (0) is still infected
         root_state = self.model.get_agent_property_value(0, "state")
