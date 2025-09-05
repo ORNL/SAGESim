@@ -17,14 +17,14 @@ from sagesim.utils import (
 
 # Define step function for infection spread
 @jit.rawkernel(device="cuda")
-def step_func(
+def infection_step_func(
     tick,
     agent_index,
     globals,
     agent_ids,
     breeds,
     locations,
-    state_tensor,
+    state_tensor
 ):
     """
     Step function for infection spread with probability p (default p=1 for testing)
@@ -61,7 +61,7 @@ def step_func(
             i += 1
 
 
-class InfectionBreed(Breed):
+class SIBreed(Breed):
     """Breed for infection spreading test"""
     
     def __init__(self) -> None:
@@ -71,16 +71,16 @@ class InfectionBreed(Breed):
         self.register_property("state", 1)
         # Register the step function
         curr_fpath = Path(__file__).resolve()
-        self.register_step_func(step_func, curr_fpath, 0)
+        self.register_step_func(infection_step_func, curr_fpath, 0)
 
 
-class InfectionModel(Model):
+class SIModel(Model):
     """Model for infection spreading test"""
     
     def __init__(self, p_infection=1.0) -> None:
         space = NetworkSpace()
         super().__init__(space)
-        self._infection_breed = InfectionBreed()
+        self._infection_breed = SIBreed()
         
         # Register the breed
         self.register_breed(breed=self._infection_breed)
@@ -98,70 +98,136 @@ class InfectionModel(Model):
         self.get_space().connect_agents(agent_0, agent_1)
 
 
+# Define step function for infection spread
+@jit.rawkernel(device="cuda")
+def recovery_step_func(
+    tick,
+    agent_index,
+    globals,
+    agent_ids,
+    breeds,
+    locations,
+    state_tensor,
+):
+    """
+    Step function for infection spread with probability p (default p=1 for testing)
+    """
+    # Get infection probability from globals (default p=1 for testing)
+    p_recovery = globals[1]
+    
+    # Get current agent state
+    agent_state = int(get_this_agent_data_from_tensor(agent_index, state_tensor))
+    
+    # Only infected agents can be recovered
+    if agent_state == 2:  # SUSCEPTIBLE
+       
+        rand = random.random()
+        if rand < p_recovery:
+            set_this_agent_data_from_tensor(agent_index,state_tensor,3)
+
+
+
+class SIRBreed(Breed):
+    """Breed for infection and recovery spreading test"""
+    
+    def __init__(self) -> None:
+        name = "Infection"
+        super().__init__(name)
+        # Register state property
+        self.register_property("state", 1)
+        # Register the step function
+        curr_fpath = Path(__file__).resolve()
+        self.register_step_func(infection_step_func, curr_fpath, 0)
+        self.register_step_func(recovery_step_func, curr_fpath, 1)
+
+
+class SIRModel(Model):
+    """Model for infection spreading and recovery test"""
+    
+    def __init__(self, p_infection=1.0, p_recovery=1.0) -> None:
+        space = NetworkSpace()
+        super().__init__(space)
+        
+        # Register the breed
+        self.register_breed(breed=SIRBreed())
+        
+        # Register infection probability (default p=1 for testing)
+        self.register_global_property("p_infection", p_infection)
+        # Register recovery probability (default p=1 for testing)
+        self.register_global_property("p_recovery", p_recovery)
+    
+    def create_agent(self, state):
+        agent_id = self.create_agent_of_breed(
+            self._infection_breed, state=state
+        )
+        return agent_id
+    
+    def connect_agents(self, agent_0, agent_1):
+        self.get_space().connect_agents(agent_0, agent_1)
+
+def generate_hierarchical_network(total_agents=111):
+    """Generate 1->10->100 network using NetworkX"""
+    # Create empty graph
+    G = nx.DiGraph()
+    
+    # Add all nodes
+    G.add_nodes_from(range(total_agents))
+    
+    # Root agent (0) connects to middle agents (1-10)
+    for middle_agent in range(1, 11):
+        G.add_edge(0, middle_agent)
+    
+    # Middle agents (1-10) connect to end agents (11-110)
+    # First: each middle agent connects to exactly 10 end agents to ensure all 100 are connected
+    random.seed(46)  # For reproducible tests
+    end_agents = list(range(11, 111))
+    
+    # Distribute the 100 end agents evenly: each of 10 middle agents gets 10 end agents
+    for middle_agent_idx, middle_agent in enumerate(range(1, 11)):
+        # Each middle agent gets exactly 10 end agents (10 * 10 = 100 total)
+        start_idx = middle_agent_idx * 10
+        end_idx = start_idx + 10
+        assigned_end_agents = end_agents[start_idx:end_idx]
+        
+        for end_agent in assigned_end_agents:
+            G.add_edge(middle_agent, end_agent)
+        
+        # Then: randomly connect to 1-10 additional end agents from the remaining 90
+        remaining_end_agents = [agent for agent in end_agents if agent not in assigned_end_agents]
+        num_additional = random.randint(1, 10)
+        additional_connections = random.sample(remaining_end_agents, min(num_additional, len(remaining_end_agents)))
+        
+        for end_agent in additional_connections:
+            G.add_edge(middle_agent, end_agent)
+
+    return G
+
+def create_model_from_network(model, network):
+    """Create SAGESim model from NetworkX network"""
+    # Create all agents as susceptible
+    for node in network.nodes:
+        model.create_agent(1)  # 1 = SUSCEPTIBLE
+    
+    # Set root agent as infected
+    model.set_agent_property_value(0, "state", 2)  # 2 = INFECTED
+    
+    # Add all edges to the model
+    for edge in network.edges:
+        model.connect_agents(edge[0], edge[1])
+    
+    return model
+
+
 class TestDoubleBuffer(unittest.TestCase):
     def setUp(self):
-        """Set up test environment"""
-        self.model = InfectionModel(p_infection=1) 
-        self.total_agents = 111  # 1 root + 10 middle + 100 end
+        """Set up the network"""
+        self.total_agents = 111
+        self.network = generate_hierarchical_network(self.total_agents)
         
-    def generate_hierarchical_network(self):
-        """Generate 1->10->100 network using NetworkX"""
-        # Create empty graph
-        G = nx.DiGraph()
-        
-        # Add all nodes
-        G.add_nodes_from(range(self.total_agents))
-        
-        # Root agent (0) connects to middle agents (1-10)
-        for middle_agent in range(1, 11):
-            G.add_edge(0, middle_agent)
-        
-        # Middle agents (1-10) connect to end agents (11-110)
-        # First: each middle agent connects to exactly 10 end agents to ensure all 100 are connected
-        random.seed(46)  # For reproducible tests
-        end_agents = list(range(11, 111))
-        
-        # Distribute the 100 end agents evenly: each of 10 middle agents gets 10 end agents
-        for middle_agent_idx, middle_agent in enumerate(range(1, 11)):
-            # Each middle agent gets exactly 10 end agents (10 * 10 = 100 total)
-            start_idx = middle_agent_idx * 10
-            end_idx = start_idx + 10
-            assigned_end_agents = end_agents[start_idx:end_idx]
-            
-            for end_agent in assigned_end_agents:
-                G.add_edge(middle_agent, end_agent)
-            
-            # Then: randomly connect to 1-10 additional end agents from the remaining 90
-            remaining_end_agents = [agent for agent in end_agents if agent not in assigned_end_agents]
-            num_additional = random.randint(1, 10)
-            additional_connections = random.sample(remaining_end_agents, min(num_additional, len(remaining_end_agents)))
-            
-            for end_agent in additional_connections:
-                G.add_edge(middle_agent, end_agent)
-
-        return G
-    
-    def create_model_from_network(self, network):
-        """Create SAGESim model from NetworkX network"""
-        # Create all agents as susceptible
-        for node in network.nodes:
-            self.model.create_agent(1)  # 1 = SUSCEPTIBLE
-        
-        # Set root agent as infected
-        self.model.set_agent_property_value(0, "state", 2)  # 2 = INFECTED
-        
-        # Add all edges to the model
-        for edge in network.edges:
-            self.model.connect_agents(edge[0], edge[1])
-        
-        return self.model
-
-    
-    def test_1_tick_spread(self):
+    def test_1_tick_spread_with_SIModel(self):
         """Test internal ticks with infection spreading on hierarchical network"""
         # Generate network and create model
-        network = self.generate_hierarchical_network()
-        self.model = self.create_model_from_network(network)
+        self.model = create_model_from_network(SIModel(p_infection=1.0), self.network)
         
         # Setup model
         self.model.setup(use_gpu=True)
