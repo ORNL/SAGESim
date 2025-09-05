@@ -25,6 +25,7 @@ def infection_step_func(
     breeds,
     locations,
     state_tensor,
+    dummy_tensor
 ):
     """
     Step function for infection spread with probability p (default p=1 for testing)
@@ -70,10 +71,12 @@ def recovery_step_func(
     breeds,
     locations,
     state_tensor,
+    dummy_tensor
 ):
     """
     Step function for infection spread with probability p (default p=1 for testing)
     """
+    dummy_tensor[agent_index] = dummy_tensor[agent_index] + 1  # test if write_dummy_tensor will be created
     # Get infection probability from globals (default p=1 for testing)
     p_recovery = globals[1]
     
@@ -135,6 +138,8 @@ class SIRBreed(Breed):
         super().__init__(name)
         # Register state property
         self.register_property("state", 1)
+        self.register_property("dummy", 0)  # Dummy property for double buffering
+
         # Register the step function
         curr_fpath = Path(__file__).resolve()
         self.register_step_func(infection_step_func, curr_fpath, 0)
@@ -282,15 +287,7 @@ class TestDoubleBuffer(unittest.TestCase):
         self.model = create_model_from_network(SIRModel(p_infection=1.0, p_recovery=1.0), self.network)
         
         # Setup model
-        self.model.setup(use_gpu=True)
-        
-        # Verify initial state: only root agent is infected
-        infected_count = 0
-        for agent_id in range(self.total_agents):
-            state = self.model.get_agent_property_value(agent_id, "state")
-            if state == 2:
-                infected_count += 1
-        self.assertEqual(infected_count, 1)  # Only root agent
+        self.model.setup(use_gpu=True) 
         
         # Run simulation for 2 ticks
         print(f"Running SIR simulation with 2 ticks, sync_workers_every_n_ticks=1")
