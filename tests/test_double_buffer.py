@@ -1,3 +1,4 @@
+import sys
 import unittest
 import networkx as nx
 import random
@@ -14,10 +15,56 @@ from sagesim.utils import (
     get_neighbor_data_from_tensor,
 )
 
-
 # Define step function for infection spread
 @jit.rawkernel(device="cuda")
 def infection_step_func(
+    tick,
+    agent_index,
+    globals,
+    agent_ids,
+    breeds,
+    locations,
+    state_tensor,
+):
+    """
+    Step function for infection spread with probability p (default p=1 for testing)
+    """
+    # Get the list of neighboring agent IDs
+    neighbor_ids = locations[agent_index]
+    
+    # Get infection probability from globals (default p=1 for testing)
+    p_infection = globals[0]
+    
+    # Get current agent state
+    agent_state = int(get_this_agent_data_from_tensor(agent_index, state_tensor))
+    
+    # Only susceptible agents can be infected
+    if agent_state == 1:  # SUSCEPTIBLE
+        # Check all neighbors
+        i = 0
+        infected = False
+        while i < len(neighbor_ids) and not cp.isnan(neighbor_ids[i]) and not infected:
+            neighbor_id = neighbor_ids[i]
+            
+            # Get neighbor state
+            neighbor_state = int(
+                get_neighbor_data_from_tensor(agent_ids, neighbor_id, state_tensor)
+            )
+            
+            # If neighbor is infected and random chance passes, infect this agent
+            if neighbor_state == 2:  # INFECTED
+                rand = random.random()
+                if rand < p_infection:
+                    set_this_agent_data_from_tensor(agent_index,state_tensor,2)
+                    # state_tensor[agent_index]=  2  # INFECTED
+                    infected = True  # Once infected, no need to check more neighbors
+            i += 1
+
+
+
+# Define step function for infection spread
+@jit.rawkernel(device="cuda")
+def infection_step_func_with_dummy(
     tick,
     agent_index,
     globals,
@@ -60,6 +107,8 @@ def infection_step_func(
                     # state_tensor[agent_index]=  2  # INFECTED
                     infected = True  # Once infected, no need to check more neighbors
             i += 1
+
+
 
 # Define step function for infection spread
 @jit.rawkernel(device="cuda")
@@ -142,7 +191,7 @@ class SIRBreed(Breed):
 
         # Register the step function
         curr_fpath = Path(__file__).resolve()
-        self.register_step_func(infection_step_func, curr_fpath, 0)
+        self.register_step_func(infection_step_func_with_dummy, curr_fpath, 0)
         self.register_step_func(recovery_step_func, curr_fpath, 1)
 
 
@@ -225,15 +274,26 @@ def create_model_from_network(model, network):
 
 
 class TestDoubleBuffer(unittest.TestCase):
-    def setUp(self):
-        """Set up the network"""
-        self.total_agents = 111
-        self.network = generate_hierarchical_network(self.total_agents)
+    @classmethod
+    def setUpClass(cls):
+        """Set up the network once for all tests"""
+        cls.total_agents = 111
+        cls.network = generate_hierarchical_network(cls.total_agents)
+        
+    def tearDown(self):
+        """Clean up after each test"""
+        if hasattr(self, 'model'):
+            del self.model
+        
+        # Clear any cached modules to force regeneration
+        if 'step_func_code' in sys.modules:
+            del sys.modules['step_func_code']
         
     def test_1_tick_spread_with_SIModel(self):
         """Test internal ticks with infection spreading on hierarchical network"""
         # Generate network and create model
-        self.model = create_model_from_network(SIModel(p_infection=1.0), self.network)
+
+        self.model = create_model_from_network(SIModel(p_infection=1.0), self.__class__.network)
         
         # Setup model
         self.model.setup(use_gpu=True)
@@ -262,7 +322,7 @@ class TestDoubleBuffer(unittest.TestCase):
     def test_2_tick_spread_with_SIRModel(self):
         """Test 2 ticks with SIR model: middle layer recovers, second layer gets infected"""
         # Generate network and create model with both infection and recovery probabilities = 1
-        self.model = create_model_from_network(SIRModel(p_infection=1.0, p_recovery=1.0), self.network)
+        self.model = create_model_from_network(SIRModel(p_infection=1.0, p_recovery=1.0), self.__class__.network)
         
         # Setup model
         self.model.setup(use_gpu=True) 
