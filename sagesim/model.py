@@ -320,29 +320,32 @@ class Model:
         # Prepare all arguments: read tensors + write tensors
         all_args = list(rank_local_agent_and_neighbor_adts) + write_buffers
 
-        # BLOCK-WISE SYNCHRONIZATION: Process one tick at a time
-        # This ensures all blocks complete tick N before any block starts tick N+1
+        # CROSS-BREED SYNCHRONIZATION: Process breeds sequentially within each tick
+        # This ensures proper execution order: soma -> synapse -> learning
         for tick_offset in range(sync_workers_every_n_ticks):
             current_tick = self.tick + tick_offset
 
-            # Phase 1: Execute step functions (all blocks write to write buffers)
-            self._step_func[blockspergrid, threadsperblock](
-                current_tick,
-                self._global_data_vector,
-                *all_args,
-                1,  # Process exactly 1 tick for proper synchronization
-                cp.float32(len(self.__rank_local_agent_ids)),
-                rank_local_agent_and_non_local_neighbor_ids,
-            )
+            # Execute each breed priority group separately with synchronization
+            for priority_idx, priority_group in enumerate(self._breed_idx_2_step_func_by_priority):
+                # Execute step functions for this breed priority group only
+                self._step_func[blockspergrid, threadsperblock](
+                    current_tick,
+                    self._global_data_vector,
+                    *all_args,
+                    1,  # Process exactly 1 tick
+                    cp.float32(len(self.__rank_local_agent_ids)),
+                    rank_local_agent_and_non_local_neighbor_ids,
+                    priority_idx,  # Which priority group to execute
+                )
 
-            # Synchronization barrier: Wait for all blocks to complete
-            cp.cuda.Stream.null.synchronize()
+                # Synchronization barrier: Wait for all blocks to complete this breed phase
+                cp.cuda.Stream.null.synchronize()
 
-            # Phase 2: Copy write buffers back to read buffers
+            # Copy write buffers back to read buffers after all breeds complete
             for i, prop_idx in enumerate(self._write_property_indices):
                 rank_local_agent_and_neighbor_adts[prop_idx][:len(self.__rank_local_agent_ids)] = write_buffers[i][:len(self.__rank_local_agent_ids)]
 
-            # Another synchronization before next tick
+            # Final synchronization before next tick
             cp.cuda.Stream.null.synchronize()
         
         # Update global tick counter after all threads have completed
@@ -556,13 +559,33 @@ def generate_gpu_func(
     joined_sim_loop = "\n\t\t\t".join(sim_loop)
     joined_args = ",".join(args)
 
+    # Generate breed-specific execution logic with proper indentation
+    breed_execution_code = []
+    for priority_idx, breed_idx_2_step_func in enumerate(breed_idx_2_step_func_by_priority):
+        breed_execution_code.append(f"\t\t\tif current_priority_index == {priority_idx}:")
+        for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
+            breed_step_func_impl, module_fpath = breed_step_func_info
+            step_func_name = getattr(breed_step_func_impl, "__name__", repr(callable))
+            modified_step_func_name = f"{step_func_name}_double_buffer"
+
+            breed_execution_code.append(f"\t\t\t\tif breed_id == {breedidx}:")
+            breed_execution_code.append(f"\t\t\t\t\t{modified_step_func_name}(")
+            breed_execution_code.append("\t\t\t\t\t\tthread_local_tick,")
+            breed_execution_code.append("\t\t\t\t\t\tagent_index,")
+            breed_execution_code.append("\t\t\t\t\t\tdevice_global_data_vector,")
+            breed_execution_code.append("\t\t\t\t\t\tagent_ids,")
+            breed_execution_code.append(f"\t\t\t\t\t\t{','.join(args)},")
+            breed_execution_code.append("\t\t\t\t\t)")
+
+    joined_breed_execution = "\n".join(breed_execution_code)
+
     func = [
-        "# Auto-generated GPU kernel with double buffering",
+        "# Auto-generated GPU kernel with cross-breed synchronization",
         "# Contains all necessary imports and modified step functions",
         "",
         step_sources,
         "",
-        "# Modified step functions with double buffering", 
+        "# Modified step functions with double buffering",
         all_modified_step_functions,
         "",
         "@jit.rawkernel(device='cuda')",
@@ -573,14 +596,16 @@ def generate_gpu_func(
         "sync_workers_every_n_ticks,",
         "num_rank_local_agents,",
         "agent_ids,",
+        "current_priority_index,",
         "):",
         "\tthread_id = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x",
         "\tagent_index = thread_id",
         "\tif agent_index < num_rank_local_agents:",
         "\t\tbreed_id = a0[agent_index]",
         "\t\tfor tick in range(sync_workers_every_n_ticks):",
-        f"\n\t\t\tthread_local_tick = int(global_tick) + tick",
-        f"\n\t\t\t{joined_sim_loop}",
+        "\t\t\tthread_local_tick = int(global_tick) + tick",
+        "",
+        joined_breed_execution,
     ]
 
     func = "\n".join(func)
