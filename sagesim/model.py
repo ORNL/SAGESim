@@ -282,7 +282,7 @@ class Model:
         self.__rank_local_agent_ids = list(
             self._agent_factory._rank2agentid2agentidx[worker].keys()
         )
-        threadsperblock = 32
+        threadsperblock = 8
         blockspergrid = int(
             math.ceil(len(self.__rank_local_agent_ids) / threadsperblock)
         )
@@ -316,22 +316,34 @@ class Model:
             # Create a copy of the tensor for writing
             write_buffer = cp.array(rank_local_agent_and_neighbor_adts[prop_idx])
             write_buffers.append(write_buffer)
-        
+
         # Prepare all arguments: read tensors + write tensors
         all_args = list(rank_local_agent_and_neighbor_adts) + write_buffers
-        
-        self._step_func[blockspergrid, threadsperblock](
-            self.tick,
-            self._global_data_vector,
-            *all_args,
-            sync_workers_every_n_ticks,
-            cp.float32(len(self.__rank_local_agent_ids)),
-            rank_local_agent_and_non_local_neighbor_ids,
-        )
-        
-        # Copy write buffers back to read buffers BEFORE extracting data
-        for i, prop_idx in enumerate(self._write_property_indices):
-            rank_local_agent_and_neighbor_adts[prop_idx] = write_buffers[i]
+
+        # BLOCK-WISE SYNCHRONIZATION: Process one tick at a time
+        # This ensures all blocks complete tick N before any block starts tick N+1
+        for tick_offset in range(sync_workers_every_n_ticks):
+            current_tick = self.tick + tick_offset
+
+            # Phase 1: Execute step functions (all blocks write to write buffers)
+            self._step_func[blockspergrid, threadsperblock](
+                current_tick,
+                self._global_data_vector,
+                *all_args,
+                1,  # Process exactly 1 tick for proper synchronization
+                cp.float32(len(self.__rank_local_agent_ids)),
+                rank_local_agent_and_non_local_neighbor_ids,
+            )
+
+            # Synchronization barrier: Wait for all blocks to complete
+            cp.cuda.Stream.null.synchronize()
+
+            # Phase 2: Copy write buffers back to read buffers
+            for i, prop_idx in enumerate(self._write_property_indices):
+                rank_local_agent_and_neighbor_adts[prop_idx][:len(self.__rank_local_agent_ids)] = write_buffers[i][:len(self.__rank_local_agent_ids)]
+
+            # Another synchronization before next tick
+            cp.cuda.Stream.null.synchronize()
         
         # Update global tick counter after all threads have completed
         self.tick += sync_workers_every_n_ticks
