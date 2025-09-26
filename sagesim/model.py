@@ -42,9 +42,19 @@ def analyze_step_function_for_writes(step_func: Callable, num_properties: int) -
     # where N = num_properties
     property_params = param_names[-num_properties:]  # Take last N parameters as properties
     
+    def check_target_for_writes(target_node):
+        if isinstance(target_node, ast.Name):
+            # Direct assignment: param_name = value
+            if target_node.id in property_params:
+                property_index = property_params.index(target_node.id)
+                write_property_indices.add(property_index)
+        elif isinstance(target_node, ast.Subscript):
+            # Subscript assignment: param_name[...] = value or nested subscripts
+            check_target_for_writes(target_node.value)
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
-            if (isinstance(node.func, ast.Name) and 
+            if (isinstance(node.func, ast.Name) and
                 node.func.id == 'set_this_agent_data_from_tensor'):
                 if len(node.args) >= 2:
                     tensor_arg = node.args[1]
@@ -54,16 +64,12 @@ def analyze_step_function_for_writes(step_func: Callable, num_properties: int) -
                             property_index = property_params.index(tensor_name)
                             write_property_indices.add(property_index)
         elif isinstance(node, ast.Assign):
-            # Check for direct tensor assignments like state_tensor[agent_index] = value
+            # Check for all types of assignments to property parameters
             for target in node.targets:
-                if isinstance(target, ast.Subscript):
-                    if isinstance(target.value, ast.Name):
-                        tensor_name = target.value.id
-                        if tensor_name in property_params:
-                            property_index = property_params.index(tensor_name)
-                            write_property_indices.add(property_index)
-
-    
+                check_target_for_writes(target)
+        elif isinstance(node, ast.AugAssign):
+            # Check for augmented assignments (+=, -=, *=, etc.)
+            check_target_for_writes(node.target)
 
     return write_property_indices
 
@@ -282,7 +288,7 @@ class Model:
         self.__rank_local_agent_ids = list(
             self._agent_factory._rank2agentid2agentidx[worker].keys()
         )
-        threadsperblock = 8
+        threadsperblock = 32
         blockspergrid = int(
             math.ceil(len(self.__rank_local_agent_ids) / threadsperblock)
         )
@@ -341,9 +347,10 @@ class Model:
                 # Synchronization barrier: Wait for all blocks to complete this breed phase
                 cp.cuda.Stream.null.synchronize()
 
-            # Copy write buffers back to read buffers after all breeds complete
-            for i, prop_idx in enumerate(self._write_property_indices):
-                rank_local_agent_and_neighbor_adts[prop_idx][:len(self.__rank_local_agent_ids)] = write_buffers[i][:len(self.__rank_local_agent_ids)]
+                # Copy write buffers back to read buffers after each priority group completes
+                # This enables proper data flow between priority groups (e.g., neurons -> synapses -> learning)
+                for i, prop_idx in enumerate(self._write_property_indices):
+                    rank_local_agent_and_neighbor_adts[prop_idx][:len(self.__rank_local_agent_ids)] = write_buffers[i][:len(self.__rank_local_agent_ids)]
 
             # Final synchronization before next tick
             cp.cuda.Stream.null.synchronize()
@@ -460,18 +467,22 @@ def generate_gpu_func(
         # Find last parameter and add write parameters
         last_param = property_params[-1]
         write_params_list = list(param_to_write_param.values())
-        
+
         # Replace the closing ): with write parameters + ):
         if f'{last_param},\n):' in source:
             # Multi-line with trailing comma
-            write_params_str = '\n'.join(write_params_list) + ',\n'
+            write_params_str = '    ' + ',\n    '.join(write_params_list) + ',\n'
             modified_source = source.replace(f'{last_param},\n):', f'{last_param},\n{write_params_str}):')
         elif f'{last_param}\n):' in source:
             # Multi-line without trailing comma
-            write_params_str = ',\n' + ',\n'.join(write_params_list) + ',\n'
+            write_params_str = ',\n    ' + ',\n    '.join(write_params_list) + ',\n'
             modified_source = source.replace(f'{last_param}\n):', f'{last_param}{write_params_str}):')
+        else:
+            # Fallback: try to find the closing ): and insert before it
+            write_params_str = ',\n    ' + ',\n    '.join(write_params_list)
+            modified_source = source.replace('\n):', f'{write_params_str},\n):')
 
-        
+
         # Step 2: Replace parameter names with write parameter names in WRITE contexts only
         tree = ast.parse(modified_source)
         
@@ -487,12 +498,83 @@ def generate_gpu_func(
                         node.args[1] = ast.Name(id=param_to_write_param[tensor_arg.id], ctx=ast.Load())
             
             elif isinstance(node, ast.Assign):
-                # Replace in direct assignments (param_name[...] = ...)
+                # Replace in all types of assignments to param_name
+                def replace_param_in_target(target_node):
+                    if isinstance(target_node, ast.Name):
+                        # Direct assignment: param_name = value
+                        if target_node.id in param_to_write_param:
+                            target_node.id = param_to_write_param[target_node.id]
+                    elif isinstance(target_node, ast.Subscript):
+                        # Subscript assignment: param_name[...] = value or nested subscripts
+                        replace_param_in_target(target_node.value)
+
                 for target in node.targets:
-                    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
-                        if target.value.id in param_to_write_param:
-                            target.value.id = param_to_write_param[target.value.id]
-        
+                    replace_param_in_target(target)
+
+            elif isinstance(node, ast.AugAssign):
+                # Convert augmented assignments to regular assignments for double buffering
+                # e.g., write_param[i] += 1 becomes write_param[i] = param[i] + 1
+                def convert_aug_assign_target(target_node):
+                    if isinstance(target_node, ast.Name):
+                        if target_node.id in param_to_write_param:
+                            # Create new assignment: write_param = param + value
+                            original_target = ast.Name(id=target_node.id, ctx=ast.Load())
+                            write_target = ast.Name(id=param_to_write_param[target_node.id], ctx=ast.Store())
+
+                            new_value = ast.BinOp(
+                                left=original_target,
+                                op=node.op,
+                                right=node.value
+                            )
+
+                            new_assign = ast.Assign(targets=[write_target], value=new_value)
+                            return new_assign
+                    elif isinstance(target_node, ast.Subscript):
+                        # Check if the base is a parameter that needs write buffering
+                        base = target_node
+                        while isinstance(base, ast.Subscript):
+                            base = base.value
+                        if isinstance(base, ast.Name) and base.id in param_to_write_param:
+                            # Create new assignment: write_param[...] = param[...] + value
+                            # Clone the entire target structure for read (original param)
+                            import copy
+                            read_target = copy.deepcopy(target_node)
+                            read_target.ctx = ast.Load()
+
+                            # Clone the entire target structure for write (write param)
+                            write_target = copy.deepcopy(target_node)
+                            write_target.ctx = ast.Store()
+                            # Find and replace the base name with write version
+                            current = write_target
+                            while isinstance(current, ast.Subscript):
+                                if isinstance(current.value, ast.Name):
+                                    current.value.id = param_to_write_param[current.value.id]
+                                    break
+                                current = current.value
+
+                            new_value = ast.BinOp(
+                                left=read_target,
+                                op=node.op,
+                                right=node.value
+                            )
+
+                            new_assign = ast.Assign(targets=[write_target], value=new_value)
+                            return new_assign
+                    return None
+
+                new_assign = convert_aug_assign_target(node.target)
+                if new_assign:
+                    # Replace the AugAssign node with the new Assign node
+                    # We need to track this for later replacement
+                    node.__class__ = ast.Assign
+                    node.targets = new_assign.targets
+                    node.value = new_assign.value
+                    # Remove the op and target attributes
+                    if hasattr(node, 'op'):
+                        delattr(node, 'op')
+                    if hasattr(node, 'target'):
+                        delattr(node, 'target')
+
         modified_source = ast.unparse(tree)
         
         return modified_source
