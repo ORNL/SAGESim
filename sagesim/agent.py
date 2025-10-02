@@ -261,7 +261,6 @@ class AgentFactory:
             3. agent_data_tensors_subcontexts: subcontext of agent_data_tensors
                 required by agents of agent_ids_chunks to be processed by a worker
         """
-
         neighborrank2agentidandadt = {}
         neighborrankandagentidsvisited = set()
         num_agents_this_rank = len(agent_ids_chunk)
@@ -274,9 +273,15 @@ class AgentFactory:
                 # If the agent data has not changed, skip sending it
                 agent_changed = False
                 for prop_idx in range(self.num_properties):
+                    current_property_adt = agent_adts[prop_idx]
+                    previous_property_adt = self._prev_agent_data[agent_id][prop_idx]
+                    if type(current_property_adt) == set:
+                        current_property_adt = list(current_property_adt)
+                    if type(previous_property_adt) == set:
+                        previous_property_adt = list(previous_property_adt)
                     if not np.array_equal(
-                        agent_adts[prop_idx],
-                        self._prev_agent_data[agent_id][prop_idx],
+                        current_property_adt,
+                        previous_property_adt,
                         equal_nan=True,
                     ):
                         agent_changed = True

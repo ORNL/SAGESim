@@ -150,7 +150,13 @@ class Model:
         :param scheduler_fpath: specify if using external dask cluster. Else
             distributed.LocalCluster is set up.
         """
+
         self._use_gpu = use_gpu
+        # Generate global data tensor
+        self._global_data_vector = list(self.globals.values())
+        self.tick = 0
+
+        ####
         # Create record of agent step functions by breed and priority
         self._breed_idx_2_step_func_by_priority: List[Dict[int, Callable]] = []
         heap_priority_breedidx_func = []
@@ -173,8 +179,6 @@ class Model:
                 )
                 last_priority = priority
 
-        # Generate global data tensor
-        self._global_data_vector = list(self.globals.values())
         
         # Determine and cache write property indices once during setup
         self._write_property_indices = set()
@@ -197,6 +201,8 @@ class Model:
                     )
                 )
         comm.barrier()
+        ###
+        
         # Generate agent data tensors
         self.__rank_local_agent_data_tensors = (
             self._agent_factory._generate_agent_data_tensors()
