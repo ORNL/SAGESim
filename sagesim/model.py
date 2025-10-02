@@ -209,6 +209,17 @@ class Model:
         )
         self._is_setup = True
 
+    def reset(self) -> None:
+        # Generate global data tensor
+        self._global_data_vector = list(self.globals.values())
+        self.tick = 0
+        
+        # Generate agent data tensors
+        self.__rank_local_agent_data_tensors = (
+            self._agent_factory._generate_agent_data_tensors()
+        )
+
+
     def simulate(
         self,
         ticks: int,
