@@ -225,14 +225,6 @@ As a result, when implementing your own `step functions` and `reduce functions`,
 
 ## SAGESim Multi-Level Synchronization Strategy
 
-### Background
-- **Cooperative groups are not supported on AMD GPUs.**
-- Implemented a custom **multi-level synchronization strategy** instead.
-
----
-
-### Hierarchical Execution Flow
-
 #### Per MPI worker
 - Runs on an independent GPU device/rank.
 - Manages a subset of agents assigned to this worker.
@@ -271,7 +263,7 @@ As a result, when implementing your own `step functions` and `reduce functions`,
 ---
 
 ### Write Buffer Detection & Handling
-
+We modified your step function to avoid race condition. Specifically [add details]
 #### 1. Enhanced Assignment Detection (`analyze_step_function_for_writes`)
 * **Before**: Only detected `param_name[...] = value`.
 * **Now**: Detects all assignment types:
