@@ -344,7 +344,6 @@ class Model:
         all_args = list(rank_local_agent_and_neighbor_adts) + write_buffers
 
         # CROSS-BREED SYNCHRONIZATION: Process breeds sequentially within each tick
-        # This ensures proper execution order: soma -> synapse -> learning
         for tick_offset in range(sync_workers_every_n_ticks):
             current_tick = self.tick + tick_offset
 
