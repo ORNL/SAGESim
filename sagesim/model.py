@@ -42,9 +42,19 @@ def analyze_step_function_for_writes(step_func: Callable, num_properties: int) -
     # where N = num_properties
     property_params = param_names[-num_properties:]  # Take last N parameters as properties
     
+    def check_target_for_writes(target_node):
+        if isinstance(target_node, ast.Name):
+            # Direct assignment: param_name = value
+            if target_node.id in property_params:
+                property_index = property_params.index(target_node.id)
+                write_property_indices.add(property_index)
+        elif isinstance(target_node, ast.Subscript):
+            # Subscript assignment: param_name[...] = value or nested subscripts
+            check_target_for_writes(target_node.value)
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
-            if (isinstance(node.func, ast.Name) and 
+            if (isinstance(node.func, ast.Name) and
                 node.func.id == 'set_this_agent_data_from_tensor'):
                 if len(node.args) >= 2:
                     tensor_arg = node.args[1]
@@ -54,16 +64,12 @@ def analyze_step_function_for_writes(step_func: Callable, num_properties: int) -
                             property_index = property_params.index(tensor_name)
                             write_property_indices.add(property_index)
         elif isinstance(node, ast.Assign):
-            # Check for direct tensor assignments like state_tensor[agent_index] = value
+            # Check for all types of assignments to property parameters
             for target in node.targets:
-                if isinstance(target, ast.Subscript):
-                    if isinstance(target.value, ast.Name):
-                        tensor_name = target.value.id
-                        if tensor_name in property_params:
-                            property_index = property_params.index(tensor_name)
-                            write_property_indices.add(property_index)
-
-    
+                check_target_for_writes(target)
+        elif isinstance(node, ast.AugAssign):
+            # Check for augmented assignments (+=, -=, *=, etc.)
+            check_target_for_writes(node.target)
 
     return write_property_indices
 
@@ -144,7 +150,13 @@ class Model:
         :param scheduler_fpath: specify if using external dask cluster. Else
             distributed.LocalCluster is set up.
         """
+
         self._use_gpu = use_gpu
+        # Generate global data tensor
+        self._global_data_vector = list(self.globals.values())
+        self.tick = 0
+
+        ####
         # Create record of agent step functions by breed and priority
         self._breed_idx_2_step_func_by_priority: List[Dict[int, Callable]] = []
         heap_priority_breedidx_func = []
@@ -167,8 +179,6 @@ class Model:
                 )
                 last_priority = priority
 
-        # Generate global data tensor
-        self._global_data_vector = list(self.globals.values())
         
         # Determine and cache write property indices once during setup
         self._write_property_indices = set()
@@ -191,11 +201,24 @@ class Model:
                     )
                 )
         comm.barrier()
+        ###
+        
         # Generate agent data tensors
         self.__rank_local_agent_data_tensors = (
             self._agent_factory._generate_agent_data_tensors()
         )
         self._is_setup = True
+
+    def reset(self) -> None:
+        # Generate global data tensor
+        self._global_data_vector = list(self.globals.values())
+        self.tick = 0
+        
+        # Generate agent data tensors
+        self.__rank_local_agent_data_tensors = (
+            self._agent_factory._generate_agent_data_tensors()
+        )
+
 
     def simulate(
         self,
@@ -316,22 +339,37 @@ class Model:
             # Create a copy of the tensor for writing
             write_buffer = cp.array(rank_local_agent_and_neighbor_adts[prop_idx])
             write_buffers.append(write_buffer)
-        
+
         # Prepare all arguments: read tensors + write tensors
         all_args = list(rank_local_agent_and_neighbor_adts) + write_buffers
-        
-        self._step_func[blockspergrid, threadsperblock](
-            self.tick,
-            self._global_data_vector,
-            *all_args,
-            sync_workers_every_n_ticks,
-            cp.float32(len(self.__rank_local_agent_ids)),
-            rank_local_agent_and_non_local_neighbor_ids,
-        )
-        
-        # Copy write buffers back to read buffers BEFORE extracting data
-        for i, prop_idx in enumerate(self._write_property_indices):
-            rank_local_agent_and_neighbor_adts[prop_idx] = write_buffers[i]
+
+        # CROSS-BREED SYNCHRONIZATION: Process breeds sequentially within each tick
+        for tick_offset in range(sync_workers_every_n_ticks):
+            current_tick = self.tick + tick_offset
+
+            # Execute each breed priority group separately with synchronization
+            for priority_idx, priority_group in enumerate(self._breed_idx_2_step_func_by_priority):
+                # Execute step functions for this breed priority group only
+                self._step_func[blockspergrid, threadsperblock](
+                    current_tick,
+                    self._global_data_vector,
+                    *all_args,
+                    1,  # Process exactly 1 tick
+                    cp.float32(len(self.__rank_local_agent_ids)),
+                    rank_local_agent_and_non_local_neighbor_ids,
+                    priority_idx,  # Which priority group to execute
+                )
+
+                # Synchronization barrier: Wait for all blocks to complete this breed phase
+                cp.cuda.Stream.null.synchronize()
+
+                # Copy write buffers back to read buffers after each priority group completes
+                # This enables proper data flow between priority groups (e.g., neurons -> synapses -> learning)
+                for i, prop_idx in enumerate(self._write_property_indices):
+                    rank_local_agent_and_neighbor_adts[prop_idx][:len(self.__rank_local_agent_ids)] = write_buffers[i][:len(self.__rank_local_agent_ids)]
+
+            # Final synchronization before next tick
+            cp.cuda.Stream.null.synchronize()
         
         # Update global tick counter after all threads have completed
         self.tick += sync_workers_every_n_ticks
@@ -445,18 +483,22 @@ def generate_gpu_func(
         # Find last parameter and add write parameters
         last_param = property_params[-1]
         write_params_list = list(param_to_write_param.values())
-        
+
         # Replace the closing ): with write parameters + ):
         if f'{last_param},\n):' in source:
             # Multi-line with trailing comma
-            write_params_str = '\n'.join(write_params_list) + ',\n'
+            write_params_str = '    ' + ',\n    '.join(write_params_list) + ',\n'
             modified_source = source.replace(f'{last_param},\n):', f'{last_param},\n{write_params_str}):')
         elif f'{last_param}\n):' in source:
             # Multi-line without trailing comma
-            write_params_str = ',\n' + ',\n'.join(write_params_list) + ',\n'
+            write_params_str = ',\n    ' + ',\n    '.join(write_params_list) + ',\n'
             modified_source = source.replace(f'{last_param}\n):', f'{last_param}{write_params_str}):')
+        else:
+            # Fallback: try to find the closing ): and insert before it
+            write_params_str = ',\n    ' + ',\n    '.join(write_params_list)
+            modified_source = source.replace('\n):', f'{write_params_str},\n):')
 
-        
+
         # Step 2: Replace parameter names with write parameter names in WRITE contexts only
         tree = ast.parse(modified_source)
         
@@ -472,12 +514,83 @@ def generate_gpu_func(
                         node.args[1] = ast.Name(id=param_to_write_param[tensor_arg.id], ctx=ast.Load())
             
             elif isinstance(node, ast.Assign):
-                # Replace in direct assignments (param_name[...] = ...)
+                # Replace in all types of assignments to param_name
+                def replace_param_in_target(target_node):
+                    if isinstance(target_node, ast.Name):
+                        # Direct assignment: param_name = value
+                        if target_node.id in param_to_write_param:
+                            target_node.id = param_to_write_param[target_node.id]
+                    elif isinstance(target_node, ast.Subscript):
+                        # Subscript assignment: param_name[...] = value or nested subscripts
+                        replace_param_in_target(target_node.value)
+
                 for target in node.targets:
-                    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
-                        if target.value.id in param_to_write_param:
-                            target.value.id = param_to_write_param[target.value.id]
-        
+                    replace_param_in_target(target)
+
+            elif isinstance(node, ast.AugAssign):
+                # Convert augmented assignments to regular assignments for double buffering
+                # e.g., write_param[i] += 1 becomes write_param[i] = param[i] + 1
+                def convert_aug_assign_target(target_node):
+                    if isinstance(target_node, ast.Name):
+                        if target_node.id in param_to_write_param:
+                            # Create new assignment: write_param = param + value
+                            original_target = ast.Name(id=target_node.id, ctx=ast.Load())
+                            write_target = ast.Name(id=param_to_write_param[target_node.id], ctx=ast.Store())
+
+                            new_value = ast.BinOp(
+                                left=original_target,
+                                op=node.op,
+                                right=node.value
+                            )
+
+                            new_assign = ast.Assign(targets=[write_target], value=new_value)
+                            return new_assign
+                    elif isinstance(target_node, ast.Subscript):
+                        # Check if the base is a parameter that needs write buffering
+                        base = target_node
+                        while isinstance(base, ast.Subscript):
+                            base = base.value
+                        if isinstance(base, ast.Name) and base.id in param_to_write_param:
+                            # Create new assignment: write_param[...] = param[...] + value
+                            # Clone the entire target structure for read (original param)
+                            import copy
+                            read_target = copy.deepcopy(target_node)
+                            read_target.ctx = ast.Load()
+
+                            # Clone the entire target structure for write (write param)
+                            write_target = copy.deepcopy(target_node)
+                            write_target.ctx = ast.Store()
+                            # Find and replace the base name with write version
+                            current = write_target
+                            while isinstance(current, ast.Subscript):
+                                if isinstance(current.value, ast.Name):
+                                    current.value.id = param_to_write_param[current.value.id]
+                                    break
+                                current = current.value
+
+                            new_value = ast.BinOp(
+                                left=read_target,
+                                op=node.op,
+                                right=node.value
+                            )
+
+                            new_assign = ast.Assign(targets=[write_target], value=new_value)
+                            return new_assign
+                    return None
+
+                new_assign = convert_aug_assign_target(node.target)
+                if new_assign:
+                    # Replace the AugAssign node with the new Assign node
+                    # We need to track this for later replacement
+                    node.__class__ = ast.Assign
+                    node.targets = new_assign.targets
+                    node.value = new_assign.value
+                    # Remove the op and target attributes
+                    if hasattr(node, 'op'):
+                        delattr(node, 'op')
+                    if hasattr(node, 'target'):
+                        delattr(node, 'target')
+
         modified_source = ast.unparse(tree)
         
         return modified_source
@@ -544,13 +657,33 @@ def generate_gpu_func(
     joined_sim_loop = "\n\t\t\t".join(sim_loop)
     joined_args = ",".join(args)
 
+    # Generate breed-specific execution logic with proper indentation
+    breed_execution_code = []
+    for priority_idx, breed_idx_2_step_func in enumerate(breed_idx_2_step_func_by_priority):
+        breed_execution_code.append(f"\t\t\tif current_priority_index == {priority_idx}:")
+        for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
+            breed_step_func_impl, module_fpath = breed_step_func_info
+            step_func_name = getattr(breed_step_func_impl, "__name__", repr(callable))
+            modified_step_func_name = f"{step_func_name}_double_buffer"
+
+            breed_execution_code.append(f"\t\t\t\tif breed_id == {breedidx}:")
+            breed_execution_code.append(f"\t\t\t\t\t{modified_step_func_name}(")
+            breed_execution_code.append("\t\t\t\t\t\tthread_local_tick,")
+            breed_execution_code.append("\t\t\t\t\t\tagent_index,")
+            breed_execution_code.append("\t\t\t\t\t\tdevice_global_data_vector,")
+            breed_execution_code.append("\t\t\t\t\t\tagent_ids,")
+            breed_execution_code.append(f"\t\t\t\t\t\t{','.join(args)},")
+            breed_execution_code.append("\t\t\t\t\t)")
+
+    joined_breed_execution = "\n".join(breed_execution_code)
+
     func = [
-        "# Auto-generated GPU kernel with double buffering",
+        "# Auto-generated GPU kernel with cross-breed synchronization",
         "# Contains all necessary imports and modified step functions",
         "",
         step_sources,
         "",
-        "# Modified step functions with double buffering", 
+        "# Modified step functions with double buffering",
         all_modified_step_functions,
         "",
         "@jit.rawkernel(device='cuda')",
@@ -561,14 +694,16 @@ def generate_gpu_func(
         "sync_workers_every_n_ticks,",
         "num_rank_local_agents,",
         "agent_ids,",
+        "current_priority_index,",
         "):",
         "\tthread_id = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x",
         "\tagent_index = thread_id",
         "\tif agent_index < num_rank_local_agents:",
         "\t\tbreed_id = a0[agent_index]",
         "\t\tfor tick in range(sync_workers_every_n_ticks):",
-        f"\n\t\t\tthread_local_tick = int(global_tick) + tick",
-        f"\n\t\t\t{joined_sim_loop}",
+        "\t\t\tthread_local_tick = int(global_tick) + tick",
+        "",
+        joined_breed_execution,
     ]
 
     func = "\n".join(func)
