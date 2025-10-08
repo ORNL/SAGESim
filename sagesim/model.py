@@ -12,6 +12,7 @@ import pickle
 import math
 import heapq
 import warnings
+import time
 
 import ast
 import inspect
@@ -23,6 +24,41 @@ from mpi4py import MPI
 from sagesim.agent import AgentFactory, Breed
 from sagesim.space import Space
 from sagesim.internal_utils import convert_to_equal_side_tensor
+
+
+def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
+    """
+    Convert agent IDs in nested arrays to local indices using a hash map.
+
+    :param data_tensor: Nested list structure containing agent IDs (can also contain sets)
+    :param agent_id_to_index_map: Dictionary mapping agent_id -> local_index
+    :return: Same structure with IDs replaced by local indices (-1 if not found)
+    """
+    result = []
+    for agent_data in data_tensor:
+        if isinstance(agent_data, (list, tuple, set)):
+            # Handle collections (list, tuple, set) with multiple connections
+            converted_data = []
+            for value in agent_data:
+                if isinstance(value, (int, float, np.integer, np.floating)):
+                    if not np.isnan(value):
+                        # Convert ID to index, use -1 if not found
+                        converted_data.append(agent_id_to_index_map.get(int(value), -1))
+                    else:
+                        converted_data.append(value)
+                else:
+                    converted_data.append(value)
+            result.append(converted_data)
+        else:
+            # Single value
+            if isinstance(agent_data, (int, float, np.integer, np.floating)):
+                if not np.isnan(agent_data):
+                    result.append(agent_id_to_index_map.get(int(agent_data), -1))
+                else:
+                    result.append(agent_data)
+            else:
+                result.append(agent_data)
+    return result
 
 comm = MPI.COMM_WORLD
 num_workers = comm.Get_size()
@@ -150,6 +186,7 @@ class Model:
         :param scheduler_fpath: specify if using external dask cluster. Else
             distributed.LocalCluster is set up.
         """
+        setup_start = time.time()
 
         self._use_gpu = use_gpu
         # Generate global data tensor
@@ -179,7 +216,7 @@ class Model:
                 )
                 last_priority = priority
 
-        
+
         # Determine and cache write property indices once during setup
         self._write_property_indices = set()
         for breed_idx_2_step_func in self._breed_idx_2_step_func_by_priority:
@@ -202,12 +239,13 @@ class Model:
                 )
         comm.barrier()
         ###
-        
+
         # Generate agent data tensors
         self.__rank_local_agent_data_tensors = (
             self._agent_factory._generate_agent_data_tensors()
         )
         self._is_setup = True
+        print(f"[TIMING] Total setup time: {time.time() - setup_start:.4f}s")
 
     def reset(self) -> None:
         # Generate global data tensor
@@ -225,7 +263,9 @@ class Model:
         ticks: int,
         sync_workers_every_n_ticks: int = 1,
     ) -> None:
+        simulate_start = time.time()
         comm.barrier()
+
         # Import the package using module package
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -254,6 +294,8 @@ class Model:
                 sync_workers_every_n_ticks = original_sync_workers_every_n_ticks
 
             self.worker_coroutine(sync_workers_every_n_ticks)
+
+        print(f"[TIMING] Total simulate time: {time.time() - simulate_start:.4f}s")
 
     def save(self, app: "Model", fpath: str) -> None:
         """
@@ -309,9 +351,12 @@ class Model:
         blockspergrid = int(
             math.ceil(len(self.__rank_local_agent_ids) / threadsperblock)
         )
+
         rank_local_agents_neighbors = self.get_space()._neighbor_compute_func(
             self.__rank_local_agent_data_tensors[1]
         )
+
+        context_start = time.time()
         (
             self.__rank_local_agent_ids,
             self.__rank_local_agent_data_tensors,
@@ -322,17 +367,47 @@ class Model:
             self.__rank_local_agent_ids,
             rank_local_agents_neighbors,
         )
+        print(f"[TIMING] Contextualize agent data: {time.time() - context_start:.4f}s")
+
+        tensor_convert_start = time.time()
         rank_local_agent_and_neighbor_adts = [
             convert_to_equal_side_tensor(
                 self.__rank_local_agent_data_tensors[i] + received_neighbor_adts[i]
             )
             for i in range(self._agent_factory.num_properties)
         ]
+        print(f"[TIMING] Convert to equal side tensor: {time.time() - tensor_convert_start:.4f}s")
+
         self._global_data_vector = cp.array(self._global_data_vector)
-        rank_local_agent_and_non_local_neighbor_ids = cp.array(
-            self.__rank_local_agent_ids + received_neighbor_ids
-        )
-        
+
+        # Create agent ID to local index mapping for fast lookups
+        all_agent_ids_list = self.__rank_local_agent_ids + received_neighbor_ids
+        agent_id_to_index = {int(agent_id): idx for idx, agent_id in enumerate(all_agent_ids_list)}
+
+        rank_local_agent_and_non_local_neighbor_ids = cp.array(all_agent_ids_list)
+
+        # Convert agent IDs to local indices in locations array (property index 1)
+        # This eliminates the need for linear search in GPU kernels
+        id_convert_start = time.time()
+
+        # Property index 1 is 'locations' (neighbors/connections) - this is standard in SAGESim
+        # Keep original locations unchanged, create converted copy for kernel
+        locations_for_kernel = None
+        if len(rank_local_agent_and_neighbor_adts) > 1:
+            original_locations = rank_local_agent_and_neighbor_adts[1]
+            # Convert on CPU (fast with hash map), then transfer to GPU
+            locations_cpu = original_locations if not isinstance(original_locations, cp.ndarray) else original_locations.get()
+
+            locations_as_indices = convert_agent_ids_to_indices(
+                locations_cpu, agent_id_to_index
+            )
+            # Create new array for kernel - don't modify original!
+            locations_for_kernel = cp.array(locations_as_indices)
+
+        id_convert_time = time.time() - id_convert_start
+        if id_convert_time > 0.1:
+            print(f"[TIMING] ID to index conversion: {id_convert_time:.4f}s")
+
         # Create write buffers for properties that need them
         write_buffers = []
         for prop_idx in self._write_property_indices:
@@ -341,7 +416,14 @@ class Model:
             write_buffers.append(write_buffer)
 
         # Prepare all arguments: read tensors + write tensors
-        all_args = list(rank_local_agent_and_neighbor_adts) + write_buffers
+        # Use converted locations for kernel, but keep original in rank_local_agent_and_neighbor_adts
+        all_args = []
+        for i, tensor in enumerate(rank_local_agent_and_neighbor_adts):
+            if i == 1 and locations_for_kernel is not None:
+                all_args.append(locations_for_kernel)  # Use converted indices for kernel
+            else:
+                all_args.append(tensor)  # Use original
+        all_args = all_args + write_buffers
 
         # CROSS-BREED SYNCHRONIZATION: Process breeds sequentially within each tick
         for tick_offset in range(sync_workers_every_n_ticks):
@@ -370,8 +452,9 @@ class Model:
 
             # Final synchronization before next tick
             cp.cuda.Stream.null.synchronize()
-        
+
         # Update global tick counter after all threads have completed
+        cleanup_start = time.time()
         self.tick += sync_workers_every_n_ticks
         cp.get_default_memory_pool().free_all_blocks()
         num_agents = len(self.__rank_local_agent_ids)
@@ -379,6 +462,8 @@ class Model:
             rank_local_agent_and_neighbor_adts[i][:num_agents].tolist()
             for i in range(self._agent_factory.num_properties)
         ]
+        print(f"[TIMING] Memory cleanup and tensor conversion: {time.time() - cleanup_start:.4f}s")
+
         """worker_agent_and_neighbor_data_tensors = (
             self._agent_factory.reduce_agent_data_tensors(
                 worker_agent_and_neighbor_data_tensors,
