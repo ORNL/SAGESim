@@ -223,6 +223,73 @@ As a result, when implementing your own `step functions` and `reduce functions`,
 
 ---
 
+## SAGESim Multi-Level Synchronization Strategy
+
+### Background
+- **Cooperative groups are not supported on AMD GPUs.**
+- Implemented a custom **multi-level synchronization strategy** instead.
+
+---
+
+### Hierarchical Execution Flow
+
+#### Per MPI worker
+- Runs on an independent GPU device/rank.
+- Manages a subset of agents assigned to this worker.
+- No cross-worker synchronization during execution.
+
+#### Per `tick_offset` in `sync_workers_every_n_ticks`
+- Processes multiple ticks in batch to reduce kernel launch overhead.
+- Sets `current_tick = self.tick + tick_offset`.
+
+#### Per priority group 
+
+**1. RUN – Launch GPU kernel**
+* All GPU blocks execute in parallel.
+* Each block processes multiple agents.
+* `priority_idx` controls which step functions run inside the kernel.
+
+**2. SYNC – Wait for GPU blocks to complete**
+
+* Ensures all agents in the current priority group have finished.
+* No block proceeds until **all** blocks complete.
+
+**3. WRITE BACK – Copy results to read buffers**
+
+* Makes outputs of the current group visible to the next group.
+* Preserves correct data flow based on priority
+
+**Final tick synchronization**
+
+* Guarantees all priority groups complete before advancing to the next tick.
+
+**Worker completion**
+* Updates global tick counter.
+* Cleans up GPU memory.
+* Prepares for next batch of ticks.
+
+---
+
+### Write Buffer Detection & Handling
+
+#### 1. Enhanced Assignment Detection (`analyze_step_function_for_writes`)
+* **Before**: Only detected `param_name[...] = value`.
+* **Now**: Detects all assignment types:
+   * Direct: `param_name = value`
+   * Subscript: `param_name[i] = value`
+   * Nested: `param_name[i][j] = value`
+   * Augmented: `param_name += value`, `param_name[i] += value`
+
+#### 2. Assignment Rewriting (`generate_modified_step_func_code`)
+* Special handling for augmented assignments (`+=`).
+* Example:
+
+```python
+write_param[i] += 1
+# becomes
+write_param[i] = param[i] + 1
+```
+
 ## **High-Performance Computing (HPC) with `sagesim`**
 
 `sagesim` is designed to efficiently utilize High-Performance Computing (HPC) systems. Below is an example submission script tailored for the **Frontier** system at **Oak Ridge National Laboratory (ORNL)**.
