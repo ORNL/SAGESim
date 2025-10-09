@@ -29,28 +29,26 @@ def infection_step_func(
     """
     Step function for infection spread with probability p (default p=1 for testing)
     """
-    # Get the list of neighboring agent IDs
-    neighbor_ids = locations[agent_index]
-    
+    # Get the list of neighboring indices (pre-converted from agent IDs by SAGESim)
+    neighbor_indices = locations[agent_index]
+
     # Get infection probability from globals (default p=1 for testing)
     p_infection = globals[0]
-    
+
     # Get current agent state
     agent_state = int(get_this_agent_data_from_tensor(agent_index, state_tensor))
-    
+
     # Only susceptible agents can be infected
     if agent_state == 1:  # SUSCEPTIBLE
         # Check all neighbors
         i = 0
         infected = False
-        while i < len(neighbor_ids) and not cp.isnan(neighbor_ids[i]) and not infected:
-            neighbor_id = neighbor_ids[i]
-            
-            # Get neighbor state
-            neighbor_state = int(
-                get_neighbor_data_from_tensor(agent_ids, neighbor_id, state_tensor)
-            )
-            
+        while i < len(neighbor_indices) and not cp.isnan(neighbor_indices[i]) and not infected:
+            neighbor_index = int(neighbor_indices[i])
+
+            # Get neighbor state using pre-converted index (no search needed!)
+            neighbor_state = int(state_tensor[neighbor_index])
+
             # If neighbor is infected and random chance passes, infect this agent
             if neighbor_state == 2:  # INFECTED
                 rand = random.random()
@@ -77,28 +75,26 @@ def infection_step_func_with_dummy(
     """
     Step function for infection spread with probability p (default p=1 for testing)
     """
-    # Get the list of neighboring agent IDs
-    neighbor_ids = locations[agent_index]
-    
+    # Get the list of neighboring indices (pre-converted from agent IDs by SAGESim)
+    neighbor_indices = locations[agent_index]
+
     # Get infection probability from globals (default p=1 for testing)
     p_infection = globals[0]
-    
+
     # Get current agent state
     agent_state = int(get_this_agent_data_from_tensor(agent_index, state_tensor))
-    
+
     # Only susceptible agents can be infected
     if agent_state == 1:  # SUSCEPTIBLE
         # Check all neighbors
         i = 0
         infected = False
-        while i < len(neighbor_ids) and not cp.isnan(neighbor_ids[i]) and not infected:
-            neighbor_id = neighbor_ids[i]
-            
-            # Get neighbor state
-            neighbor_state = int(
-                get_neighbor_data_from_tensor(agent_ids, neighbor_id, state_tensor)
-            )
-            
+        while i < len(neighbor_indices) and not cp.isnan(neighbor_indices[i]) and not infected:
+            neighbor_index = int(neighbor_indices[i])
+
+            # Get neighbor state using pre-converted index (no search needed!)
+            neighbor_state = int(state_tensor[neighbor_index])
+
             # If neighbor is infected and random chance passes, infect this agent
             if neighbor_state == 2:  # INFECTED
                 rand = random.random()
