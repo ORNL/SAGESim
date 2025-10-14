@@ -9,9 +9,30 @@ def convert_to_equal_side_tensor(ragged_list: List[Any]) -> cp.array:
     """
     Convert ragged list to equal-size padded tensor.
     Uses fast NumPy for depth 1-2, falls back to awkward for depth 3+.
+
+    Optimization: If data is already padded (from previous tick), skip padding.
     """
     if not ragged_list:
         return cp.array([], dtype=np.float32)
+
+    # Quick check: is data already padded? (all rows same length AND elements are scalars)
+    # This happens after first tick when .tolist() keeps padded structure
+    # Only works for depth 2 data (rows of scalars, not rows of lists)
+    if isinstance(ragged_list[0], (list, tuple)):
+        # Investigate row lengths - check ALL rows (not just sample)
+        row_lengths = [len(row) if isinstance(row, (list, tuple)) else 1 for row in ragged_list]
+
+        unique_lengths = set(row_lengths)
+        first_len = len(ragged_list[0])
+        all_same_len = len(unique_lengths) == 1
+
+        if all_same_len:
+            # Check if elements are scalars (not lists) - distinguishes depth 2 from depth 3
+            if first_len > 0:
+                is_scalar = not isinstance(ragged_list[0][0], (list, tuple))
+                if is_scalar:
+                    # Already padded depth-2 data! Just convert to GPU array
+                    return cp.array(ragged_list, dtype=np.float32)
 
     # Detect depth using awkward
     awkward_array = ak.from_iter(ragged_list)

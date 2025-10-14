@@ -264,6 +264,7 @@ class AgentFactory:
         neighborrank2agentidandadt = {}
         neighborrankandagentidsvisited = set()
         num_agents_this_rank = len(agent_ids_chunk)
+
         for agent_idx in range(num_agents_this_rank):
             agent_id = agent_ids_chunk[agent_idx]
             agent_adts = [adt[agent_idx] for adt in agent_data_tensors]
