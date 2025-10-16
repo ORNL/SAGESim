@@ -444,11 +444,12 @@ class Model:
 
                 # Synchronization barrier: Wait for all blocks to complete this breed phase
                 cp.cuda.Stream.null.synchronize()
-
+            ####===============================================
             # Copy write buffers back to read buffers after ALL priority groups complete
             # This ensures all priorities execute with the same read buffer (state at start of tick)
             for i, prop_idx in enumerate(self._write_property_indices):
                 rank_local_agent_and_neighbor_adts[prop_idx][:len(self.__rank_local_agent_ids)] = write_buffers[i][:len(self.__rank_local_agent_ids)]
+            ####===============================================
 
             # Final synchronization before next tick
             cp.cuda.Stream.null.synchronize()
