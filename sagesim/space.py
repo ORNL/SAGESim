@@ -95,11 +95,5 @@ if __name__ == "__main__":
     for i in range(6):
         ns.add_agent(i)
 
-    for i in range(6):
-        print(f"Neighbors of {i}: {ns.get_neighbors(i)}")
-
     for i in [1, 3, 4]:
         ns.connect_agents(0, i)
-
-    for i in range(6):
-        print(f"Neighbors of {i}: {ns.get_neighbors(i)}")

@@ -186,8 +186,6 @@ class Model:
         :param scheduler_fpath: specify if using external dask cluster. Else
             distributed.LocalCluster is set up.
         """
-        setup_start = time.time()
-
         self._use_gpu = use_gpu
         # Generate global data tensor
         self._global_data_vector = list(self.globals.values())
@@ -238,6 +236,14 @@ class Model:
                     )
                 )
         comm.barrier()
+
+        # Import and cache the step function once during setup
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            step_func_module = importlib.import_module(
+                os.path.splitext(self._step_function_file_path)[0]
+            )
+        self._step_func = step_func_module.stepfunc
         ###
 
         # Generate agent data tensors
@@ -265,34 +271,32 @@ class Model:
         simulate_start = time.time()
         comm.barrier()
 
-        # Import the package using module package
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            step_func_module = importlib.import_module(
-                os.path.splitext(self._step_function_file_path)[0]
-            )
+        # Step function is cached during setup() - no need to reimport
+        # Optimization: Single worker doesn't need synchronization overhead
+        # Just run all ticks in one batch
+        if num_workers == 1:
+            # Single worker optimization: no MPI sync overhead
+            self.worker_coroutine(ticks)
+        else:
+            # Multi-worker: need periodic synchronization
+            # Repeatedly execute worker coroutine until simulation
+            # has run for the right amount of ticks
+            original_sync_workers_every_n_ticks = sync_workers_every_n_ticks
+            for time_chunk in range((ticks // original_sync_workers_every_n_ticks) + 1):
 
-        # Access the step function using the module
-        self._step_func = step_func_module.stepfunc
+                if time_chunk == (ticks // original_sync_workers_every_n_ticks):
+                    # Final chunk: handle remaining ticks
+                    remaining_ticks = ticks - (
+                        time_chunk * original_sync_workers_every_n_ticks
+                    )
+                    if remaining_ticks == 0:
+                        break
+                    sync_workers_every_n_ticks = remaining_ticks
+                else:
+                    # Regular chunk: use original batch size
+                    sync_workers_every_n_ticks = original_sync_workers_every_n_ticks
 
-        # Repeatedly execute worker coroutine until simulation
-        # has run for the right amount of ticks
-        original_sync_workers_every_n_ticks = sync_workers_every_n_ticks
-        for time_chunk in range((ticks // original_sync_workers_every_n_ticks) + 1):
-
-            if time_chunk == (ticks // original_sync_workers_every_n_ticks):
-                # Final chunk: handle remaining ticks
-                remaining_ticks = ticks - (
-                    time_chunk * original_sync_workers_every_n_ticks
-                )
-                if remaining_ticks == 0:
-                    break
-                sync_workers_every_n_ticks = remaining_ticks
-            else:
-                # Regular chunk: use original batch size
-                sync_workers_every_n_ticks = original_sync_workers_every_n_ticks
-
-            self.worker_coroutine(sync_workers_every_n_ticks)
+                self.worker_coroutine(sync_workers_every_n_ticks)
 
     def save(self, app: "Model", fpath: str) -> None:
         """
@@ -448,9 +452,11 @@ class Model:
             cp.cuda.Stream.null.synchronize()
 
         # Update global tick counter after all threads have completed
-        cleanup_start = time.time()
         self.tick += sync_workers_every_n_ticks
         cp.get_default_memory_pool().free_all_blocks()
+
+        # Convert GPU tensors back to CPU lists for next iteration
+        gpu_to_cpu_start = time.time()
         num_agents = len(self.__rank_local_agent_ids)
         self.__rank_local_agent_data_tensors = [
             rank_local_agent_and_neighbor_adts[i][:num_agents].tolist()
