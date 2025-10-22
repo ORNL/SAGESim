@@ -245,7 +245,6 @@ class Model:
             self._agent_factory._generate_agent_data_tensors()
         )
         self._is_setup = True
-        print(f"[TIMING] Total setup time: {time.time() - setup_start:.4f}s")
 
     def reset(self) -> None:
         # Generate global data tensor
@@ -294,8 +293,6 @@ class Model:
                 sync_workers_every_n_ticks = original_sync_workers_every_n_ticks
 
             self.worker_coroutine(sync_workers_every_n_ticks)
-
-        print(f"[TIMING] Total simulate time: {time.time() - simulate_start:.4f}s")
 
     def save(self, app: "Model", fpath: str) -> None:
         """
@@ -367,7 +364,6 @@ class Model:
             self.__rank_local_agent_ids,
             rank_local_agents_neighbors,
         )
-        print(f"[TIMING] Contextualize agent data: {time.time() - context_start:.4f}s")
 
         tensor_convert_start = time.time()
         rank_local_agent_and_neighbor_adts = [
@@ -376,7 +372,6 @@ class Model:
             )
             for i in range(self._agent_factory.num_properties)
         ]
-        print(f"[TIMING] Convert to equal side tensor: {time.time() - tensor_convert_start:.4f}s")
 
         self._global_data_vector = cp.array(self._global_data_vector)
 
@@ -405,8 +400,6 @@ class Model:
             locations_for_kernel = cp.array(locations_as_indices)
 
         id_convert_time = time.time() - id_convert_start
-        if id_convert_time > 0.1:
-            print(f"[TIMING] ID to index conversion: {id_convert_time:.4f}s")
 
         # Create write buffers for properties that need them
         write_buffers = []
@@ -463,7 +456,6 @@ class Model:
             rank_local_agent_and_neighbor_adts[i][:num_agents].tolist()
             for i in range(self._agent_factory.num_properties)
         ]
-        print(f"[TIMING] Memory cleanup and tensor conversion: {time.time() - cleanup_start:.4f}s")
 
         """worker_agent_and_neighbor_data_tensors = (
             self._agent_factory.reduce_agent_data_tensors(
