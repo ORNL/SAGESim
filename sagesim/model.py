@@ -400,8 +400,14 @@ class Model:
             locations_as_indices = convert_agent_ids_to_indices(
                 locations_cpu, agent_id_to_index
             )
-            # Create new array for kernel - don't modify original!
-            locations_for_kernel = cp.array(locations_as_indices)
+
+            # Convert to int32 array, replacing NaN with -1 for efficient indexing
+            # This allows users to directly use indices without int() casting
+            locations_np = np.array(locations_as_indices, dtype=np.float32)
+            locations_np = np.where(np.isnan(locations_np), -1, locations_np)
+
+            # Create new array for kernel - cast to int32
+            locations_for_kernel = cp.array(locations_np, dtype=cp.int32)
 
         id_convert_time = time.time() - id_convert_start
 

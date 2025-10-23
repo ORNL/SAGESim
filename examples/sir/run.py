@@ -1,10 +1,8 @@
 from time import time
-import argparse
 from sir_model import SIRModel
 from state import SIRState
 from mpi4py import MPI
 from random import random
-
 from random import sample
 
 import networkx as nx
@@ -47,27 +45,14 @@ def generate_small_world_of_agents(
 
 
 if __name__ == "__main__":
+    # Hardcoded parameters
+    num_agents = 1000
+    num_init_connections = 10
+    num_nodes = num_workers
+    num_ticks = 10
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--num_agents",
-        type=int,
-    )
-    parser.add_argument(
-        "--num_init_connections",
-        type=float,
-    )
-    parser.add_argument(
-        "--num_nodes",
-        type=int,
-    )
-    args = parser.parse_args()
-
-    model = SIRModel()
+    model = SIRModel(p_infection=1.0, p_recovery=1.0)
     model.setup(use_gpu=True)
-    num_agents = args.num_agents
-    num_init_connections = int(args.num_init_connections)
-    num_nodes = args.num_nodes
 
     model_creation_start = time()
     model = generate_small_world_of_agents(
@@ -83,15 +68,22 @@ if __name__ == "__main__":
     )"""
 
     simulate_start = time()
-    model.simulate(10, sync_workers_every_n_ticks=1)
+    model.simulate(num_ticks, sync_workers_every_n_ticks=1)
     simulate_end = time()
     simulate_duration = simulate_end - simulate_start
 
+    # Print timing information
     if worker == 0:
-        with open("execution_times.csv", "a") as f:
-            f.write(
-                f"{num_agents}, {num_init_connections}, {num_nodes}, {num_workers}, {model_creation_duration}, {simulate_duration}\n"
-            )
+        print(f"\n{'='*60}")
+        print(f"PERFORMANCE METRICS")
+        print(f"{'='*60}")
+        print(f"Number of workers: {num_workers}")
+        print(f"Number of agents: {num_agents}")
+        print(f"Number of ticks: {num_ticks}")
+        print(f"Model creation time: {model_creation_duration:.4f} seconds")
+        print(f"Simulation time: {simulate_duration:.4f} seconds")
+        print(f"Total time: {model_creation_duration + simulate_duration:.4f} seconds")
+        print(f"{'='*60}\n")
 
     result = [
         SIRState(model.get_agent_property_value(agent_id, property_name="state"))
