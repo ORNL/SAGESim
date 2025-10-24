@@ -36,8 +36,9 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
     """
     result = []
     for agent_data in data_tensor:
-        if isinstance(agent_data, (list, tuple, set)):
-            # Handle collections (list, tuple, set) with multiple connections
+        # FIX: Also handle numpy arrays, not just lists/tuples/sets
+        if isinstance(agent_data, (list, tuple, set, np.ndarray)):
+            # Handle collections (list, tuple, set, numpy array) with multiple connections
             converted_data = []
             for value in agent_data:
                 if isinstance(value, (int, float, np.integer, np.floating)):
@@ -357,6 +358,12 @@ class Model:
             self.__rank_local_agent_data_tensors[1]
         )
 
+        # CRITICAL FIX: Clear the agent data cache to force resending all agent data
+        # This prevents the bug where contextualize skips sending agents whose state
+        # hasn't changed YET (because GPU kernel hasn't run), causing stale neighbor data
+        if num_workers > 1:
+            self._agent_factory.clear_agent_data_cache()
+
         context_start = time.time()
         (
             self.__rank_local_agent_ids,
@@ -468,6 +475,12 @@ class Model:
             rank_local_agent_and_neighbor_adts[i][:num_agents].tolist()
             for i in range(self._agent_factory.num_properties)
         ]
+
+        # CRITICAL FIX: Ensure all workers have finished processing before syncing neighbor data
+        # Without this barrier, the next call to contextualize_agent_data_tensors() may see
+        # stale data from some workers that haven't finished their GPU kernels yet
+        if num_workers > 1:
+            comm.barrier()
 
         """worker_agent_and_neighbor_data_tensors = (
             self._agent_factory.reduce_agent_data_tensors(
