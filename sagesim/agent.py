@@ -46,6 +46,14 @@ class AgentFactory:
 
         self._prev_agent_data = {}
 
+    def clear_agent_data_cache(self):
+        """Clear the previous agent data cache to force resending all agent data.
+
+        This is necessary to avoid stale data issues in MPI synchronization where
+        the cache check happens before GPU kernel execution in the same tick.
+        """
+        self._prev_agent_data = {}
+
     @property
     def breeds(self) -> List[Breed]:
         """

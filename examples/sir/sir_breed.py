@@ -26,5 +26,6 @@ class SIRBreed(Breed):
         # Register properties for the breed
         self.register_property("state", SIRState.SUSCEPTIBLE.value)
         self.register_property("preventative_measures", [random() for _ in range(100)])
+        self.register_property("state_history_buffer", [])  # Buffer to track state at each tick
         # Register the step function
         self.register_step_func(step_func, "sir_step_func.py", 0)
