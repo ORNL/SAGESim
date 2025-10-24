@@ -4,6 +4,7 @@ from state import SIRState
 from mpi4py import MPI
 from random import random
 from random import sample
+import csv
 
 import networkx as nx
 
@@ -72,24 +73,26 @@ if __name__ == "__main__":
     simulate_end = time()
     simulate_duration = simulate_end - simulate_start
 
-    # Print timing information
-    if worker == 0:
-        print(f"\n{'='*60}")
-        print(f"PERFORMANCE METRICS")
-        print(f"{'='*60}")
-        print(f"Number of workers: {num_workers}")
-        print(f"Number of agents: {num_agents}")
-        print(f"Number of ticks: {num_ticks}")
-        print(f"Model creation time: {model_creation_duration:.4f} seconds")
-        print(f"Simulation time: {simulate_duration:.4f} seconds")
-        print(f"Total time: {model_creation_duration + simulate_duration:.4f} seconds")
-        print(f"{'='*60}\n")
-
     result = [
         SIRState(model.get_agent_property_value(agent_id, property_name="state"))
         for agent_id in range(num_agents)
         if model.get_agent_property_value(agent_id, property_name="state") is not None
     ]
+
+    # Save state history to CSV (only on worker 0 to avoid duplicates)
+    if worker == 0:
+        with open('state_history.csv', 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            # Write header
+            writer.writerow(['agent_id'] + [f'tick_{i}' for i in range(num_ticks)])
+
+            # Write state history for each agent
+            for agent_id in range(model._agent_factory.num_agents):
+                state_history = model.get_state_history(agent_id)
+                if state_history is not None:
+                    # Convert float states to integers
+                    state_history_int = [int(state) for state in state_history]
+                    writer.writerow([agent_id] + state_history_int)
 
     """if worker == 0:
         print(

@@ -14,6 +14,7 @@ def step_func(
     locations,
     state_tensor,
     preventative_measures_tensor,
+    state_history_buffer,
 ):
     """
     At each simulation step, this function evaluates a subset of agents—either all agents in a serial run or a partition assigned to
@@ -101,3 +102,8 @@ def step_func(
             ):
                 state_tensor[agent_index] = 2
             i += 1
+
+    # Safe buffer indexing: use modulo to prevent out-of-bounds access
+    # When tracking is disabled, buffer length is 1, so tick % 1 = 0 always
+    buffer_idx = tick % len(state_history_buffer[agent_index])
+    state_history_buffer[agent_index][buffer_idx] = state_tensor[agent_index]
