@@ -358,13 +358,6 @@ class Model:
             self.__rank_local_agent_data_tensors[1]
         )
 
-        # CRITICAL FIX: Clear the agent data cache to force resending all agent data
-        # This prevents the bug where contextualize skips sending agents whose state
-        # hasn't changed YET (because GPU kernel hasn't run), causing stale neighbor data
-        if num_workers > 1:
-            self._agent_factory.clear_agent_data_cache()
-
-        context_start = time.time()
         (
             self.__rank_local_agent_ids,
             self.__rank_local_agent_data_tensors,
@@ -376,7 +369,6 @@ class Model:
             rank_local_agents_neighbors,
         )
 
-        tensor_convert_start = time.time()
         rank_local_agent_and_neighbor_adts = [
             convert_to_equal_side_tensor(
                 self.__rank_local_agent_data_tensors[i] + received_neighbor_adts[i]
@@ -394,7 +386,6 @@ class Model:
 
         # Convert agent IDs to local indices in locations array (property index 1)
         # This eliminates the need for linear search in GPU kernels
-        id_convert_start = time.time()
 
         # Property index 1 is 'locations' (neighbors/connections) - this is standard in SAGESim
         # Keep original locations unchanged, create converted copy for kernel
@@ -415,8 +406,6 @@ class Model:
 
             # Create new array for kernel - cast to int32
             locations_for_kernel = cp.array(locations_np, dtype=cp.int32)
-
-        id_convert_time = time.time() - id_convert_start
 
         # Create write buffers for properties that need them
         write_buffers = []

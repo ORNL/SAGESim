@@ -55,8 +55,8 @@ def generate_small_world_of_agents(
 
 if __name__ == "__main__":
     # Hardcoded parameters
-    num_agents = 20
-    num_init_connections = 2
+    num_agents = 100
+    num_init_connections = 20
     num_nodes = num_workers
     num_ticks = 1
     random_seed = 2  # Set seed for reproducible results
