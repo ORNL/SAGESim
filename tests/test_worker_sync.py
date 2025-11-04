@@ -1,7 +1,6 @@
 from time import time
 from mpi4py import MPI
 from random import random, seed as set_random_seed
-from random import sample
 import csv
 from enum import Enum
 
@@ -33,13 +32,12 @@ def step_func(
     breeds,
     locations,
     state_tensor,
-    preventative_measures_tensor,
     state_history_buffer,
 ):
     """
-    At each simulation step, this function evaluates a subset of agents—either all agents in a serial run or a partition assigned to
-    a specific rank in parallel processing—and determines whether an agent's state should change based on interactions with its neighbors
-    and their respective preventative behaviors.
+    Simplified step function without preventative measures.
+    At each simulation step, this function evaluates agents and determines whether
+    an agent's state should change based on interactions with neighbors.
     """
     # Get the list of neighboring agent indices for the current agent based on network topology
     neighbor_indices = locations[agent_index]
@@ -54,9 +52,6 @@ def step_func(
     # Get the current state of the agent (e.g., susceptible, infected, recovered)
     agent_state = state_tensor[agent_index]
 
-    # Get the preventative measures vector for the current agent
-    agent_preventative_measures = preventative_measures_tensor[agent_index]
-
     # If agent is infected and the recovery condition passes, update agent's state
     if agent_state == 2 and rand < p_recovery:
         state_tensor[agent_index] = 3
@@ -69,29 +64,8 @@ def step_func(
             # Retrieve the state of the neighbor (e.g., susceptible, infected, recovered)
             neighbor_state = state_tensor[neighbor_index]
 
-            # Get the preventative measures vector of the neighbor
-            neighbor_preventative_measures = preventative_measures_tensor[neighbor_index]
-
-            # Initialize cumulative safety score for the interaction
-            abs_safety_of_interaction = 0.0
-
-            # Calculate total safety of interaction based on pairwise product of measures
-            for n in range(len(agent_preventative_measures)):
-                for m in range(len(neighbor_preventative_measures)):
-                    abs_safety_of_interaction += (
-                        agent_preventative_measures[n]
-                        * neighbor_preventative_measures[m]
-                    )
-
-            # Normalize the safety score to be in [0, 1]
-            normalized_safety_of_interaction = abs_safety_of_interaction / (
-                len(agent_preventative_measures) ** 2
-            )
-
             # If neighbor is infected and the infection condition passes, update agent's state
-            if neighbor_state == 2 and rand < p_infection * (
-                1 - normalized_safety_of_interaction
-            ):
+            if neighbor_state == 2 and rand < p_infection:
                 state_tensor[agent_index] = 2
             i += 1
 
@@ -112,7 +86,6 @@ class SIRBreed(Breed):
         super().__init__(name)
         # Register properties for the breed
         self.register_property("state", SIRState.SUSCEPTIBLE.value)
-        self.register_property("preventative_measures", [random() for _ in range(100)])
         self.register_property("state_history_buffer", [])  # Buffer to track state at each tick
         # Register the step function
         self.register_step_func(step_func, __file__, 0)
@@ -139,10 +112,10 @@ class SIRModel(Model):
         # Store state tracking setting
         self.enable_state_tracking = enable_state_tracking
 
-    # create_agent method takes user-defined properties, that is, the state and preventative_measures, to create an agent
-    def create_agent(self, state, preventative_measures):
+    # create_agent method takes user-defined properties, that is, the state to create an agent
+    def create_agent(self, state):
         agent_id = self.create_agent_of_breed(
-            self._sir_breed, state=state, preventative_measures=preventative_measures
+            self._sir_breed, state=state
         )
         return agent_id
 
@@ -185,49 +158,52 @@ class SIRModel(Model):
         return self.get_agent_property_value(agent_id, "state_history_buffer")
 
 
-def generate_small_world_network(n, k, p, seed=None):
+def generate_chain_network(num_agents):
     """
-    Generate a small world network using the Watts-Strogatz model.
+    Generate a chain network where 0->1->2->3->...->9
 
     Parameters:
-    - n (int): The number of nodes in the network.
-    - k (int): Each node is connected to its k nearest neighbors in a ring topology.
-    - p (float): The probability of rewiring each edge.
-    - seed (int, optional): Random seed for reproducibility.
+    - num_agents (int): The number of agents in the chain.
 
     Returns:
-    - networkx.Graph: The generated small world network.
+    - networkx.Graph: The generated chain network.
     """
-    return nx.watts_strogatz_graph(n, k, p, seed=seed)
+    G = nx.Graph()
+    G.add_nodes_from(range(num_agents))
+
+    # Create chain: 0-1-2-3-4-5-6-7-8-9
+    for i in range(num_agents - 1):
+        G.add_edge(i, i + 1)
+
+    return G
 
 
-def generate_small_world_of_agents(
-    model, num_agents: int, num_init_connections: int, num_infected: int, seed=None
+def generate_chain_of_agents(
+    model, num_agents: int, num_infected: int = 1, seed=None
 ) -> SIRModel:
     # Set random seed for reproducibility
     if seed is not None:
         set_random_seed(seed)
 
-    network = generate_small_world_network(num_agents, num_init_connections, 0.1, seed=seed)
+    network = generate_chain_network(num_agents)
+
+    # Create all agents as susceptible
     for n in network.nodes:
-        preventative_measures = [0.0]*100
-        model.create_agent(SIRState.SUSCEPTIBLE.value, preventative_measures)
+        model.create_agent(SIRState.SUSCEPTIBLE.value)
 
-    # Set seed again before sampling to ensure deterministic selection of infected agents
-    if seed is not None:
-        set_random_seed(seed)
-    for n in sample(sorted(network.nodes), num_infected):
-        model.set_agent_property_value(n, "state", SIRState.INFECTED.value)
+    # Set agent 0 as infected
+    model.set_agent_property_value(0, "state", SIRState.INFECTED.value)
 
+    # Add all edges to the model (chain: 0-1, 1-2, 2-3, ..., 8-9)
     for edge in network.edges:
         model.connect_agents(edge[0], edge[1])
+
     return model
 
 
 if __name__ == "__main__":
     # Hardcoded parameters
-    num_agents = 20
-    num_init_connections = 2
+    num_agents = 10  # Chain of 10 agents: 0-1-2-3-4-5-6-7-8-9
     num_nodes = num_workers
     num_ticks = 10
     random_seed = 2  # Set seed for reproducible results
@@ -236,11 +212,31 @@ if __name__ == "__main__":
     model.setup(use_gpu=True)
 
     model_creation_start = time()
-    model = generate_small_world_of_agents(
-        model, num_agents, num_init_connections, int(0.1 * num_agents), seed=random_seed
+    model = generate_chain_of_agents(
+        model, num_agents, num_infected=1, seed=random_seed
     )
     model_creation_end = time()
     model_creation_duration = model_creation_end - model_creation_start
+
+    # Print which agents are assigned (non-ghost) to each worker
+    # An agent is "owned" by a worker if it can write to it
+    owned_agents = []
+    for agent_id in range(num_agents):
+        # Try to get the state - if we can, it means we have access to this agent
+        # But we need to check if we actually OWN it (not a ghost)
+        # The framework assigns agents in round-robin fashion: even agents to worker 0, odd to worker 1
+        if agent_id % num_workers == worker:
+            owned_agents.append(agent_id)
+
+    print(f"Worker {worker}: owns agents {owned_agents}")
+    comm.Barrier()
+
+    if worker == 0:
+        print(f"\nCreated chain network: 0-1-2-3-4-5-6-7-8-9")
+        print(f"Agent 0 starts INFECTED, all others SUSCEPTIBLE")
+        print(f"p_infection=1.0, p_recovery=1.0")
+        print(f"Running with {num_workers} workers")
+        print()
 
     simulate_start = time()
     model.simulate(num_ticks, sync_workers_every_n_ticks=1)
@@ -268,7 +264,7 @@ if __name__ == "__main__":
 
     # Save state history to CSV (only on worker 0 to avoid duplicates)
     if worker == 0:
-        with open('state_history.csv', 'w', newline='') as csvfile:
+        with open('test_worker_sync_results.csv', 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             # Write header
             writer.writerow(['agent_id'] + [f'tick_{i}' for i in range(num_ticks)])
@@ -281,4 +277,15 @@ if __name__ == "__main__":
                     state_history_int = [int(state) for state in state_history]
                     writer.writerow([agent_id] + state_history_int)
 
-        print(f"State history saved to state_history.csv")
+        print(f"\nState history saved to test_worker_sync_results.csv")
+        print(f"Model creation duration: {model_creation_duration:.4f} seconds")
+        print(f"Simulation duration: {simulate_duration:.4f} seconds")
+
+        # Print expected vs actual results
+        print("\nExpected behavior with deterministic infection/recovery:")
+        print("Tick 0: Agent 0 infected")
+        print("Tick 1: Agent 0 recovers, Agent 1 gets infected")
+        print("Tick 2: Agent 1 recovers, Agent 2 gets infected")
+        print("...")
+        print("Tick 9: Agent 8 recovers, Agent 9 gets infected")
+        print("\nActual final states:", result)
