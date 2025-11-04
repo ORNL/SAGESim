@@ -276,31 +276,46 @@ class AgentFactory:
         for agent_idx in range(num_agents_this_rank):
             agent_id = agent_ids_chunk[agent_idx]
             agent_adts = [adt[agent_idx] for adt in agent_data_tensors]
-            if agent_id not in self._prev_agent_data:
-                self._prev_agent_data[agent_id] = agent_adts
-            else:
-                # If the agent data has not changed, skip sending it
-                agent_changed = False
-                for prop_idx in range(self.num_properties):
-                    current_property_adt = agent_adts[prop_idx]
-                    previous_property_adt = self._prev_agent_data[agent_id][prop_idx]
-                    if type(current_property_adt) == set:
-                        current_property_adt = list(current_property_adt)
-                    if type(previous_property_adt) == set:
-                        previous_property_adt = list(previous_property_adt)
-                    if not np.array_equal(
-                        current_property_adt,
-                        previous_property_adt,
-                        equal_nan=True,
-                    ):
-                        agent_changed = True
-                        break
-                if agent_changed:
-                    # Update the previous agent data
+
+            # Check if this agent has neighbors on other workers
+            has_cross_worker_neighbors = False
+            for neighbor_id in all_neighbors[agent_idx]:
+                if np.isnan(neighbor_id):
+                    break
+                neighbor_rank = self._agent2rank[int(neighbor_id)]
+                if neighbor_rank != worker:
+                    has_cross_worker_neighbors = True
+                    break
+
+            # Optimization: Skip sending if data hasn't changed AND agent has no cross-worker neighbors
+            # Agents with cross-worker neighbors must always be sent to maintain agent_id_to_index mapping
+            if not has_cross_worker_neighbors:
+                if agent_id not in self._prev_agent_data:
                     self._prev_agent_data[agent_id] = agent_adts
                 else:
-                    # Skip sending this agent if its data has not changed
-                    continue
+                    # If the agent data has not changed, skip sending it
+                    agent_changed = False
+                    for prop_idx in range(self.num_properties):
+                        current_property_adt = agent_adts[prop_idx]
+                        previous_property_adt = self._prev_agent_data[agent_id][prop_idx]
+                        if type(current_property_adt) == set:
+                            current_property_adt = list(current_property_adt)
+                        if type(previous_property_adt) == set:
+                            previous_property_adt = list(previous_property_adt)
+                        if not np.array_equal(
+                            current_property_adt,
+                            previous_property_adt,
+                            equal_nan=True,
+                        ):
+                            agent_changed = True
+                            break
+                    if agent_changed:
+                        # Update the previous agent data
+                        self._prev_agent_data[agent_id] = agent_adts
+                    else:
+                        # Skip sending this agent if its data has not changed
+                        # and it has no neighbors on other workers
+                        continue
 
             for neighbor_id in all_neighbors[agent_idx]:
                 if np.isnan(neighbor_id):

@@ -16,18 +16,18 @@ unset SLURM_EXPORT_ENV
 # Load modules
 module load PrgEnv-gnu/8.6.0
 module load miniforge3/23.11.0-0
-module load rocm/5.7.1
+module load rocm/6.2.4
 module load craype-accel-amd-gfx90a
 
 
 # Activate your environment
-source activate /lustre/orion/proj-shared/csc536/envs/sagesimenv_cg
+source activate /lustre/orion/proj-shared/lrn088/objective3/envs/superneuroabm_cupy13.6
 
 # Point to source
-export PYTHONPATH=/lustre/orion/proj-shared/csc536/gunaratnecs/mpiasync/SAGESim/:$PYTHONPATH
+export PYTHONPATH=/lustre/orion/proj-shared/lrn088/objective3/xxz/SAGESim/:$PYTHONPATH
 
 # Make run dir if not exists per job id
-RUN_DIR=/lustre/orion/proj-shared/csc536/gunaratnecs/mpiasync/SAGESim/examples/sir
+RUN_DIR=/lustre/orion/proj-shared/lrn088/objective3/xxz/SAGESim/examples/sir
 if [ ! -d "$RUN_DIR" ]
 then
         mkdir -p $RUN_DIR
@@ -44,7 +44,7 @@ do
             num_mpi_ranks=$((8 * ${num_nodes}))
             # Run script
             echo Running. Python Script with ${num_nodes} nodes, ${num_agents} agents, and ${percent_init_connections} percent init connections.
-            time srun -N${num_nodes} -n${num_mpi_ranks} -c7 --ntasks-per-gpu=1 --gpu-bind=closest python3 -u ./run.py --num_agents ${num_agents} --num_init_connections ${num_init_connections} --num_nodes ${num_nodes}
+            time srun -N${num_nodes} -n${num_mpi_ranks} -c7 --ntasks-per-gpu=1 --gpu-bind=closest python3 -u ./run_frontier.py --num_agents ${num_agents} --num_init_connections ${num_init_connections} --num_nodes ${num_nodes}
             #time srun -N${num_nodes} -n${num_mpi_ranks} -c7 --gpus-per-task=1 --gpu-bind=closest /bin/bash -c 'echo $(hostname) $(grep Cpus_allowed_list /proc/self/status) GPUS: $ROCR_VISIBLE_DEVICES' | sort
             echo Run finished. Python Script with ${num_nodes} nodes, ${num_agents} agents, and ${percent_init_connections} percent init connections.
             date

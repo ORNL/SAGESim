@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -A csc536
+#SBATCH -A lrn088
 #SBATCH -J sagesim_sir
 #SBATCH -o logs/sagesim_sir_%j.o
 #SBATCH -e logs/sagesim_sir_%j.e
@@ -16,34 +16,34 @@ unset SLURM_EXPORT_ENV
 # Load modules
 module load PrgEnv-gnu/8.6.0
 module load miniforge3/23.11.0-0
-module load rocm/5.7.1
+module load rocm/8.6.0
 module load craype-accel-amd-gfx90a
 
 # make sure it runs the correct code
-export SRC_DIR=/lustre/orion/proj-shared/csc536/xiz/SAGESim/examples/sir/
+export SRC_DIR=/lustre/orion/proj-shared/lrn088/objective3/xxz/SAGESim/examples/sir/
 # Activate your environment
-source activate /lustre/orion/proj-shared/csc536/envs/sagesimenv_xi
+source activate /lustre/orion/proj-shared/lrn088/objective3/envs/superneuroabm_cupy13.6
 
 # Point to source
-export PYTHONPATH=/lustre/orion/proj-shared/csc536/xiz/SAGESim/:$PYTHONPATH
+export PYTHONPATH=/lustre/orion/proj-shared/lrn088/objective3/xxz/SAGESim/:$PYTHONPATH
 
-# # Make run dir if not exists per job id
-# RUN_DIR=/lustre/orion/proj-shared/csc536/xiz/SAGESim/examples/sir
-# if [ ! -d "$RUN_DIR" ]
-# then
-#         mkdir -p $RUN_DIR
-# fi
-# cd $RUN_DIR
+# Make run dir if not exists per job id
+RUN_DIR=/lustre/orion/proj-shared/lrn088/objective3/xxz/SAGESim/examples/sir
+if [ ! -d "$RUN_DIR" ]
+then
+        mkdir -p $RUN_DIR
+fi
+cd $RUN_DIR
 
 
 num_agents=100000
 num_nodes=1
-num_init_connections=20
+num_init_connections=200
 
 num_mpi_ranks=$((8 * ${num_nodes}))
 # Run script
 echo Running. Python Script with ${num_nodes} nodes, ${num_agents} agents, and ${num_init_connections} init connections.
-time srun -N${num_nodes} -n${num_mpi_ranks} -c7 --ntasks-per-gpu=1 --gpu-bind=closest python3 -u ${SRC_DIR}/run.py --num_agents ${num_agents} --num_init_connections ${num_init_connections} --num_nodes ${num_nodes}
+time srun -N${num_nodes} -n${num_mpi_ranks} -c7 --ntasks-per-gpu=1 --gpu-bind=closest python3 -u ${SRC_DIR}/run_frontier.py --num_agents ${num_agents} --num_init_connections ${num_init_connections} --num_nodes ${num_nodes}
 #time srun -N${num_nodes} -n${num_mpi_ranks} -c7 --gpus-per-task=1 --gpu-bind=closest /bin/bash -c 'echo $(hostname) $(grep Cpus_allowed_list /proc/self/status) GPUS: $ROCR_VISIBLE_DEVICES' | sort
 echo Run finished. Python Script with ${num_nodes} nodes, ${num_agents} agents, and ${num_init_connections} init connections.
 date
