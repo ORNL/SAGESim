@@ -298,15 +298,21 @@ class AgentFactory:
                     for prop_idx in range(self.num_properties):
                         current_property_adt = agent_adts[prop_idx]
                         previous_property_adt = self._prev_agent_data[agent_id][prop_idx]
-                        if type(current_property_adt) == set:
-                            current_property_adt = list(current_property_adt)
-                        if type(previous_property_adt) == set:
-                            previous_property_adt = list(previous_property_adt)
-                        if not np.array_equal(
-                            current_property_adt,
-                            previous_property_adt,
-                            equal_nan=True,
-                        ):
+
+                        # Compare based on type to handle ordered (list) vs unordered (set) neighbors
+                        properties_equal = False
+                        if isinstance(current_property_adt, set):
+                            # For sets (unordered neighbors), order doesn't matter
+                            properties_equal = current_property_adt == previous_property_adt
+                        else:
+                            # For lists, tuples, arrays (ordered neighbors), order matters
+                            properties_equal = np.array_equal(
+                                current_property_adt,
+                                previous_property_adt,
+                                equal_nan=True,
+                            )
+
+                        if not properties_equal:
                             agent_changed = True
                             break
                     if agent_changed:
