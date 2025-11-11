@@ -219,14 +219,9 @@ if __name__ == "__main__":
     model_creation_duration = model_creation_end - model_creation_start
 
     # Print which agents are assigned (non-ghost) to each worker
-    # An agent is "owned" by a worker if it can write to it
-    owned_agents = []
-    for agent_id in range(num_agents):
-        # Try to get the state - if we can, it means we have access to this agent
-        # But we need to check if we actually OWN it (not a ghost)
-        # The framework assigns agents in round-robin fashion: even agents to worker 0, odd to worker 1
-        if agent_id % num_workers == worker:
-            owned_agents.append(agent_id)
+    # Use the framework's internal agent-to-rank mapping for accurate results
+    agent_factory = model._agent_factory
+    owned_agents = list(agent_factory._rank2agentid2agentidx.get(worker, {}).keys())
 
     print(f"Worker {worker}: owns agents {owned_agents}")
     comm.Barrier()

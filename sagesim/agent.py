@@ -225,15 +225,7 @@ class AgentFactory:
     def _generate_agent_data_tensors(
         self,
     ) -> List[List[Any]]:
-        """converted_agent_data_tensors = []
-        for property_name in self._property_name_2_agent_data_tensor.keys():
-            converted_agent_data_tensors.append(
-                convert_to_equal_side_tensor(
-                    self._property_name_2_agent_data_tensor[property_name]
-                )
-            )
 
-        return converted_agent_data_tensors"""
         return list(self._property_name_2_agent_data_tensor.values())
 
     def _update_agent_property(
@@ -282,6 +274,8 @@ class AgentFactory:
             for neighbor_id in all_neighbors[agent_idx]:
                 if np.isnan(neighbor_id):
                     break
+                if int(neighbor_id) < 0:  # Skip invalid/external agent IDs (e.g., -1 for external inputs)
+                    continue
                 neighbor_rank = self._agent2rank[int(neighbor_id)]
                 if neighbor_rank != worker:
                     has_cross_worker_neighbors = True
@@ -298,15 +292,21 @@ class AgentFactory:
                     for prop_idx in range(self.num_properties):
                         current_property_adt = agent_adts[prop_idx]
                         previous_property_adt = self._prev_agent_data[agent_id][prop_idx]
-                        if type(current_property_adt) == set:
-                            current_property_adt = list(current_property_adt)
-                        if type(previous_property_adt) == set:
-                            previous_property_adt = list(previous_property_adt)
-                        if not np.array_equal(
-                            current_property_adt,
-                            previous_property_adt,
-                            equal_nan=True,
-                        ):
+
+                        # Compare based on type to handle ordered (list) vs unordered (set) neighbors
+                        properties_equal = False
+                        if isinstance(current_property_adt, set):
+                            # For sets (unordered neighbors), order doesn't matter
+                            properties_equal = current_property_adt == previous_property_adt
+                        else:
+                            # For lists, tuples, arrays (ordered neighbors), order matters
+                            properties_equal = np.array_equal(
+                                current_property_adt,
+                                previous_property_adt,
+                                equal_nan=True,
+                            )
+
+                        if not properties_equal:
                             agent_changed = True
                             break
                     if agent_changed:
@@ -320,6 +320,8 @@ class AgentFactory:
             for neighbor_id in all_neighbors[agent_idx]:
                 if np.isnan(neighbor_id):
                     break
+                if int(neighbor_id) < 0:  # Skip invalid/external agent IDs (e.g., -1 for external inputs)
+                    continue
                 neighbor_rank = self._agent2rank[int(neighbor_id)]
                 if neighbor_rank == worker:
                     # Don't send to self
