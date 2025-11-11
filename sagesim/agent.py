@@ -225,15 +225,7 @@ class AgentFactory:
     def _generate_agent_data_tensors(
         self,
     ) -> List[List[Any]]:
-        """converted_agent_data_tensors = []
-        for property_name in self._property_name_2_agent_data_tensor.keys():
-            converted_agent_data_tensors.append(
-                convert_to_equal_side_tensor(
-                    self._property_name_2_agent_data_tensor[property_name]
-                )
-            )
 
-        return converted_agent_data_tensors"""
         return list(self._property_name_2_agent_data_tensor.values())
 
     def _update_agent_property(
@@ -273,6 +265,12 @@ class AgentFactory:
         neighborrankandagentidsvisited = set()
         num_agents_this_rank = len(agent_ids_chunk)
 
+        # # DEBUG: Print contextualization details
+        # print(f"\n[DEBUG Worker {worker}] CONTEXTUALIZE START:")
+        # print(f"  num_agents_this_rank: {num_agents_this_rank}")
+        # print(f"  agent_ids_chunk: {agent_ids_chunk}")
+        # print(f"  all_neighbors (first 3): {all_neighbors[:min(3, len(all_neighbors))]}")
+
         for agent_idx in range(num_agents_this_rank):
             agent_id = agent_ids_chunk[agent_idx]
             agent_adts = [adt[agent_idx] for adt in agent_data_tensors]
@@ -282,10 +280,18 @@ class AgentFactory:
             for neighbor_id in all_neighbors[agent_idx]:
                 if np.isnan(neighbor_id):
                     break
+                if int(neighbor_id) < 0:  # Skip invalid/external agent IDs (e.g., -1 for external inputs)
+                    continue
                 neighbor_rank = self._agent2rank[int(neighbor_id)]
                 if neighbor_rank != worker:
                     has_cross_worker_neighbors = True
                     break
+
+            # # DEBUG: Print per-agent details
+            # if agent_idx < 3:  # Only first 3 agents
+            #     print(f"  Agent {agent_id} (idx={agent_idx}):")
+            #     print(f"    Neighbors: {all_neighbors[agent_idx]}")
+            #     print(f"    has_cross_worker_neighbors: {has_cross_worker_neighbors}")
 
             # Optimization: Skip sending if data hasn't changed AND agent has no cross-worker neighbors
             # Agents with cross-worker neighbors must always be sent to maintain agent_id_to_index mapping
@@ -326,9 +332,15 @@ class AgentFactory:
             for neighbor_id in all_neighbors[agent_idx]:
                 if np.isnan(neighbor_id):
                     break
+                if int(neighbor_id) < 0:  # Skip invalid/external agent IDs (e.g., -1 for external inputs)
+                    # if agent_idx < 3:  # DEBUG
+                    #     print(f"    Skipping neighbor_id={neighbor_id} (< 0)")
+                    continue
                 neighbor_rank = self._agent2rank[int(neighbor_id)]
                 if neighbor_rank == worker:
                     # Don't send to self
+                    # if agent_idx < 3:  # DEBUG
+                    #     print(f"    Skipping neighbor_id={neighbor_id} (same rank)")
                     continue
                 if (neighbor_rank, agent_id) not in neighborrankandagentidsvisited:
                     # Don't send the same agent to the same rank multiple times
@@ -338,6 +350,8 @@ class AgentFactory:
                     neighborrank2agentidandadt[neighbor_rank].append(
                         (agent_id, agent_adts)
                     )
+                    # if agent_idx < 3:  # DEBUG
+                    #     print(f"    Sending agent {agent_id} to rank {neighbor_rank}")
 
         received_neighbor_adts = []
         received_neighbor_ids = []
@@ -440,6 +454,14 @@ class AgentFactory:
             received_neighbor_ids.append(neighbor_id)
             for prop_idx in range(self.num_properties):
                 received_neighbor_adts[prop_idx].append(adts[prop_idx])
+
+        # # DEBUG: Print what was sent/received
+        # print(f"\n[DEBUG Worker {worker}] CONTEXTUALIZE END:")
+        # print(f"  Sending to other workers: {list(neighborrank2agentidandadt.keys())}")
+        # for rank, data in neighborrank2agentidandadt.items():
+        #     print(f"    To worker {rank}: {len(data)} agents - {[aid for aid, _ in data]}")
+        # print(f"  Received {len(received_neighbor_ids)} neighbors: {received_neighbor_ids}")
+        # print()
 
         return (
             agent_ids_chunk,

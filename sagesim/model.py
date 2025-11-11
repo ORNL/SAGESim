@@ -395,14 +395,40 @@ class Model:
             # Convert on CPU (fast with hash map), then transfer to GPU
             locations_cpu = original_locations if not isinstance(original_locations, cp.ndarray) else original_locations.get()
 
+            # # DEBUG: Print synapse neighbor conversion details
+            # print(f"\n[DEBUG Worker {worker} Tick {self.tick}] LOCATION CONVERSION:")
+            # print(f"  Number of local agents: {len(self.__rank_local_agent_ids)}")
+            # print(f"  Local agent IDs: {self.__rank_local_agent_ids}")
+            # print(f"  Received neighbor IDs: {received_neighbor_ids[:10] if len(received_neighbor_ids) > 10 else received_neighbor_ids}")
+            # print(f"  all_agent_ids_list: {all_agent_ids_list}")
+            # print(f"  agent_id_to_index map: {agent_id_to_index}")
+            # for i, agent_id in enumerate(self.__rank_local_agent_ids[:3]):  # Show first 3 agents
+            #     print(f"  Agent {agent_id} (local_idx={i}):")
+            #     print(f"    Original neighbors (agent IDs): {locations_cpu[i]}")
+            #     if i < len(locations_cpu):
+            #         neighbors_with_mapping = []
+            #         for neighbor_id in (locations_cpu[i] if hasattr(locations_cpu[i], '__iter__') and not isinstance(locations_cpu[i], str) else [locations_cpu[i]]):
+            #             if not np.isnan(neighbor_id):
+            #                 neighbor_id_int = int(neighbor_id)
+            #                 idx = agent_id_to_index.get(neighbor_id_int, -1)
+            #                 neighbors_with_mapping.append(f"{neighbor_id_int}→{idx}")
+            #         print(f"    Neighbor ID → Index mapping: {neighbors_with_mapping}")
+
             locations_as_indices = convert_agent_ids_to_indices(
                 locations_cpu, agent_id_to_index
             )
+
+            # # DEBUG: Print converted results
+            # for i, agent_id in enumerate(self.__rank_local_agent_ids[:3]):  # Show first 3 agents
+            #     print(f"  Agent {agent_id} converted neighbors (indices): {locations_as_indices[i]}")
 
             # Convert to int32 array, replacing NaN with -1 for efficient indexing
             # This allows users to directly use indices without int() casting
             locations_np = np.array(locations_as_indices, dtype=np.float32)
             locations_np = np.where(np.isnan(locations_np), -1, locations_np)
+
+            # print(f"  Final locations_np (first 3): {locations_np[:3]}")
+            # print()
 
             # Create new array for kernel - cast to int32
             locations_for_kernel = cp.array(locations_np, dtype=cp.int32)
