@@ -224,6 +224,8 @@ if __name__ == "__main__":
     owned_agents = list(agent_factory._rank2agentid2agentidx.get(worker, {}).keys())
 
     print(f"Worker {worker}: owns agents {owned_agents}")
+
+    print(model._agent_factory.num_agents)
     comm.Barrier()
 
     if worker == 0:

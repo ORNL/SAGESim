@@ -34,11 +34,21 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
     :param agent_id_to_index_map: Dictionary mapping agent_id -> local_index
     :return: Same structure with IDs replaced by local indices (-1 if not found)
     """
+    t_start = time.time()
     result = []
     for agent_data in data_tensor:
-        # FIX: Also handle numpy arrays, not just lists/tuples/sets
-        if isinstance(agent_data, (list, tuple, set, np.ndarray)):
-            # Handle collections (list, tuple, set, numpy array) with multiple connections
+        if isinstance(agent_data, np.ndarray):
+            # Optimized path for numpy arrays - convert to list once then use list comprehension
+            arr_list = agent_data.tolist()
+            converted_data = [
+                agent_id_to_index_map.get(int(v), -1)
+                if isinstance(v, (int, float)) and not (isinstance(v, float) and (v != v))  # v != v checks for NaN
+                else v
+                for v in arr_list
+            ]
+            result.append(converted_data)
+        elif isinstance(agent_data, (list, tuple, set)):
+            # Handle collections (list, tuple, set) with multiple connections
             converted_data = []
             for value in agent_data:
                 if isinstance(value, (int, float, np.integer, np.floating)):
@@ -59,6 +69,8 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
                     result.append(agent_data)
             else:
                 result.append(agent_data)
+    t_end = time.time()
+    print(f"[TIMING] convert_agent_ids_to_indices: {t_end - t_start:.4f} sec")
     return result
 
 comm = MPI.COMM_WORLD
@@ -345,7 +357,6 @@ class Model:
             the simulation by
         :param agent_ids: agents to process by this cudakernel call
         """
-
         self.__rank_local_agent_ids = list(
             self._agent_factory._rank2agentid2agentidx[worker].keys()
         )
@@ -369,13 +380,6 @@ class Model:
             rank_local_agents_neighbors,
         )
 
-        rank_local_agent_and_neighbor_adts = [
-            convert_to_equal_side_tensor(
-                self.__rank_local_agent_data_tensors[i] + received_neighbor_adts[i]
-            )
-            for i in range(self._agent_factory.num_properties)
-        ]
-
         self._global_data_vector = cp.array(self._global_data_vector)
 
         # Create agent ID to local index mapping for fast lookups
@@ -384,28 +388,43 @@ class Model:
 
         rank_local_agent_and_non_local_neighbor_ids = cp.array(all_agent_ids_list)
 
-        # Convert agent IDs to local indices in locations array (property index 1)
-        # This eliminates the need for linear search in GPU kernels
+        # OPTIMIZATION: Convert agent IDs to indices on LISTS before GPU conversion
+        # This avoids GPU->CPU->GPU roundtrip and works on lists (faster than numpy arrays)
+        t1 = time.time()
+        combined_lists = []
+        for i in range(self._agent_factory.num_properties):
+            combined = self.__rank_local_agent_data_tensors[i] + received_neighbor_adts[i]
 
-        # Property index 1 is 'locations' (neighbors/connections) - this is standard in SAGESim
-        # Keep original locations unchanged, create converted copy for kernel
+            if i == 1:  # Property 1 is 'locations' (neighbors/connections)
+                # Convert agent IDs to local indices while still a list
+                t_conv_start = time.time()
+                combined = convert_agent_ids_to_indices(combined, agent_id_to_index)
+                t_conv_end = time.time()
+                print(f"[TIMING] convert_agent_ids_to_indices (on lists): {t_conv_end - t_conv_start:.4f} sec")
+
+            combined_lists.append(combined)
+
+        # Now convert all to GPU arrays (single CPU->GPU transfer per property)
+        t2 = time.time()
+        rank_local_agent_and_neighbor_adts = [
+            convert_to_equal_side_tensor(combined_lists[i])
+            for i in range(self._agent_factory.num_properties)
+        ]
+        t3 = time.time()
+        print(f"[TIMING] convert_to_equal_side_tensor: {t3 - t2:.4f} sec")
+        print(f"[TIMING] Total prep before GPU: {t3 - t1:.4f} sec")
+
+        # Property 1 (locations) needs special handling: replace NaN with -1 and convert to int32
+        t4 = time.time()
         locations_for_kernel = None
         if len(rank_local_agent_and_neighbor_adts) > 1:
-            original_locations = rank_local_agent_and_neighbor_adts[1]
-            # Convert on CPU (fast with hash map), then transfer to GPU
-            locations_cpu = original_locations if not isinstance(original_locations, cp.ndarray) else original_locations.get()
-
-            locations_as_indices = convert_agent_ids_to_indices(
-                locations_cpu, agent_id_to_index
-            )
-
-            # Convert to int32 array, replacing NaN with -1 for efficient indexing
-            # This allows users to directly use indices without int() casting
-            locations_np = np.array(locations_as_indices, dtype=np.float32)
-            locations_np = np.where(np.isnan(locations_np), -1, locations_np)
-
-            # Create new array for kernel - cast to int32
+            locations_gpu = rank_local_agent_and_neighbor_adts[1]
+            # Transfer to CPU, replace NaN with -1, convert to int32
+            locations_cpu = locations_gpu.get()
+            locations_np = np.where(np.isnan(locations_cpu), -1, locations_cpu)
             locations_for_kernel = cp.array(locations_np, dtype=cp.int32)
+        t5 = time.time()
+        print(f"[TIMING] NaN->-1 and int32 conversion: {t5 - t4:.4f} sec")
 
         # Create write buffers for properties that need them
         write_buffers = []
@@ -458,7 +477,6 @@ class Model:
         cp.get_default_memory_pool().free_all_blocks()
 
         # Convert GPU tensors back to CPU lists for next iteration
-        gpu_to_cpu_start = time.time()
         num_agents = len(self.__rank_local_agent_ids)
         self.__rank_local_agent_data_tensors = [
             rank_local_agent_and_neighbor_adts[i][:num_agents].tolist()
