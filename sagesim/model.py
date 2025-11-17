@@ -95,30 +95,43 @@ def convert_agent_indices_to_ids(data_tensor, agent_index_to_id_list):
 
     # FAST PATH: If data_tensor is already a 2D numpy array, vectorize everything
     if isinstance(data_tensor, np.ndarray) and data_tensor.ndim == 2:
-        arr = data_tensor.astype(np.int32)
+        # Create output array (start with copy of input to preserve NaN and special values)
+        converted = data_tensor.copy()
 
-        # Vectorized conversion for entire 2D array at once
-        converted = np.where(
-            np.isnan(data_tensor),  # Keep NaN as NaN
-            data_tensor,
-            np.where(
-                arr == -1,  # Keep -1 as -1
-                -1,
-                np.where(
-                    (arr >= 0) & (arr < list_len),  # Valid indices
-                    id_array[np.clip(arr, 0, list_len-1)],  # Convert to IDs
-                    data_tensor  # Out of bounds, keep original
-                )
-            )
-        )
+        # Create mask for valid indices (not NaN, not -1, within bounds)
+        # Use np.nan_to_num to avoid warning when comparing NaN
+        with np.errstate(invalid='ignore'):
+            is_valid_number = ~np.isnan(data_tensor)
 
-        # Count total conversions
-        valid_mask = ~np.isnan(data_tensor) & (arr >= 0) & (arr < list_len)
-        total_conversions = np.sum(valid_mask)
+        # Only process valid numbers
+        if np.any(is_valid_number):
+            valid_data = data_tensor[is_valid_number]
+            # Convert to int safely (NaN already filtered out)
+            valid_indices = valid_data.astype(np.int32)
 
-        # Convert to list - use numpy's optimized tolist()
-        # For very large arrays, this can be slow, but it's the most compatible format
-        result = converted.tolist()
+            # Find which ones need conversion (not -1, within bounds)
+            needs_conversion = (valid_indices >= 0) & (valid_indices < list_len)
+
+            # Count conversions
+            total_conversions = np.sum(needs_conversion)
+
+            # Apply conversion using fancy indexing (very fast)
+            if np.any(needs_conversion):
+                indices_to_convert = valid_indices[needs_conversion]
+                converted_values = id_array[indices_to_convert]
+
+                # Put converted values back into output array
+                # Create a temporary array for indexing
+                temp = converted[is_valid_number]
+                temp[needs_conversion] = converted_values
+                converted[is_valid_number] = temp
+        else:
+            total_conversions = 0
+
+        # OPTIMIZED: Return list of numpy arrays instead of list of lists
+        # This avoids the expensive .tolist() conversion while remaining compatible
+        # with list concatenation operations (e.g., local + received)
+        result = [converted[i] for i in range(len(converted))]
         t_end = time.time()
         print(f"[TIMING] convert_agent_indices_to_ids: {t_end - t_start:.4f} sec ({len(data_tensor)} agents, {total_conversions} index conversions)")
         return result
