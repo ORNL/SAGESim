@@ -34,20 +34,54 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
     :param agent_id_to_index_map: Dictionary mapping agent_id -> local_index
     :return: Same structure with IDs replaced by local indices (-1 if not found)
     """
+    # OPTIMIZATION: Build lookup arrays ONCE instead of for every agent!
+    id_keys = np.array(list(agent_id_to_index_map.keys()), dtype=np.int32)
+    id_values = np.array(list(agent_id_to_index_map.values()), dtype=np.int32)
+    min_id = id_keys.min()
+    max_id = id_keys.max()
+    id_range = max_id - min_id + 1
+
+    # Use dense array if not too sparse (< 3x overhead)
+    use_dense = id_range < len(agent_id_to_index_map) * 3
+    if use_dense:
+        lookup_array = np.full(id_range, -1, dtype=np.int32)
+        lookup_array[id_keys - min_id] = id_values
+    else:
+        # Sparse: use sorted arrays for binary search
+        sort_idx = np.argsort(id_keys)
+        sorted_keys = id_keys[sort_idx]
+        sorted_values = id_values[sort_idx]
+
     result = []
-    total_conversions = 0  # Count total ID conversions
     for agent_data in data_tensor:
         if isinstance(agent_data, np.ndarray):
-            # Optimized path for numpy arrays - convert to list once then use list comprehension
-            arr_list = agent_data.tolist()
-            converted_data = [
-                agent_id_to_index_map.get(int(v), -1)
-                if isinstance(v, (int, float)) and not (isinstance(v, float) and (v != v))  # v != v checks for NaN
-                else v
-                for v in arr_list
-            ]
-            total_conversions += len(arr_list)
-            result.append(converted_data)
+            # FULLY VECTORIZED: Use pre-built lookup arrays (built once above)
+
+            # Handle NaN values properly
+            arr = agent_data.astype(np.float64, copy=False)
+            valid_mask = ~np.isnan(arr)
+
+            # Initialize output with -1 (invalid index)
+            converted = np.full(arr.shape, -1, dtype=np.int32)
+
+            if np.any(valid_mask):
+                valid_ids = arr[valid_mask].astype(np.int32)
+
+                # Use pre-built lookup arrays
+                if use_dense:
+                    # Dense lookup: O(1) array indexing
+                    in_range = (valid_ids >= min_id) & (valid_ids <= max_id)
+                    indices = np.full(len(valid_ids), -1, dtype=np.int32)
+                    indices[in_range] = lookup_array[valid_ids[in_range] - min_id]
+                else:
+                    # Sparse IDs: use searchsorted (O(log n) per lookup)
+                    positions = np.searchsorted(sorted_keys, valid_ids)
+                    found = (positions < len(sorted_keys)) & (sorted_keys[positions] == valid_ids)
+                    indices = np.where(found, sorted_values[positions], -1)
+
+                converted[valid_mask] = indices
+
+            result.append(converted.tolist())
         elif isinstance(agent_data, (list, tuple, set)):
             # Handle collections (list, tuple, set) with multiple connections
             converted_data = []
@@ -66,11 +100,11 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
             if isinstance(agent_data, (int, float, np.integer, np.floating)):
                 if not np.isnan(agent_data):
                     result.append(agent_id_to_index_map.get(int(agent_data), -1))
-                    total_conversions += 1
                 else:
                     result.append(agent_data)
             else:
                 result.append(agent_data)
+
     return result
 
 
@@ -83,8 +117,6 @@ def convert_agent_indices_to_ids(data_tensor, agent_index_to_id_list):
     :param agent_index_to_id_list: List where agent_index_to_id_list[index] = agent_id
     :return: Same structure with indices replaced by agent IDs (-1 remains -1)
     """
-    total_conversions = 0  # Count total index conversions
-
     # Convert to numpy array for vectorized operations (much faster)
     id_array = np.array(agent_index_to_id_list, dtype=np.int32)
     list_len = len(agent_index_to_id_list)
@@ -108,9 +140,6 @@ def convert_agent_indices_to_ids(data_tensor, agent_index_to_id_list):
             # Find which ones need conversion (not -1, within bounds)
             needs_conversion = (valid_indices >= 0) & (valid_indices < list_len)
 
-            # Count conversions
-            total_conversions = np.sum(needs_conversion)
-
             # Apply conversion using fancy indexing (very fast)
             if np.any(needs_conversion):
                 indices_to_convert = valid_indices[needs_conversion]
@@ -121,8 +150,6 @@ def convert_agent_indices_to_ids(data_tensor, agent_index_to_id_list):
                 temp = converted[is_valid_number]
                 temp[needs_conversion] = converted_values
                 converted[is_valid_number] = temp
-        else:
-            total_conversions = 0
 
         # OPTIMIZED: Return list of numpy arrays instead of list of lists
         # This avoids the expensive .tolist() conversion while remaining compatible
@@ -152,10 +179,6 @@ def convert_agent_indices_to_ids(data_tensor, agent_index_to_id_list):
                 )
             )
 
-            # Count conversions (valid indices that were converted)
-            valid_mask = ~np.isnan(agent_data) & (arr >= 0) & (arr < list_len)
-            total_conversions += np.sum(valid_mask)
-
             result.append(converted.tolist())
         elif isinstance(agent_data, (list, tuple, set)):
             # Handle collections (list, tuple, set) with multiple connections
@@ -168,7 +191,6 @@ def convert_agent_indices_to_ids(data_tensor, agent_index_to_id_list):
                             converted_data.append(-1)
                         elif 0 <= idx < list_len:
                             converted_data.append(agent_index_to_id_list[idx])
-                            total_conversions += 1
                         else:
                             converted_data.append(value)
                     else:
@@ -185,7 +207,6 @@ def convert_agent_indices_to_ids(data_tensor, agent_index_to_id_list):
                         result.append(-1)
                     elif 0 <= idx < list_len:
                         result.append(agent_index_to_id_list[idx])
-                        total_conversions += 1
                     else:
                         result.append(agent_data)
                 else:
@@ -529,13 +550,12 @@ class Model:
         ]
 
         # Property 1 (locations) needs special handling: replace NaN with -1 and convert to int32
+        # OPTIMIZATION: Do this entirely on GPU to avoid CPU->GPU roundtrip
         locations_for_kernel = None
         if len(rank_local_agent_and_neighbor_adts) > 1:
             locations_gpu = rank_local_agent_and_neighbor_adts[1]
-            # Transfer to CPU, replace NaN with -1, convert to int32
-            locations_cpu = locations_gpu.get()
-            locations_np = np.where(np.isnan(locations_cpu), -1, locations_cpu)
-            locations_for_kernel = cp.array(locations_np, dtype=cp.int32)
+            # Do NaN replacement and conversion entirely on GPU using CuPy
+            locations_for_kernel = cp.where(cp.isnan(locations_gpu), -1, locations_gpu).astype(cp.int32)
 
         # Create write buffers for properties that need them
         write_buffers = []
@@ -585,6 +605,7 @@ class Model:
 
         # Update global tick counter after all threads have completed
         self.tick += sync_workers_every_n_ticks
+
         cp.get_default_memory_pool().free_all_blocks()
 
         # Convert GPU tensors back to CPU lists for next iteration
