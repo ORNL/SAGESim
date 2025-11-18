@@ -34,11 +34,56 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
     :param agent_id_to_index_map: Dictionary mapping agent_id -> local_index
     :return: Same structure with IDs replaced by local indices (-1 if not found)
     """
+    # OPTIMIZATION: Build lookup arrays ONCE instead of for every agent!
+    id_keys = np.array(list(agent_id_to_index_map.keys()), dtype=np.int32)
+    id_values = np.array(list(agent_id_to_index_map.values()), dtype=np.int32)
+    min_id = id_keys.min()
+    max_id = id_keys.max()
+    id_range = max_id - min_id + 1
+
+    # Use dense array if not too sparse (< 3x overhead)
+    use_dense = id_range < len(agent_id_to_index_map) * 3
+    if use_dense:
+        lookup_array = np.full(id_range, -1, dtype=np.int32)
+        lookup_array[id_keys - min_id] = id_values
+    else:
+        # Sparse: use sorted arrays for binary search
+        sort_idx = np.argsort(id_keys)
+        sorted_keys = id_keys[sort_idx]
+        sorted_values = id_values[sort_idx]
+
     result = []
     for agent_data in data_tensor:
-        # FIX: Also handle numpy arrays, not just lists/tuples/sets
-        if isinstance(agent_data, (list, tuple, set, np.ndarray)):
-            # Handle collections (list, tuple, set, numpy array) with multiple connections
+        if isinstance(agent_data, np.ndarray):
+            # FULLY VECTORIZED: Use pre-built lookup arrays (built once above)
+
+            # Handle NaN values properly
+            arr = agent_data.astype(np.float64, copy=False)
+            valid_mask = ~np.isnan(arr)
+
+            # Initialize output with -1 (invalid index)
+            converted = np.full(arr.shape, -1, dtype=np.int32)
+
+            if np.any(valid_mask):
+                valid_ids = arr[valid_mask].astype(np.int32)
+
+                # Use pre-built lookup arrays
+                if use_dense:
+                    # Dense lookup: O(1) array indexing
+                    in_range = (valid_ids >= min_id) & (valid_ids <= max_id)
+                    indices = np.full(len(valid_ids), -1, dtype=np.int32)
+                    indices[in_range] = lookup_array[valid_ids[in_range] - min_id]
+                else:
+                    # Sparse IDs: use searchsorted (O(log n) per lookup)
+                    positions = np.searchsorted(sorted_keys, valid_ids)
+                    found = (positions < len(sorted_keys)) & (sorted_keys[positions] == valid_ids)
+                    indices = np.where(found, sorted_values[positions], -1)
+
+                converted[valid_mask] = indices
+
+            result.append(converted.tolist())
+        elif isinstance(agent_data, (list, tuple, set)):
+            # Handle collections (list, tuple, set) with multiple connections
             converted_data = []
             for value in agent_data:
                 if isinstance(value, (int, float, np.integer, np.floating)):
@@ -59,7 +104,118 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
                     result.append(agent_data)
             else:
                 result.append(agent_data)
+
     return result
+
+
+def convert_agent_indices_to_ids(data_tensor, agent_index_to_id_list):
+    """
+    Convert local indices back to agent IDs in nested arrays.
+    This is the reverse operation of convert_agent_ids_to_indices.
+
+    :param data_tensor: Nested list/array structure containing local indices (can be 2D numpy array, list of arrays, or list of lists)
+    :param agent_index_to_id_list: List where agent_index_to_id_list[index] = agent_id
+    :return: Same structure with indices replaced by agent IDs (-1 remains -1)
+    """
+    # Convert to numpy array for vectorized operations (much faster)
+    id_array = np.array(agent_index_to_id_list, dtype=np.int32)
+    list_len = len(agent_index_to_id_list)
+
+    # FAST PATH: If data_tensor is already a 2D numpy array, vectorize everything
+    if isinstance(data_tensor, np.ndarray) and data_tensor.ndim == 2:
+        # Create output array (start with copy of input to preserve NaN and special values)
+        converted = data_tensor.copy()
+
+        # Create mask for valid indices (not NaN, not -1, within bounds)
+        # Use np.nan_to_num to avoid warning when comparing NaN
+        with np.errstate(invalid='ignore'):
+            is_valid_number = ~np.isnan(data_tensor)
+
+        # Only process valid numbers
+        if np.any(is_valid_number):
+            valid_data = data_tensor[is_valid_number]
+            # Convert to int safely (NaN already filtered out)
+            valid_indices = valid_data.astype(np.int32)
+
+            # Find which ones need conversion (not -1, within bounds)
+            needs_conversion = (valid_indices >= 0) & (valid_indices < list_len)
+
+            # Apply conversion using fancy indexing (very fast)
+            if np.any(needs_conversion):
+                indices_to_convert = valid_indices[needs_conversion]
+                converted_values = id_array[indices_to_convert]
+
+                # Put converted values back into output array
+                # Create a temporary array for indexing
+                temp = converted[is_valid_number]
+                temp[needs_conversion] = converted_values
+                converted[is_valid_number] = temp
+
+        # OPTIMIZED: Return list of numpy arrays instead of list of lists
+        # This avoids the expensive .tolist() conversion while remaining compatible
+        # with list concatenation operations (e.g., local + received)
+        result = [converted[i] for i in range(len(converted))]
+        return result
+
+    # SLOW PATH: For lists or mixed data structures, process row by row
+    result = []
+    for agent_data in data_tensor:
+        if isinstance(agent_data, np.ndarray):
+            # VECTORIZED path for numpy arrays - extremely fast
+            arr = agent_data.astype(np.int32)
+
+            # Create output array (start with original data)
+            converted = np.where(
+                np.isnan(agent_data),  # Keep NaN as NaN
+                agent_data,
+                np.where(
+                    arr == -1,  # Keep -1 as -1
+                    -1,
+                    np.where(
+                        (arr >= 0) & (arr < list_len),  # Valid indices
+                        id_array[np.clip(arr, 0, list_len-1)],  # Convert to IDs
+                        agent_data  # Out of bounds, keep original
+                    )
+                )
+            )
+
+            result.append(converted.tolist())
+        elif isinstance(agent_data, (list, tuple, set)):
+            # Handle collections (list, tuple, set) with multiple connections
+            converted_data = []
+            for value in agent_data:
+                if isinstance(value, (int, float, np.integer, np.floating)):
+                    if not np.isnan(value):
+                        idx = int(value)
+                        if idx == -1:
+                            converted_data.append(-1)
+                        elif 0 <= idx < list_len:
+                            converted_data.append(agent_index_to_id_list[idx])
+                        else:
+                            converted_data.append(value)
+                    else:
+                        converted_data.append(value)
+                else:
+                    converted_data.append(value)
+            result.append(converted_data)
+        else:
+            # Single value
+            if isinstance(agent_data, (int, float, np.integer, np.floating)):
+                if not np.isnan(agent_data):
+                    idx = int(agent_data)
+                    if idx == -1:
+                        result.append(-1)
+                    elif 0 <= idx < list_len:
+                        result.append(agent_index_to_id_list[idx])
+                    else:
+                        result.append(agent_data)
+                else:
+                    result.append(agent_data)
+            else:
+                result.append(agent_data)
+
+    return result
+
 
 comm = MPI.COMM_WORLD
 num_workers = comm.Get_size()
@@ -269,7 +425,6 @@ class Model:
         ticks: int,
         sync_workers_every_n_ticks: int = 1,
     ) -> None:
-        simulate_start = time.time()
         comm.barrier()
 
         # Step function is cached during setup() - no need to reimport
@@ -345,7 +500,6 @@ class Model:
             the simulation by
         :param agent_ids: agents to process by this cudakernel call
         """
-
         self.__rank_local_agent_ids = list(
             self._agent_factory._rank2agentid2agentidx[worker].keys()
         )
@@ -369,13 +523,6 @@ class Model:
             rank_local_agents_neighbors,
         )
 
-        rank_local_agent_and_neighbor_adts = [
-            convert_to_equal_side_tensor(
-                self.__rank_local_agent_data_tensors[i] + received_neighbor_adts[i]
-            )
-            for i in range(self._agent_factory.num_properties)
-        ]
-
         self._global_data_vector = cp.array(self._global_data_vector)
 
         # Create agent ID to local index mapping for fast lookups
@@ -384,28 +531,31 @@ class Model:
 
         rank_local_agent_and_non_local_neighbor_ids = cp.array(all_agent_ids_list)
 
-        # Convert agent IDs to local indices in locations array (property index 1)
-        # This eliminates the need for linear search in GPU kernels
+        # OPTIMIZATION: Convert agent IDs to indices on LISTS before GPU conversion
+        # This avoids GPU->CPU->GPU roundtrip and works on lists (faster than numpy arrays)
+        combined_lists = []
+        for i in range(self._agent_factory.num_properties):
+            combined = self.__rank_local_agent_data_tensors[i] + received_neighbor_adts[i]
 
-        # Property index 1 is 'locations' (neighbors/connections) - this is standard in SAGESim
-        # Keep original locations unchanged, create converted copy for kernel
+            if i == 1:  # Property 1 is 'locations' (neighbors/connections)
+                # Convert agent IDs to local indices while still a list
+                combined = convert_agent_ids_to_indices(combined, agent_id_to_index)
+
+            combined_lists.append(combined)
+
+        # Now convert all to GPU arrays (single CPU->GPU transfer per property)
+        rank_local_agent_and_neighbor_adts = [
+            convert_to_equal_side_tensor(combined_lists[i])
+            for i in range(self._agent_factory.num_properties)
+        ]
+
+        # Property 1 (locations) needs special handling: replace NaN with -1 and convert to int32
+        # OPTIMIZATION: Do this entirely on GPU to avoid CPU->GPU roundtrip
         locations_for_kernel = None
         if len(rank_local_agent_and_neighbor_adts) > 1:
-            original_locations = rank_local_agent_and_neighbor_adts[1]
-            # Convert on CPU (fast with hash map), then transfer to GPU
-            locations_cpu = original_locations if not isinstance(original_locations, cp.ndarray) else original_locations.get()
-
-            locations_as_indices = convert_agent_ids_to_indices(
-                locations_cpu, agent_id_to_index
-            )
-
-            # Convert to int32 array, replacing NaN with -1 for efficient indexing
-            # This allows users to directly use indices without int() casting
-            locations_np = np.array(locations_as_indices, dtype=np.float32)
-            locations_np = np.where(np.isnan(locations_np), -1, locations_np)
-
-            # Create new array for kernel - cast to int32
-            locations_for_kernel = cp.array(locations_np, dtype=cp.int32)
+            locations_gpu = rank_local_agent_and_neighbor_adts[1]
+            # Do NaN replacement and conversion entirely on GPU using CuPy
+            locations_for_kernel = cp.where(cp.isnan(locations_gpu), -1, locations_gpu).astype(cp.int32)
 
         # Create write buffers for properties that need them
         write_buffers = []
@@ -455,15 +605,28 @@ class Model:
 
         # Update global tick counter after all threads have completed
         self.tick += sync_workers_every_n_ticks
+
         cp.get_default_memory_pool().free_all_blocks()
 
         # Convert GPU tensors back to CPU lists for next iteration
-        gpu_to_cpu_start = time.time()
+        # Property 1 (locations) contains indices after GPU processing - convert back to agent IDs
         num_agents = len(self.__rank_local_agent_ids)
-        self.__rank_local_agent_data_tensors = [
-            rank_local_agent_and_neighbor_adts[i][:num_agents].tolist()
-            for i in range(self._agent_factory.num_properties)
-        ]
+        self.__rank_local_agent_data_tensors = []
+        for i in range(self._agent_factory.num_properties):
+            if i == 1:  # Property 1 is locations - convert indices back to IDs
+                # Keep as numpy array for fast vectorized conversion
+                gpu_data = rank_local_agent_and_neighbor_adts[i][:num_agents]
+                # Convert cupy to numpy if needed
+                if hasattr(gpu_data, 'get'):
+                    cpu_array = gpu_data.get()  # cupy -> numpy (2D array)
+                else:
+                    cpu_array = np.array(gpu_data) if not isinstance(gpu_data, np.ndarray) else gpu_data
+
+                # Pass numpy arrays (rows) to conversion function for vectorization
+                data = convert_agent_indices_to_ids(cpu_array, all_agent_ids_list)
+            else:
+                data = rank_local_agent_and_neighbor_adts[i][:num_agents].tolist()
+            self.__rank_local_agent_data_tensors.append(data)
 
         # CRITICAL FIX: Ensure all workers have finished processing before syncing neighbor data
         # Without this barrier, the next call to contextualize_agent_data_tensors() may see

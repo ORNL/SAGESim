@@ -261,20 +261,30 @@ class AgentFactory:
             3. agent_data_tensors_subcontexts: subcontext of agent_data_tensors
                 required by agents of agent_ids_chunks to be processed by a worker
         """
+        import math
         neighborrank2agentidandadt = {}
         neighborrankandagentidsvisited = set()
         num_agents_this_rank = len(agent_ids_chunk)
 
+        # OPTIMIZATION: Convert all_neighbors to lists ONCE to avoid slow numpy scalar iteration
+        if isinstance(all_neighbors, list) and len(all_neighbors) > 0 and isinstance(all_neighbors[0], np.ndarray):
+            # Convert numpy arrays to lists (much faster iteration)
+            all_neighbors_list = [arr.tolist() for arr in all_neighbors]
+        else:
+            all_neighbors_list = all_neighbors
+
         for agent_idx in range(num_agents_this_rank):
             agent_id = agent_ids_chunk[agent_idx]
             agent_adts = [adt[agent_idx] for adt in agent_data_tensors]
+            agent_neighbors = all_neighbors_list[agent_idx]
 
             # Check if this agent has neighbors on other workers
             has_cross_worker_neighbors = False
-            for neighbor_id in all_neighbors[agent_idx]:
-                if np.isnan(neighbor_id):
+            for neighbor_id in agent_neighbors:
+                # Use math.isnan for Python floats (faster than np.isnan)
+                if math.isnan(neighbor_id):
                     break
-                if int(neighbor_id) < 0:  # Skip invalid/external agent IDs (e.g., -1 for external inputs)
+                if int(neighbor_id) < 0:  # Skip invalid/external agent IDs
                     continue
                 neighbor_rank = self._agent2rank[int(neighbor_id)]
                 if neighbor_rank != worker:
@@ -292,6 +302,15 @@ class AgentFactory:
                     for prop_idx in range(self.num_properties):
                         current_property_adt = agent_adts[prop_idx]
                         previous_property_adt = self._prev_agent_data[agent_id][prop_idx]
+
+                        # OPTIMIZATION: Skip expensive comparison for large arrays (property 1 = locations)
+                        # Property 1 contains neighbor connections which can be very large (1000+ elements)
+                        # np.array_equal on these is too slow (27M element comparisons!)
+                        # Instead, always mark as changed for property 1 if it's a numpy array
+                        if prop_idx == 1 and isinstance(current_property_adt, np.ndarray):
+                            # Always send property 1 if it's a large numpy array
+                            agent_changed = True
+                            break
 
                         # Compare based on type to handle ordered (list) vs unordered (set) neighbors
                         properties_equal = False
@@ -317,15 +336,17 @@ class AgentFactory:
                         # and it has no neighbors on other workers
                         continue
 
-            for neighbor_id in all_neighbors[agent_idx]:
-                if np.isnan(neighbor_id):
+            # Build list of ranks this agent should be sent to
+            for neighbor_id in agent_neighbors:
+                if math.isnan(neighbor_id):
                     break
-                if int(neighbor_id) < 0:  # Skip invalid/external agent IDs (e.g., -1 for external inputs)
+                if int(neighbor_id) < 0:  # Skip invalid/external agent IDs
                     continue
                 neighbor_rank = self._agent2rank[int(neighbor_id)]
                 if neighbor_rank == worker:
                     # Don't send to self
                     continue
+
                 if (neighbor_rank, agent_id) not in neighborrankandagentidsvisited:
                     # Don't send the same agent to the same rank multiple times
                     neighborrankandagentidsvisited.add((neighbor_rank, agent_id))
@@ -421,6 +442,7 @@ class AgentFactory:
         received_data = []
         num_send_chunk_requests = len(send_chunk_requests)
         num_recv_chunk_requests = len(recv_chunk_requests)
+
         for i in range(max(num_send_chunk_requests, num_recv_chunk_requests)):
             if i < num_send_chunk_requests:
                 MPI.Request.waitall(send_chunk_requests[i])
