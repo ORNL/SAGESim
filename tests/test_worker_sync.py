@@ -211,12 +211,9 @@ if __name__ == "__main__":
     model = SIRModel(p_infection=1.0, p_recovery=1.0, enable_state_tracking=True)
     model.setup(use_gpu=True)
 
-    model_creation_start = time()
     model = generate_chain_of_agents(
         model, num_agents, num_infected=1, seed=random_seed
     )
-    model_creation_end = time()
-    model_creation_duration = model_creation_end - model_creation_start
 
     # Print which agents are assigned (non-ghost) to each worker
     # Use the framework's internal agent-to-rank mapping for accurate results
@@ -235,10 +232,7 @@ if __name__ == "__main__":
         print(f"Running with {num_workers} workers")
         print()
 
-    simulate_start = time()
     model.simulate(num_ticks, sync_workers_every_n_ticks=1)
-    simulate_end = time()
-    simulate_duration = simulate_end - simulate_start
 
     result = [
         int(model.get_agent_property_value(agent_id, property_name="state"))
@@ -275,8 +269,6 @@ if __name__ == "__main__":
                     writer.writerow([agent_id] + state_history_int)
 
         print(f"\nState history saved to test_worker_sync_results.csv")
-        print(f"Model creation duration: {model_creation_duration:.4f} seconds")
-        print(f"Simulation duration: {simulate_duration:.4f} seconds")
 
         # Print expected vs actual results
         print("\nExpected behavior with deterministic infection/recovery:")

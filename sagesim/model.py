@@ -34,7 +34,6 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
     :param agent_id_to_index_map: Dictionary mapping agent_id -> local_index
     :return: Same structure with IDs replaced by local indices (-1 if not found)
     """
-    t_start = time.time()
     result = []
     total_conversions = 0  # Count total ID conversions
     for agent_data in data_tensor:
@@ -72,8 +71,6 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
                     result.append(agent_data)
             else:
                 result.append(agent_data)
-    t_end = time.time()
-    print(f"[TIMING] convert_agent_ids_to_indices: {t_end - t_start:.4f} sec ({len(data_tensor)} agents, {total_conversions} ID conversions)")
     return result
 
 
@@ -86,7 +83,6 @@ def convert_agent_indices_to_ids(data_tensor, agent_index_to_id_list):
     :param agent_index_to_id_list: List where agent_index_to_id_list[index] = agent_id
     :return: Same structure with indices replaced by agent IDs (-1 remains -1)
     """
-    t_start = time.time()
     total_conversions = 0  # Count total index conversions
 
     # Convert to numpy array for vectorized operations (much faster)
@@ -132,8 +128,6 @@ def convert_agent_indices_to_ids(data_tensor, agent_index_to_id_list):
         # This avoids the expensive .tolist() conversion while remaining compatible
         # with list concatenation operations (e.g., local + received)
         result = [converted[i] for i in range(len(converted))]
-        t_end = time.time()
-        print(f"[TIMING] convert_agent_indices_to_ids: {t_end - t_start:.4f} sec ({len(data_tensor)} agents, {total_conversions} index conversions)")
         return result
 
     # SLOW PATH: For lists or mixed data structures, process row by row
@@ -199,8 +193,6 @@ def convert_agent_indices_to_ids(data_tensor, agent_index_to_id_list):
             else:
                 result.append(agent_data)
 
-    t_end = time.time()
-    print(f"[TIMING] convert_agent_indices_to_ids: {t_end - t_start:.4f} sec ({len(data_tensor)} agents, {total_conversions} index conversions)")
     return result
 
 
@@ -412,7 +404,6 @@ class Model:
         ticks: int,
         sync_workers_every_n_ticks: int = 1,
     ) -> None:
-        simulate_start = time.time()
         comm.barrier()
 
         # Step function is cached during setup() - no need to reimport
@@ -521,38 +512,23 @@ class Model:
 
         # OPTIMIZATION: Convert agent IDs to indices on LISTS before GPU conversion
         # This avoids GPU->CPU->GPU roundtrip and works on lists (faster than numpy arrays)
-        t1 = time.time()
         combined_lists = []
         for i in range(self._agent_factory.num_properties):
             combined = self.__rank_local_agent_data_tensors[i] + received_neighbor_adts[i]
 
             if i == 1:  # Property 1 is 'locations' (neighbors/connections)
-                # Diagnostic: Show data distribution
-                num_local = len(self.__rank_local_agent_data_tensors[i])
-                num_received = len(received_neighbor_adts[i])
-                num_total = len(combined)
-                print(f"[MPI Data] Local agents: {num_local}, Received neighbors: {num_received}, Total: {num_total}")
-
                 # Convert agent IDs to local indices while still a list
-                t_conv_start = time.time()
                 combined = convert_agent_ids_to_indices(combined, agent_id_to_index)
-                t_conv_end = time.time()
-                print(f"[TIMING] convert_agent_ids_to_indices (on lists): {t_conv_end - t_conv_start:.4f} sec")
 
             combined_lists.append(combined)
 
         # Now convert all to GPU arrays (single CPU->GPU transfer per property)
-        t2 = time.time()
         rank_local_agent_and_neighbor_adts = [
             convert_to_equal_side_tensor(combined_lists[i])
             for i in range(self._agent_factory.num_properties)
         ]
-        t3 = time.time()
-        print(f"[TIMING] convert_to_equal_side_tensor: {t3 - t2:.4f} sec")
-        print(f"[TIMING] Total prep before GPU: {t3 - t1:.4f} sec")
 
         # Property 1 (locations) needs special handling: replace NaN with -1 and convert to int32
-        t4 = time.time()
         locations_for_kernel = None
         if len(rank_local_agent_and_neighbor_adts) > 1:
             locations_gpu = rank_local_agent_and_neighbor_adts[1]
@@ -560,8 +536,6 @@ class Model:
             locations_cpu = locations_gpu.get()
             locations_np = np.where(np.isnan(locations_cpu), -1, locations_cpu)
             locations_for_kernel = cp.array(locations_np, dtype=cp.int32)
-        t5 = time.time()
-        print(f"[TIMING] NaN->-1 and int32 conversion: {t5 - t4:.4f} sec")
 
         # Create write buffers for properties that need them
         write_buffers = []
