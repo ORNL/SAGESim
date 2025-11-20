@@ -460,6 +460,15 @@ class AgentFactory:
                 required by agents of agent_ids_chunks to be processed by a worker
         """
         import math
+        import time
+        t_ctx_start = time.time()
+
+        # MPI operation counters
+        num_isend_ops = 0
+        num_irecv_ops = 0
+        total_bytes_sent = 0
+        total_bytes_recv = 0
+
         neighborrank2agentidandadt = {}
         neighborrankandagentidsvisited = set()
         num_agents_this_rank = len(agent_ids_chunk)
@@ -592,6 +601,8 @@ class AgentFactory:
                         tag=0,
                     )
                 )
+                num_isend_ops += 1
+                total_bytes_sent += sys.getsizeof(num_chunks)
             else:
                 # No data to send to this rank
                 torank2numchunks[to_rank] = 0
@@ -602,13 +613,18 @@ class AgentFactory:
                         tag=0,
                     )
                 )
+                num_isend_ops += 1
+                total_bytes_sent += sys.getsizeof(0)
         # Receive num_chunks from all ranks
         recvs_num_chunks_requests = []
         for from_rank in other_ranks_from:
             recvs_num_chunks_requests.append(comm.irecv(source=from_rank, tag=0))
+            num_irecv_ops += 1
 
+        t_before_wait1 = time.time()
         MPI.Request.waitall(sends_num_chunks)
         recvs_num_chunks = MPI.Request.waitall(recvs_num_chunks_requests)
+        t_after_wait1 = time.time()
 
         # Send the chunks
         send_chunk_requests = []
@@ -624,6 +640,8 @@ class AgentFactory:
                         dest=to_rank,
                         tag=i + 1,
                     )
+                    num_isend_ops += 1
+                    total_bytes_sent += sys.getsizeof(chunk)
                     if i >= len(send_chunk_requests):
                         send_chunk_requests.append([])
                     send_chunk_requests[i].append(send_chunk_request)
@@ -633,6 +651,7 @@ class AgentFactory:
             num_chunks = recvs_num_chunks[i]
             for j in range(num_chunks):
                 received_chunk_request = comm.irecv(source=from_rank, tag=j + 1)
+                num_irecv_ops += 1
                 if j >= len(recv_chunk_requests):
                     recv_chunk_requests.append([])
                 recv_chunk_requests[j].append(received_chunk_request)
@@ -641,6 +660,7 @@ class AgentFactory:
         num_send_chunk_requests = len(send_chunk_requests)
         num_recv_chunk_requests = len(recv_chunk_requests)
 
+        t_before_wait2 = time.time()
         for i in range(max(num_send_chunk_requests, num_recv_chunk_requests)):
             if i < num_send_chunk_requests:
                 MPI.Request.waitall(send_chunk_requests[i])
@@ -648,14 +668,26 @@ class AgentFactory:
                 received_data_ranks_chunk = MPI.Request.waitall(recv_chunk_requests[i])
                 for received_data_rank_chunk in received_data_ranks_chunk:
                     received_data.extend(received_data_rank_chunk)
+        t_after_wait2 = time.time()
 
         # Process received chunks
         received_neighbor_adts = [[] for _ in range(self.num_properties)]
         received_neighbor_ids = []
         for neighbor_idx, (neighbor_id, adts) in enumerate(received_data):
             received_neighbor_ids.append(neighbor_id)
+            total_bytes_recv += sys.getsizeof(neighbor_id) + sys.getsizeof(adts)
             for prop_idx in range(self.num_properties):
                 received_neighbor_adts[prop_idx].append(adts[prop_idx])
+
+        t_ctx_end = time.time()
+        if worker == 0:
+            total_agents_to_send = sum(len(v) for v in neighborrank2agentidandadt.values())
+            print(f"  [contextualize] Total time: {t_ctx_end - t_ctx_start:.3f}s")
+            print(f"  [contextualize] - Wait for chunk counts: {t_after_wait1 - t_before_wait1:.3f}s")
+            print(f"  [contextualize] - Wait for chunks: {t_after_wait2 - t_before_wait2:.3f}s")
+            print(f"  [contextualize] - Agents to send: {total_agents_to_send}, Received: {len(received_neighbor_ids)}")
+            print(f"  [MPI ops] isend: {num_isend_ops}, irecv: {num_irecv_ops}")
+            print(f"  [MPI data] Sent: {total_bytes_sent/1024/1024:.2f} MB, Recv: {total_bytes_recv/1024/1024:.2f} MB")
 
         return (
             agent_ids_chunk,

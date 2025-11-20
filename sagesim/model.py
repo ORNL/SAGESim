@@ -532,9 +532,16 @@ class Model:
             the simulation by
         :param agent_ids: agents to process by this cudakernel call
         """
+        import time
+        t_start = time.time()
+
         self.__rank_local_agent_ids = list(
             self._agent_factory._rank2agentid2agentidx[worker].keys()
         )
+
+        if worker == 0 and self.tick % 5 == 0:
+            print(f"[Rank {worker}] Tick {self.tick}: worker_coroutine started, local agents: {len(self.__rank_local_agent_ids)}")
+
         threadsperblock = 32
         blockspergrid = int(
             math.ceil(len(self.__rank_local_agent_ids) / threadsperblock)
@@ -544,6 +551,7 @@ class Model:
             self.__rank_local_agent_data_tensors[1]
         )
 
+        t_before_context = time.time()
         (
             self.__rank_local_agent_ids,
             self.__rank_local_agent_data_tensors,
@@ -554,6 +562,10 @@ class Model:
             self.__rank_local_agent_ids,
             rank_local_agents_neighbors,
         )
+        t_after_context = time.time()
+
+        if worker == 0 and self.tick % 5 == 0:
+            print(f"[Rank {worker}] Tick {self.tick}: contextualize took {t_after_context - t_before_context:.3f}s, received {len(received_neighbor_ids)} neighbor agents")
 
         self._global_data_vector = cp.array(self._global_data_vector)
 
@@ -664,7 +676,13 @@ class Model:
         # Without this barrier, the next call to contextualize_agent_data_tensors() may see
         # stale data from some workers that haven't finished their GPU kernels yet
         if num_workers > 1:
+            t_before_barrier = time.time()
+            if worker == 0 and self.tick % 5 == 0:
+                print(f"[Rank {worker}] Tick {self.tick}: entering barrier...")
             comm.barrier()
+            t_after_barrier = time.time()
+            if worker == 0 and self.tick % 5 == 0:
+                print(f"[Rank {worker}] Tick {self.tick}: barrier took {t_after_barrier - t_before_barrier:.3f}s")
 
         """worker_agent_and_neighbor_data_tensors = (
             self._agent_factory.reduce_agent_data_tensors(
@@ -677,6 +695,10 @@ class Model:
         self._global_data_vector = comm.allreduce(
             self._global_data_vector.tolist(), op=reduce_global_data_vector
         )
+
+        t_end = time.time()
+        if worker == 0 and self.tick % 5 == 0:
+            print(f"[Rank {worker}] Tick {self.tick}: worker_coroutine total time {t_end - t_start:.3f}s\n")
 
 
 def reduce_global_data_vector(A, B):
