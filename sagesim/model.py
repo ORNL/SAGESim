@@ -420,6 +420,25 @@ class Model:
         self.__rank_local_agent_data_tensors = (
             self._agent_factory._generate_agent_data_tensors()
         )
+
+        # Print agent distribution summary
+        if worker == 0:
+            total_agents = self._agent_factory._num_agents
+            agents_per_rank = {}
+            for agent_id in range(total_agents):
+                rank = self._agent_factory._agent2rank.get(agent_id, -1)
+                agents_per_rank[rank] = agents_per_rank.get(rank, 0) + 1
+
+            print(f"\n{'='*60}")
+            print(f"[SAGESim] Agent Distribution Across Workers")
+            print(f"{'='*60}")
+            print(f"Total agents: {total_agents}")
+            for rank in sorted(agents_per_rank.keys()):
+                count = agents_per_rank[rank]
+                percentage = (count / total_agents) * 100 if total_agents > 0 else 0
+                print(f"Rank {rank}: {count:5d} agents ({percentage:5.2f}%)")
+            print(f"{'='*60}\n")
+
         self._is_setup = True
 
     def reset(self) -> None:
