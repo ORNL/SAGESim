@@ -332,6 +332,19 @@ class Model:
     def register_reduce_function(self, reduce_func: Callable) -> None:
         self._reduce_func = reduce_func
 
+    def load_partition(self, partition_file: str, format: str = "auto") -> None:
+        """Load network partition from file to optimize multi-worker performance.
+
+        This method loads a pre-computed network partition that assigns agents to MPI ranks
+        to minimize cross-worker communication. Must be called BEFORE creating any agents.
+
+        For details on partition formats and usage, see AgentFactory.load_partition().
+
+        :param partition_file: Path to partition file
+        :param format: File format ('pickle', 'json', 'numpy', 'text', or 'auto')
+        """
+        self._agent_factory.load_partition(partition_file, format)
+
     def setup(self, use_gpu: bool = True) -> None:
         """
         Must be called before first simulate call.

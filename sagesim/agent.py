@@ -1,8 +1,11 @@
 from __future__ import annotations
-from typing import Any, Callable, Iterable, List, Dict
+from typing import Any, Callable, Iterable, List, Dict, Optional
 from collections import OrderedDict
 from copy import copy
 import sys
+import pickle
+import json
+from pathlib import Path
 
 import numpy as np
 from mpi4py import MPI
@@ -43,6 +46,8 @@ class AgentFactory:
         self._rank2agentid2agentidx = {}  # global
 
         self._current_rank = 0
+        self._partition_loaded = False  # Flag to track if partition is loaded
+        self._partition_mapping: Optional[Dict[int, int]] = None  # agent_id -> rank mapping
 
         self._prev_agent_data = {}
 
@@ -53,6 +58,187 @@ class AgentFactory:
         the cache check happens before GPU kernel execution in the same tick.
         """
         self._prev_agent_data = {}
+
+    def load_partition_from_dict(self, partition_dict: Dict[int, int]) -> None:
+        """Load partition directly from a dictionary (no file I/O).
+
+        This is useful for dynamic networks where partitions are regenerated frequently.
+
+        :param partition_dict: Dictionary mapping agent_id -> rank
+        :raises ValueError: If partition is loaded after agents are created
+        """
+        if self._num_agents > 0:
+            raise ValueError(
+                "Partition must be loaded BEFORE creating any agents. "
+                f"Currently {self._num_agents} agents already exist."
+            )
+
+        # Validate partition
+        if not partition_dict:
+            raise ValueError("Partition dictionary is empty")
+
+        # Check that ranks are valid (0 to num_workers-1)
+        invalid_ranks = {r for r in partition_dict.values() if r < 0 or r >= num_workers}
+        if invalid_ranks:
+            raise ValueError(
+                f"Partition contains invalid ranks: {sorted(invalid_ranks)}. "
+                f"Valid ranks are 0 to {num_workers-1} (num_workers={num_workers})"
+            )
+
+        self._partition_mapping = partition_dict
+        self._partition_loaded = True
+
+        if worker == 0:
+            num_agents_in_partition = len(partition_dict)
+            agents_per_rank = {}
+            for agent_id, rank in partition_dict.items():
+                agents_per_rank[rank] = agents_per_rank.get(rank, 0) + 1
+
+            print(f"[SAGESim] Loaded partition from dictionary")
+            print(f"[SAGESim] Number of agents in partition: {num_agents_in_partition}")
+            print(f"[SAGESim] Agents per rank: {dict(sorted(agents_per_rank.items()))}")
+
+    def load_partition(self, partition_file: str, format: str = "auto") -> None:
+        """Load network partition from file.
+
+        This method loads a pre-computed network partition that maps agent IDs to MPI ranks.
+        When a partition is loaded, agents will be assigned to ranks according to the partition
+        instead of using round-robin assignment. This can significantly reduce cross-worker
+        communication overhead (see SAGESIM_OVERHEAD_ANALYSIS.md).
+
+        Must be called BEFORE creating any agents.
+
+        Supported formats:
+        - 'pickle': Python pickle format - Dict[int, int] mapping agent_id -> rank
+        - 'json': JSON format - {"agent_id": rank, ...}
+        - 'numpy': NumPy format (.npy) - 1D array where index=agent_id, value=rank
+        - 'text': Plain text format - one line per agent: "agent_id rank"
+        - 'auto': Automatically detect format from file extension
+
+        Example pickle format:
+            {0: 0, 1: 0, 2: 1, 3: 1, ...}  # Agent 0,1 on rank 0; Agent 2,3 on rank 1
+
+        Example text format:
+            0 0
+            1 0
+            2 1
+            3 1
+
+        :param partition_file: Path to partition file
+        :param format: File format ('pickle', 'json', 'numpy', 'text', or 'auto')
+        :raises ValueError: If partition file is loaded after agents are created
+        :raises FileNotFoundError: If partition file does not exist
+        :raises ValueError: If partition format is invalid
+        """
+        if self._num_agents > 0:
+            raise ValueError(
+                "Partition must be loaded BEFORE creating any agents. "
+                f"Currently {self._num_agents} agents already exist."
+            )
+
+        partition_path = Path(partition_file)
+        if not partition_path.exists():
+            raise FileNotFoundError(f"Partition file not found: {partition_file}")
+
+        # Auto-detect format from extension
+        if format == "auto":
+            suffix = partition_path.suffix.lower()
+            if suffix == ".pkl" or suffix == ".pickle":
+                format = "pickle"
+            elif suffix == ".json":
+                format = "json"
+            elif suffix == ".npy":
+                format = "numpy"
+            elif suffix == ".txt" or suffix == ".dat":
+                format = "text"
+            else:
+                raise ValueError(
+                    f"Cannot auto-detect format for extension '{suffix}'. "
+                    "Please specify format explicitly."
+                )
+
+        # Load partition based on format
+        if format == "pickle":
+            with open(partition_path, "rb") as f:
+                partition_mapping = pickle.load(f)
+            if not isinstance(partition_mapping, dict):
+                raise ValueError(
+                    f"Pickle partition must be Dict[int, int], got {type(partition_mapping)}"
+                )
+        elif format == "json":
+            with open(partition_path, "r") as f:
+                raw_mapping = json.load(f)
+            # Convert string keys to int if needed
+            partition_mapping = {int(k): int(v) for k, v in raw_mapping.items()}
+        elif format == "numpy":
+            partition_array = np.load(partition_path)
+            if partition_array.ndim != 1:
+                raise ValueError(
+                    f"NumPy partition must be 1D array, got shape {partition_array.shape}"
+                )
+            # Convert array to dict: index -> value
+            partition_mapping = {i: int(rank) for i, rank in enumerate(partition_array)}
+        elif format == "text":
+            partition_mapping = {}
+            with open(partition_path, "r") as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue  # Skip empty lines and comments
+                    parts = line.split()
+                    if len(parts) != 2:
+                        raise ValueError(
+                            f"Invalid text partition format at line {line_num}: '{line}'. "
+                            "Expected 'agent_id rank'"
+                        )
+                    try:
+                        agent_id = int(parts[0])
+                        rank = int(parts[1])
+                        partition_mapping[agent_id] = rank
+                    except ValueError as e:
+                        raise ValueError(
+                            f"Invalid integer at line {line_num}: '{line}'. Error: {e}"
+                        )
+        else:
+            raise ValueError(
+                f"Unknown partition format: '{format}'. "
+                "Supported formats: 'pickle', 'json', 'numpy', 'text', 'auto'"
+            )
+
+        # Validate partition
+        if not partition_mapping:
+            raise ValueError("Partition file is empty or contains no valid mappings")
+
+        # Check that ranks are valid (0 to num_workers-1)
+        invalid_ranks = {r for r in partition_mapping.values() if r < 0 or r >= num_workers}
+        if invalid_ranks:
+            raise ValueError(
+                f"Partition contains invalid ranks: {sorted(invalid_ranks)}. "
+                f"Valid ranks are 0 to {num_workers-1} (num_workers={num_workers})"
+            )
+
+        self._partition_mapping = partition_mapping
+        self._partition_loaded = True
+
+        if worker == 0:
+            num_agents_in_partition = len(partition_mapping)
+            agents_per_rank = {}
+            for agent_id, rank in partition_mapping.items():
+                agents_per_rank[rank] = agents_per_rank.get(rank, 0) + 1
+
+            print(f"[SAGESim] Loaded network partition from: {partition_file}")
+            print(f"[SAGESim] Partition format: {format}")
+            print(f"[SAGESim] Number of agents in partition: {num_agents_in_partition}")
+            print(f"[SAGESim] Agents per rank: {dict(sorted(agents_per_rank.items()))}")
+
+            # Calculate partition quality metrics
+            max_agents = max(agents_per_rank.values()) if agents_per_rank else 0
+            min_agents = min(agents_per_rank.values()) if agents_per_rank else 0
+            avg_agents = num_agents_in_partition / num_workers if num_workers > 0 else 0
+            imbalance = (max_agents - min_agents) / avg_agents if avg_agents > 0 else 0
+
+            print(f"[SAGESim] Load balance - Max: {max_agents}, Min: {min_agents}, "
+                  f"Avg: {avg_agents:.1f}, Imbalance: {imbalance:.2%}")
 
     @property
     def breeds(self) -> List[Breed]:
@@ -118,21 +304,28 @@ class AgentFactory:
         """
 
         agent_id = self._num_agents
-        # Assign agents to rank in round robin fashion across available workers.
-        self._agent2rank[agent_id] = self._current_rank
+
+        # Assign agent to rank: use partition if loaded, otherwise round-robin
+        if self._partition_loaded and agent_id in self._partition_mapping:
+            # Use pre-loaded partition
+            assigned_rank = self._partition_mapping[agent_id]
+        else:
+            # Fall back to round-robin assignment
+            assigned_rank = self._current_rank
+            self._current_rank += 1
+            if self._current_rank >= num_workers:
+                self._current_rank = 0
+
+        self._agent2rank[agent_id] = assigned_rank
         agentid2agentidx_of_current_rank = self._rank2agentid2agentidx.get(
-            self._current_rank, OrderedDict()
+            assigned_rank, OrderedDict()
         )
         agentid2agentidx_of_current_rank[agent_id] = len(
             self._property_name_2_agent_data_tensor["locations"]
         )
-        self._rank2agentid2agentidx[self._current_rank] = (
+        self._rank2agentid2agentidx[assigned_rank] = (
             agentid2agentidx_of_current_rank
         )
-
-        self._current_rank += 1
-        if self._current_rank >= num_workers:
-            self._current_rank = 0
 
         if worker == self._agent2rank[agent_id]:
             # Only the worker that owns this agent will create and store the agent data.
