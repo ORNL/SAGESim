@@ -309,9 +309,14 @@ class AgentFactory:
         if self._partition_loaded and agent_id in self._partition_mapping:
             # Use pre-loaded partition
             assigned_rank = self._partition_mapping[agent_id]
+            # Debug: Print first few partition assignments
+            if agent_id < 5 and worker == 0:
+                print(f"[SAGESim] Agent {agent_id} assigned to rank {assigned_rank} (from METIS partition)")
         else:
             # Fall back to round-robin assignment
             assigned_rank = self._current_rank
+            if agent_id < 5 and worker == 0:
+                print(f"[SAGESim] Agent {agent_id} assigned to rank {assigned_rank} (round-robin)")
             self._current_rank += 1
             if self._current_rank >= num_workers:
                 self._current_rank = 0
