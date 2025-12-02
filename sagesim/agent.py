@@ -680,14 +680,14 @@ class AgentFactory:
                 received_neighbor_adts[prop_idx].append(adts[prop_idx])
 
         t_ctx_end = time.time()
-        if worker == 0:
-            total_agents_to_send = sum(len(v) for v in neighborrank2agentidandadt.values())
-            print(f"  [contextualize] Total time: {t_ctx_end - t_ctx_start:.3f}s")
-            print(f"  [contextualize] - Wait for chunk counts: {t_after_wait1 - t_before_wait1:.3f}s")
-            print(f"  [contextualize] - Wait for chunks: {t_after_wait2 - t_before_wait2:.3f}s")
-            print(f"  [contextualize] - Agents to send: {total_agents_to_send}, Received: {len(received_neighbor_ids)}")
-            print(f"  [MPI ops] isend: {num_isend_ops}, irecv: {num_irecv_ops}")
-            print(f"  [MPI data] Sent: {total_bytes_sent/1024/1024:.2f} MB, Recv: {total_bytes_recv/1024/1024:.2f} MB")
+        # Print from BOTH workers to understand load imbalance
+        total_agents_to_send = sum(len(v) for v in neighborrank2agentidandadt.values())
+        print(f"  [Rank {worker}] [contextualize] Total time: {t_ctx_end - t_ctx_start:.3f}s")
+        print(f"  [Rank {worker}] [contextualize] - Wait for chunk counts: {t_after_wait1 - t_before_wait1:.3f}s")
+        print(f"  [Rank {worker}] [contextualize] - Wait for chunks: {t_after_wait2 - t_before_wait2:.3f}s")
+        print(f"  [Rank {worker}] [contextualize] - Agents to send: {total_agents_to_send}, Received: {len(received_neighbor_ids)}")
+        print(f"  [Rank {worker}] [MPI ops] isend: {num_isend_ops}, irecv: {num_irecv_ops}")
+        print(f"  [Rank {worker}] [MPI data] Sent: {total_bytes_sent/1024/1024:.2f} MB, Recv: {total_bytes_recv/1024/1024:.2f} MB")
 
         return (
             agent_ids_chunk,
