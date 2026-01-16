@@ -332,6 +332,19 @@ class Model:
     def register_reduce_function(self, reduce_func: Callable) -> None:
         self._reduce_func = reduce_func
 
+    def load_partition(self, partition_file: str, format: str = "auto") -> None:
+        """Load network partition from file to optimize multi-worker performance.
+
+        This method loads a pre-computed network partition that assigns agents to MPI ranks
+        to minimize cross-worker communication. Must be called BEFORE creating any agents.
+
+        For details on partition formats and usage, see AgentFactory.load_partition().
+
+        :param partition_file: Path to partition file
+        :param format: File format ('pickle', 'json', 'numpy', 'text', or 'auto')
+        """
+        self._agent_factory.load_partition(partition_file, format)
+
     def setup(self, use_gpu: bool = True) -> None:
         """
         Must be called before first simulate call.
@@ -407,6 +420,25 @@ class Model:
         self.__rank_local_agent_data_tensors = (
             self._agent_factory._generate_agent_data_tensors()
         )
+
+        # Print agent distribution summary
+        if worker == 0:
+            total_agents = self._agent_factory._num_agents
+            agents_per_rank = {}
+            for agent_id in range(total_agents):
+                rank = self._agent_factory._agent2rank.get(agent_id, -1)
+                agents_per_rank[rank] = agents_per_rank.get(rank, 0) + 1
+
+            print(f"\n{'='*60}")
+            print(f"[SAGESim] Agent Distribution Across Workers")
+            print(f"{'='*60}")
+            print(f"Total agents: {total_agents}")
+            for rank in sorted(agents_per_rank.keys()):
+                count = agents_per_rank[rank]
+                percentage = (count / total_agents) * 100 if total_agents > 0 else 0
+                print(f"Rank {rank}: {count:5d} agents ({percentage:5.2f}%)")
+            print(f"{'='*60}\n")
+
         self._is_setup = True
 
     def reset(self) -> None:
@@ -500,9 +532,16 @@ class Model:
             the simulation by
         :param agent_ids: agents to process by this cudakernel call
         """
+        import time
+        t_start = time.time()
+
         self.__rank_local_agent_ids = list(
             self._agent_factory._rank2agentid2agentidx[worker].keys()
         )
+
+        if self.tick % 5 == 0:
+            print(f"[Rank {worker}] Tick {self.tick}: worker_coroutine started, local agents: {len(self.__rank_local_agent_ids)}")
+
         threadsperblock = 32
         blockspergrid = int(
             math.ceil(len(self.__rank_local_agent_ids) / threadsperblock)
@@ -512,6 +551,7 @@ class Model:
             self.__rank_local_agent_data_tensors[1]
         )
 
+        t_before_context = time.time()
         (
             self.__rank_local_agent_ids,
             self.__rank_local_agent_data_tensors,
@@ -522,6 +562,10 @@ class Model:
             self.__rank_local_agent_ids,
             rank_local_agents_neighbors,
         )
+        t_after_context = time.time()
+
+        if self.tick % 5 == 0:
+            print(f"[Rank {worker}] Tick {self.tick}: contextualize took {t_after_context - t_before_context:.3f}s, received {len(received_neighbor_ids)} neighbor agents")
 
         self._global_data_vector = cp.array(self._global_data_vector)
 
@@ -632,7 +676,13 @@ class Model:
         # Without this barrier, the next call to contextualize_agent_data_tensors() may see
         # stale data from some workers that haven't finished their GPU kernels yet
         if num_workers > 1:
+            t_before_barrier = time.time()
+            if self.tick % 5 == 0:
+                print(f"[Rank {worker}] Tick {self.tick}: entering barrier...")
             comm.barrier()
+            t_after_barrier = time.time()
+            if self.tick % 5 == 0:
+                print(f"[Rank {worker}] Tick {self.tick}: barrier took {t_after_barrier - t_before_barrier:.3f}s")
 
         """worker_agent_and_neighbor_data_tensors = (
             self._agent_factory.reduce_agent_data_tensors(
@@ -645,6 +695,10 @@ class Model:
         self._global_data_vector = comm.allreduce(
             self._global_data_vector.tolist(), op=reduce_global_data_vector
         )
+
+        t_end = time.time()
+        if self.tick % 5 == 0:
+            print(f"[Rank {worker}] Tick {self.tick}: worker_coroutine total time {t_end - t_start:.3f}s\n")
 
 
 def reduce_global_data_vector(A, B):

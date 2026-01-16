@@ -1,8 +1,11 @@
 from __future__ import annotations
-from typing import Any, Callable, Iterable, List, Dict
+from typing import Any, Callable, Iterable, List, Dict, Optional
 from collections import OrderedDict
 from copy import copy
 import sys
+import pickle
+import json
+from pathlib import Path
 
 import numpy as np
 from mpi4py import MPI
@@ -43,6 +46,8 @@ class AgentFactory:
         self._rank2agentid2agentidx = {}  # global
 
         self._current_rank = 0
+        self._partition_loaded = False  # Flag to track if partition is loaded
+        self._partition_mapping: Optional[Dict[int, int]] = None  # agent_id -> rank mapping
 
         self._prev_agent_data = {}
 
@@ -53,6 +58,187 @@ class AgentFactory:
         the cache check happens before GPU kernel execution in the same tick.
         """
         self._prev_agent_data = {}
+
+    def load_partition_from_dict(self, partition_dict: Dict[int, int]) -> None:
+        """Load partition directly from a dictionary (no file I/O).
+
+        This is useful for dynamic networks where partitions are regenerated frequently.
+
+        :param partition_dict: Dictionary mapping agent_id -> rank
+        :raises ValueError: If partition is loaded after agents are created
+        """
+        if self._num_agents > 0:
+            raise ValueError(
+                "Partition must be loaded BEFORE creating any agents. "
+                f"Currently {self._num_agents} agents already exist."
+            )
+
+        # Validate partition
+        if not partition_dict:
+            raise ValueError("Partition dictionary is empty")
+
+        # Check that ranks are valid (0 to num_workers-1)
+        invalid_ranks = {r for r in partition_dict.values() if r < 0 or r >= num_workers}
+        if invalid_ranks:
+            raise ValueError(
+                f"Partition contains invalid ranks: {sorted(invalid_ranks)}. "
+                f"Valid ranks are 0 to {num_workers-1} (num_workers={num_workers})"
+            )
+
+        self._partition_mapping = partition_dict
+        self._partition_loaded = True
+
+        if worker == 0:
+            num_agents_in_partition = len(partition_dict)
+            agents_per_rank = {}
+            for agent_id, rank in partition_dict.items():
+                agents_per_rank[rank] = agents_per_rank.get(rank, 0) + 1
+
+            print(f"[SAGESim] Loaded partition from dictionary")
+            print(f"[SAGESim] Number of agents in partition: {num_agents_in_partition}")
+            print(f"[SAGESim] Agents per rank: {dict(sorted(agents_per_rank.items()))}")
+
+    def load_partition(self, partition_file: str, format: str = "auto") -> None:
+        """Load network partition from file.
+
+        This method loads a pre-computed network partition that maps agent IDs to MPI ranks.
+        When a partition is loaded, agents will be assigned to ranks according to the partition
+        instead of using round-robin assignment. This can significantly reduce cross-worker
+        communication overhead (see SAGESIM_OVERHEAD_ANALYSIS.md).
+
+        Must be called BEFORE creating any agents.
+
+        Supported formats:
+        - 'pickle': Python pickle format - Dict[int, int] mapping agent_id -> rank
+        - 'json': JSON format - {"agent_id": rank, ...}
+        - 'numpy': NumPy format (.npy) - 1D array where index=agent_id, value=rank
+        - 'text': Plain text format - one line per agent: "agent_id rank"
+        - 'auto': Automatically detect format from file extension
+
+        Example pickle format:
+            {0: 0, 1: 0, 2: 1, 3: 1, ...}  # Agent 0,1 on rank 0; Agent 2,3 on rank 1
+
+        Example text format:
+            0 0
+            1 0
+            2 1
+            3 1
+
+        :param partition_file: Path to partition file
+        :param format: File format ('pickle', 'json', 'numpy', 'text', or 'auto')
+        :raises ValueError: If partition file is loaded after agents are created
+        :raises FileNotFoundError: If partition file does not exist
+        :raises ValueError: If partition format is invalid
+        """
+        if self._num_agents > 0:
+            raise ValueError(
+                "Partition must be loaded BEFORE creating any agents. "
+                f"Currently {self._num_agents} agents already exist."
+            )
+
+        partition_path = Path(partition_file)
+        if not partition_path.exists():
+            raise FileNotFoundError(f"Partition file not found: {partition_file}")
+
+        # Auto-detect format from extension
+        if format == "auto":
+            suffix = partition_path.suffix.lower()
+            if suffix == ".pkl" or suffix == ".pickle":
+                format = "pickle"
+            elif suffix == ".json":
+                format = "json"
+            elif suffix == ".npy":
+                format = "numpy"
+            elif suffix == ".txt" or suffix == ".dat":
+                format = "text"
+            else:
+                raise ValueError(
+                    f"Cannot auto-detect format for extension '{suffix}'. "
+                    "Please specify format explicitly."
+                )
+
+        # Load partition based on format
+        if format == "pickle":
+            with open(partition_path, "rb") as f:
+                partition_mapping = pickle.load(f)
+            if not isinstance(partition_mapping, dict):
+                raise ValueError(
+                    f"Pickle partition must be Dict[int, int], got {type(partition_mapping)}"
+                )
+        elif format == "json":
+            with open(partition_path, "r") as f:
+                raw_mapping = json.load(f)
+            # Convert string keys to int if needed
+            partition_mapping = {int(k): int(v) for k, v in raw_mapping.items()}
+        elif format == "numpy":
+            partition_array = np.load(partition_path)
+            if partition_array.ndim != 1:
+                raise ValueError(
+                    f"NumPy partition must be 1D array, got shape {partition_array.shape}"
+                )
+            # Convert array to dict: index -> value
+            partition_mapping = {i: int(rank) for i, rank in enumerate(partition_array)}
+        elif format == "text":
+            partition_mapping = {}
+            with open(partition_path, "r") as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue  # Skip empty lines and comments
+                    parts = line.split()
+                    if len(parts) != 2:
+                        raise ValueError(
+                            f"Invalid text partition format at line {line_num}: '{line}'. "
+                            "Expected 'agent_id rank'"
+                        )
+                    try:
+                        agent_id = int(parts[0])
+                        rank = int(parts[1])
+                        partition_mapping[agent_id] = rank
+                    except ValueError as e:
+                        raise ValueError(
+                            f"Invalid integer at line {line_num}: '{line}'. Error: {e}"
+                        )
+        else:
+            raise ValueError(
+                f"Unknown partition format: '{format}'. "
+                "Supported formats: 'pickle', 'json', 'numpy', 'text', 'auto'"
+            )
+
+        # Validate partition
+        if not partition_mapping:
+            raise ValueError("Partition file is empty or contains no valid mappings")
+
+        # Check that ranks are valid (0 to num_workers-1)
+        invalid_ranks = {r for r in partition_mapping.values() if r < 0 or r >= num_workers}
+        if invalid_ranks:
+            raise ValueError(
+                f"Partition contains invalid ranks: {sorted(invalid_ranks)}. "
+                f"Valid ranks are 0 to {num_workers-1} (num_workers={num_workers})"
+            )
+
+        self._partition_mapping = partition_mapping
+        self._partition_loaded = True
+
+        if worker == 0:
+            num_agents_in_partition = len(partition_mapping)
+            agents_per_rank = {}
+            for agent_id, rank in partition_mapping.items():
+                agents_per_rank[rank] = agents_per_rank.get(rank, 0) + 1
+
+            print(f"[SAGESim] Loaded network partition from: {partition_file}")
+            print(f"[SAGESim] Partition format: {format}")
+            print(f"[SAGESim] Number of agents in partition: {num_agents_in_partition}")
+            print(f"[SAGESim] Agents per rank: {dict(sorted(agents_per_rank.items()))}")
+
+            # Calculate partition quality metrics
+            max_agents = max(agents_per_rank.values()) if agents_per_rank else 0
+            min_agents = min(agents_per_rank.values()) if agents_per_rank else 0
+            avg_agents = num_agents_in_partition / num_workers if num_workers > 0 else 0
+            imbalance = (max_agents - min_agents) / avg_agents if avg_agents > 0 else 0
+
+            print(f"[SAGESim] Load balance - Max: {max_agents}, Min: {min_agents}, "
+                  f"Avg: {avg_agents:.1f}, Imbalance: {imbalance:.2%}")
 
     @property
     def breeds(self) -> List[Breed]:
@@ -118,21 +304,33 @@ class AgentFactory:
         """
 
         agent_id = self._num_agents
-        # Assign agents to rank in round robin fashion across available workers.
-        self._agent2rank[agent_id] = self._current_rank
+
+        # Assign agent to rank: use partition if loaded, otherwise round-robin
+        if self._partition_loaded and agent_id in self._partition_mapping:
+            # Use pre-loaded partition
+            assigned_rank = self._partition_mapping[agent_id]
+            # Debug: Print first few partition assignments
+            if agent_id < 5 and worker == 0:
+                print(f"[SAGESim] Agent {agent_id} assigned to rank {assigned_rank} (from METIS partition)")
+        else:
+            # Fall back to round-robin assignment
+            assigned_rank = self._current_rank
+            if agent_id < 5 and worker == 0:
+                print(f"[SAGESim] Agent {agent_id} assigned to rank {assigned_rank} (round-robin)")
+            self._current_rank += 1
+            if self._current_rank >= num_workers:
+                self._current_rank = 0
+
+        self._agent2rank[agent_id] = assigned_rank
         agentid2agentidx_of_current_rank = self._rank2agentid2agentidx.get(
-            self._current_rank, OrderedDict()
+            assigned_rank, OrderedDict()
         )
         agentid2agentidx_of_current_rank[agent_id] = len(
             self._property_name_2_agent_data_tensor["locations"]
         )
-        self._rank2agentid2agentidx[self._current_rank] = (
+        self._rank2agentid2agentidx[assigned_rank] = (
             agentid2agentidx_of_current_rank
         )
-
-        self._current_rank += 1
-        if self._current_rank >= num_workers:
-            self._current_rank = 0
 
         if worker == self._agent2rank[agent_id]:
             # Only the worker that owns this agent will create and store the agent data.
@@ -262,6 +460,15 @@ class AgentFactory:
                 required by agents of agent_ids_chunks to be processed by a worker
         """
         import math
+        import time
+        t_ctx_start = time.time()
+
+        # MPI operation counters
+        num_isend_ops = 0
+        num_irecv_ops = 0
+        total_bytes_sent = 0
+        total_bytes_recv = 0
+
         neighborrank2agentidandadt = {}
         neighborrankandagentidsvisited = set()
         num_agents_this_rank = len(agent_ids_chunk)
@@ -394,6 +601,8 @@ class AgentFactory:
                         tag=0,
                     )
                 )
+                num_isend_ops += 1
+                total_bytes_sent += sys.getsizeof(num_chunks)
             else:
                 # No data to send to this rank
                 torank2numchunks[to_rank] = 0
@@ -404,13 +613,18 @@ class AgentFactory:
                         tag=0,
                     )
                 )
+                num_isend_ops += 1
+                total_bytes_sent += sys.getsizeof(0)
         # Receive num_chunks from all ranks
         recvs_num_chunks_requests = []
         for from_rank in other_ranks_from:
             recvs_num_chunks_requests.append(comm.irecv(source=from_rank, tag=0))
+            num_irecv_ops += 1
 
+        t_before_wait1 = time.time()
         MPI.Request.waitall(sends_num_chunks)
         recvs_num_chunks = MPI.Request.waitall(recvs_num_chunks_requests)
+        t_after_wait1 = time.time()
 
         # Send the chunks
         send_chunk_requests = []
@@ -426,6 +640,8 @@ class AgentFactory:
                         dest=to_rank,
                         tag=i + 1,
                     )
+                    num_isend_ops += 1
+                    total_bytes_sent += sys.getsizeof(chunk)
                     if i >= len(send_chunk_requests):
                         send_chunk_requests.append([])
                     send_chunk_requests[i].append(send_chunk_request)
@@ -435,6 +651,7 @@ class AgentFactory:
             num_chunks = recvs_num_chunks[i]
             for j in range(num_chunks):
                 received_chunk_request = comm.irecv(source=from_rank, tag=j + 1)
+                num_irecv_ops += 1
                 if j >= len(recv_chunk_requests):
                     recv_chunk_requests.append([])
                 recv_chunk_requests[j].append(received_chunk_request)
@@ -443,6 +660,7 @@ class AgentFactory:
         num_send_chunk_requests = len(send_chunk_requests)
         num_recv_chunk_requests = len(recv_chunk_requests)
 
+        t_before_wait2 = time.time()
         for i in range(max(num_send_chunk_requests, num_recv_chunk_requests)):
             if i < num_send_chunk_requests:
                 MPI.Request.waitall(send_chunk_requests[i])
@@ -450,14 +668,26 @@ class AgentFactory:
                 received_data_ranks_chunk = MPI.Request.waitall(recv_chunk_requests[i])
                 for received_data_rank_chunk in received_data_ranks_chunk:
                     received_data.extend(received_data_rank_chunk)
+        t_after_wait2 = time.time()
 
         # Process received chunks
         received_neighbor_adts = [[] for _ in range(self.num_properties)]
         received_neighbor_ids = []
         for neighbor_idx, (neighbor_id, adts) in enumerate(received_data):
             received_neighbor_ids.append(neighbor_id)
+            total_bytes_recv += sys.getsizeof(neighbor_id) + sys.getsizeof(adts)
             for prop_idx in range(self.num_properties):
                 received_neighbor_adts[prop_idx].append(adts[prop_idx])
+
+        t_ctx_end = time.time()
+        # Print from BOTH workers to understand load imbalance
+        total_agents_to_send = sum(len(v) for v in neighborrank2agentidandadt.values())
+        print(f"  [Rank {worker}] [contextualize] Total time: {t_ctx_end - t_ctx_start:.3f}s")
+        print(f"  [Rank {worker}] [contextualize] - Wait for chunk counts: {t_after_wait1 - t_before_wait1:.3f}s")
+        print(f"  [Rank {worker}] [contextualize] - Wait for chunks: {t_after_wait2 - t_before_wait2:.3f}s")
+        print(f"  [Rank {worker}] [contextualize] - Agents to send: {total_agents_to_send}, Received: {len(received_neighbor_ids)}")
+        print(f"  [Rank {worker}] [MPI ops] isend: {num_isend_ops}, irecv: {num_irecv_ops}")
+        print(f"  [Rank {worker}] [MPI data] Sent: {total_bytes_sent/1024/1024:.2f} MB, Recv: {total_bytes_recv/1024/1024:.2f} MB")
 
         return (
             agent_ids_chunk,
