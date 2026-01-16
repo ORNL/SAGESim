@@ -42,6 +42,12 @@ class AgentFactory:
             "breed": 0,
             "locations": 1,
         }
+        # Track which properties need to be sent to neighbors during MPI sync
+        # Default: breed and locations are NOT neighbor-visible (never read by neighbors)
+        self._property_name_2_neighbor_visible = OrderedDict(
+            {"breed": False, "locations": False}
+        )
+        self._neighbor_visible_indices: List[int] = []  # Cached list of neighbor-visible property indices
         self._agent2rank = {}  # global
         self._rank2agentid2agentidx = {}  # global
 
@@ -268,6 +274,25 @@ class AgentFactory:
         """
         return len(self._property_name_2_agent_data_tensor)
 
+    def _build_neighbor_visible_indices(self) -> None:
+        """Build cached list of property indices that are neighbor-visible.
+
+        Called lazily on first contextualization or can be called explicitly after setup.
+        """
+        self._neighbor_visible_indices = [
+            idx for name, idx in self._property_name_2_index.items()
+            if self._property_name_2_neighbor_visible.get(name, True)
+        ]
+        if worker == 0:
+            visible_props = [
+                name for name, visible in self._property_name_2_neighbor_visible.items()
+                if visible
+            ]
+            total_props = len(self._property_name_2_agent_data_tensor)
+            print(f"[SAGESim] Selective Property Sync: {len(visible_props)}/{total_props} properties are neighbor-visible")
+            if visible_props:
+                print(f"[SAGESim] Neighbor-visible properties: {visible_props}")
+
     def register_breed(self, breed: Breed) -> None:
         """
         Registered agent breed in the model so that agents can be created under
@@ -280,9 +305,16 @@ class AgentFactory:
         self._num_breeds += 1
         self._breeds[breed.name] = breed
         for property_name, default in breed.properties.items():
+            # Get neighbor_visible flag from breed (default True for backward compatibility)
+            neighbor_visible = breed.prop2neighbor_visible.get(property_name, True)
+
             if property_name in self._property_name_2_agent_data_tensor:
                 # If the property is already registered, just update the default value
                 self._property_name_2_defaults[property_name] = default
+                # Update neighbor_visible (use OR to be conservative - if any breed marks it visible, it's visible)
+                self._property_name_2_neighbor_visible[property_name] = (
+                    self._property_name_2_neighbor_visible.get(property_name, False) or neighbor_visible
+                )
             else:
                 # Register the new property
                 self._property_name_2_index[property_name] = len(
@@ -290,6 +322,7 @@ class AgentFactory:
                 )
                 self._property_name_2_agent_data_tensor[property_name] = []
                 self._property_name_2_defaults[property_name] = default
+                self._property_name_2_neighbor_visible[property_name] = neighbor_visible
 
     def create_agent(self, breed: Breed, **kwargs) -> int:
         """
@@ -453,6 +486,9 @@ class AgentFactory:
         Chunks agent data tensors so that each distributed worker does not
         get more data than the agents that worker processes actually need.
 
+        Uses selective property synchronization to only send properties marked
+        as neighbor_visible=True, reducing MPI communication overhead.
+
         :return: 2-tuple.
             1. agent_ids_chunks: List of Lists of agent_ids to be processed
                 by each worker.
@@ -462,6 +498,10 @@ class AgentFactory:
         import math
         import time
         t_ctx_start = time.time()
+
+        # Build neighbor-visible indices cache if not already built
+        if not self._neighbor_visible_indices and self.num_properties > 0:
+            self._build_neighbor_visible_indices()
 
         # MPI operation counters
         num_isend_ops = 0
@@ -482,6 +522,13 @@ class AgentFactory:
 
         for agent_idx in range(num_agents_this_rank):
             agent_id = agent_ids_chunk[agent_idx]
+            # OPTIMIZATION: Only collect neighbor-visible properties for sending
+            # This reduces MPI message size significantly
+            agent_adts_visible = [
+                agent_data_tensors[idx][agent_idx]
+                for idx in self._neighbor_visible_indices
+            ] if self._neighbor_visible_indices else []
+            # Keep full adts for local cache comparison
             agent_adts = [adt[agent_idx] for adt in agent_data_tensors]
             agent_neighbors = all_neighbors_list[agent_idx]
 
@@ -559,8 +606,9 @@ class AgentFactory:
                     neighborrankandagentidsvisited.add((neighbor_rank, agent_id))
                     if neighbor_rank not in neighborrank2agentidandadt.keys():
                         neighborrank2agentidandadt[neighbor_rank] = []
+                    # OPTIMIZATION: Only send neighbor-visible properties
                     neighborrank2agentidandadt[neighbor_rank].append(
-                        (agent_id, agent_adts)
+                        (agent_id, agent_adts_visible)
                     )
 
         received_neighbor_adts = []
@@ -671,13 +719,30 @@ class AgentFactory:
         t_after_wait2 = time.time()
 
         # Process received chunks
+        # OPTIMIZATION: Reconstruct full property list from neighbor-visible subset
         received_neighbor_adts = [[] for _ in range(self.num_properties)]
         received_neighbor_ids = []
-        for neighbor_idx, (neighbor_id, adts) in enumerate(received_data):
+
+        # Build mapping: prop_idx -> visible_idx (position in adts_visible)
+        prop_idx_to_visible_idx = {
+            prop_idx: visible_idx
+            for visible_idx, prop_idx in enumerate(self._neighbor_visible_indices)
+        }
+
+        for neighbor_idx, (neighbor_id, adts_visible) in enumerate(received_data):
             received_neighbor_ids.append(neighbor_id)
-            total_bytes_recv += sys.getsizeof(neighbor_id) + sys.getsizeof(adts)
+            total_bytes_recv += sys.getsizeof(neighbor_id) + sys.getsizeof(adts_visible)
+
+            # Reconstruct full property list from neighbor-visible subset
             for prop_idx in range(self.num_properties):
-                received_neighbor_adts[prop_idx].append(adts[prop_idx])
+                if prop_idx in prop_idx_to_visible_idx:
+                    # This property was sent - get its value from adts_visible
+                    visible_idx = prop_idx_to_visible_idx[prop_idx]
+                    received_neighbor_adts[prop_idx].append(adts_visible[visible_idx])
+                else:
+                    # This property was not sent - use None as placeholder
+                    # (it won't be read by neighbors anyway)
+                    received_neighbor_adts[prop_idx].append(None)
 
         t_ctx_end = time.time()
         # Print from BOTH workers to understand load imbalance
