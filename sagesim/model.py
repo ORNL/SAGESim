@@ -274,10 +274,12 @@ class Model:
         space: Space,
         threads_per_block: int = 32,
         step_function_file_path: str = "step_func_code.py",
+        verbose: bool = False,
     ) -> None:
         self._threads_per_block = threads_per_block
         self._step_function_file_path = step_function_file_path
-        self._agent_factory = AgentFactory(space)
+        self._verbose = verbose
+        self._agent_factory = AgentFactory(space, verbose=verbose)
         self._is_setup = False
         self.globals = {}
         self.tick = 0
@@ -429,15 +431,16 @@ class Model:
                 rank = self._agent_factory._agent2rank.get(agent_id, -1)
                 agents_per_rank[rank] = agents_per_rank.get(rank, 0) + 1
 
-            print(f"\n{'='*60}")
-            print(f"[SAGESim] Agent Distribution Across Workers")
-            print(f"{'='*60}")
-            print(f"Total agents: {total_agents}")
-            for rank in sorted(agents_per_rank.keys()):
-                count = agents_per_rank[rank]
-                percentage = (count / total_agents) * 100 if total_agents > 0 else 0
-                print(f"Rank {rank}: {count:5d} agents ({percentage:5.2f}%)")
-            print(f"{'='*60}\n")
+            if self._verbose:
+                print(f"\n{'='*60}")
+                print(f"[SAGESim] Agent Distribution Across Workers")
+                print(f"{'='*60}")
+                print(f"Total agents: {total_agents}")
+                for rank in sorted(agents_per_rank.keys()):
+                    count = agents_per_rank[rank]
+                    percentage = (count / total_agents) * 100 if total_agents > 0 else 0
+                    print(f"Rank {rank}: {count:5d} agents ({percentage:5.2f}%)")
+                print(f"{'='*60}\n")
 
         self._is_setup = True
 
@@ -533,13 +536,14 @@ class Model:
         :param agent_ids: agents to process by this cudakernel call
         """
         import time
-        t_start = time.time()
+        if self._verbose:
+            t_start = time.time()
 
         self.__rank_local_agent_ids = list(
             self._agent_factory._rank2agentid2agentidx[worker].keys()
         )
 
-        if self.tick % 5 == 0:
+        if self._verbose and self.tick % 5 == 0:
             print(f"[Rank {worker}] Tick {self.tick}: worker_coroutine started, local agents: {len(self.__rank_local_agent_ids)}")
 
         threadsperblock = 32
@@ -551,7 +555,8 @@ class Model:
             self.__rank_local_agent_data_tensors[1]
         )
 
-        t_before_context = time.time()
+        if self._verbose:
+            t_before_context = time.time()
         (
             self.__rank_local_agent_ids,
             self.__rank_local_agent_data_tensors,
@@ -562,10 +567,10 @@ class Model:
             self.__rank_local_agent_ids,
             rank_local_agents_neighbors,
         )
-        t_after_context = time.time()
-
-        if self.tick % 5 == 0:
-            print(f"[Rank {worker}] Tick {self.tick}: contextualize took {t_after_context - t_before_context:.3f}s, received {len(received_neighbor_ids)} neighbor agents")
+        if self._verbose:
+            t_after_context = time.time()
+            if self.tick % 5 == 0:
+                print(f"[Rank {worker}] Tick {self.tick}: contextualize took {t_after_context - t_before_context:.3f}s, received {len(received_neighbor_ids)} neighbor agents")
 
         self._global_data_vector = cp.array(self._global_data_vector)
 
@@ -676,13 +681,15 @@ class Model:
         # Without this barrier, the next call to contextualize_agent_data_tensors() may see
         # stale data from some workers that haven't finished their GPU kernels yet
         if num_workers > 1:
-            t_before_barrier = time.time()
-            if self.tick % 5 == 0:
-                print(f"[Rank {worker}] Tick {self.tick}: entering barrier...")
+            if self._verbose:
+                t_before_barrier = time.time()
+                if self.tick % 5 == 0:
+                    print(f"[Rank {worker}] Tick {self.tick}: entering barrier...")
             comm.barrier()
-            t_after_barrier = time.time()
-            if self.tick % 5 == 0:
-                print(f"[Rank {worker}] Tick {self.tick}: barrier took {t_after_barrier - t_before_barrier:.3f}s")
+            if self._verbose:
+                t_after_barrier = time.time()
+                if self.tick % 5 == 0:
+                    print(f"[Rank {worker}] Tick {self.tick}: barrier took {t_after_barrier - t_before_barrier:.3f}s")
 
         """worker_agent_and_neighbor_data_tensors = (
             self._agent_factory.reduce_agent_data_tensors(
@@ -696,9 +703,10 @@ class Model:
             self._global_data_vector.tolist(), op=reduce_global_data_vector
         )
 
-        t_end = time.time()
-        if self.tick % 5 == 0:
-            print(f"[Rank {worker}] Tick {self.tick}: worker_coroutine total time {t_end - t_start:.3f}s\n")
+        if self._verbose:
+            t_end = time.time()
+            if self.tick % 5 == 0:
+                print(f"[Rank {worker}] Tick {self.tick}: worker_coroutine total time {t_end - t_start:.3f}s\n")
 
 
 def reduce_global_data_vector(A, B):
