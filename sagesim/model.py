@@ -474,7 +474,6 @@ class Model:
             # has run for the right amount of ticks
             original_sync_workers_every_n_ticks = sync_workers_every_n_ticks
             for time_chunk in range((ticks // original_sync_workers_every_n_ticks) + 1):
-
                 if time_chunk == (ticks // original_sync_workers_every_n_ticks):
                     # Final chunk: handle remaining ticks
                     remaining_ticks = ticks - (
@@ -536,27 +535,27 @@ class Model:
         :param agent_ids: agents to process by this cudakernel call
         """
         import time
-        if self._verbose:
-            t_start = time.time()
+        t_start = time.time()
 
         self.__rank_local_agent_ids = list(
             self._agent_factory._rank2agentid2agentidx[worker].keys()
         )
 
-        if self._verbose and self.tick % 5 == 0:
-            print(f"[Rank {worker}] Tick {self.tick}: worker_coroutine started, local agents: {len(self.__rank_local_agent_ids)}")
+        if self._verbose:
+            print(f"[Rank {worker}] Tick {self.tick}: worker_coroutine started, local agents: {len(self.__rank_local_agent_ids)}", flush=True)
 
         threadsperblock = 32
         blockspergrid = int(
             math.ceil(len(self.__rank_local_agent_ids) / threadsperblock)
         )
 
+        t_neighbor_start = time.time()
         rank_local_agents_neighbors = self.get_space()._neighbor_compute_func(
             self.__rank_local_agent_data_tensors[1]
         )
+        t_neighbor_end = time.time()
 
-        if self._verbose:
-            t_before_context = time.time()
+        t_before_context = time.time()
         (
             self.__rank_local_agent_ids,
             self.__rank_local_agent_data_tensors,
@@ -567,11 +566,12 @@ class Model:
             self.__rank_local_agent_ids,
             rank_local_agents_neighbors,
         )
-        if self._verbose:
-            t_after_context = time.time()
-            if self.tick % 5 == 0:
-                print(f"[Rank {worker}] Tick {self.tick}: contextualize took {t_after_context - t_before_context:.3f}s, received {len(received_neighbor_ids)} neighbor agents")
+        t_after_context = time.time()
 
+        if self._verbose:
+            print(f"[Rank {worker}] Tick {self.tick}: neighbor_compute={t_neighbor_end - t_neighbor_start:.3f}s, contextualize={t_after_context - t_before_context:.3f}s, received {len(received_neighbor_ids)} neighbors", flush=True)
+
+        t_data_prep_start = time.time()
         self._global_data_vector = cp.array(self._global_data_vector)
 
         # Create agent ID to local index mapping for fast lookups
@@ -580,33 +580,82 @@ class Model:
 
         rank_local_agent_and_non_local_neighbor_ids = cp.array(all_agent_ids_list)
 
+        # Helper function to create zero-filled placeholder matching nested structure
+        def create_zero_placeholder(sample):
+            """Recursively create a zero-filled copy matching the structure of sample."""
+            if isinstance(sample, np.ndarray):
+                return np.zeros_like(sample).tolist()
+            elif isinstance(sample, (list, tuple)):
+                if len(sample) == 0:
+                    return []
+                # Check if elements are nested (lists/tuples) or scalars
+                if isinstance(sample[0], (list, tuple, np.ndarray)):
+                    return [create_zero_placeholder(elem) for elem in sample]
+                else:
+                    return [0.0] * len(sample)
+            else:
+                return 0.0
+
         # OPTIMIZATION: Convert agent IDs to indices on LISTS before GPU conversion
         # This avoids GPU->CPU->GPU roundtrip and works on lists (faster than numpy arrays)
+        t_combine_start = time.time()
         combined_lists = []
         for i in range(self._agent_factory.num_properties):
-            combined = self.__rank_local_agent_data_tensors[i] + received_neighbor_adts[i]
+            received_data = received_neighbor_adts[i]
+
+            # Handle non-neighbor-visible properties: replace None with placeholder values
+            # For properties not sent during MPI sync, received_neighbor_adts contains None
+            if received_data and received_data[0] is None:
+                # Use placeholder matching the structure of local data
+                # Note: This assumes all agents have the same structure for each property.
+                # Edge case: If one rank has only somas and another only synapses with
+                # different structures, this will fail. Ensure networks have enough agents
+                # so each rank has mixed agent types.
+                local_data = self.__rank_local_agent_data_tensors[i]
+                if local_data:
+                    placeholder = create_zero_placeholder(local_data[0])
+                else:
+                    placeholder = 0.0
+                received_data = [placeholder for _ in range(len(received_data))]
+
+            combined = self.__rank_local_agent_data_tensors[i] + received_data
 
             if i == 1:  # Property 1 is 'locations' (neighbors/connections)
+                # DEBUG: Check data types on Tick 1+
+                if self._verbose and self.tick > 0 and worker == 0:
+                    local_sample = self.__rank_local_agent_data_tensors[i][0] if self.__rank_local_agent_data_tensors[i] else None
+                    recv_sample = received_data[0] if received_data else None
+                    print(f"[DEBUG] Tick {self.tick}: local_type={type(local_sample).__name__}, recv_type={type(recv_sample).__name__}")
                 # Convert agent IDs to local indices while still a list
                 combined = convert_agent_ids_to_indices(combined, agent_id_to_index)
 
             combined_lists.append(combined)
+        t_combine_end = time.time()
 
         # Now convert all to GPU arrays (single CPU->GPU transfer per property)
-        rank_local_agent_and_neighbor_adts = [
-            convert_to_equal_side_tensor(combined_lists[i])
-            for i in range(self._agent_factory.num_properties)
-        ]
+        t_tensor_convert_start = time.time()
+        rank_local_agent_and_neighbor_adts = []
+        tensor_times = []
+        for i in range(self._agent_factory.num_properties):
+            t_prop_start = time.time()
+            tensor = convert_to_equal_side_tensor(combined_lists[i])
+            t_prop_end = time.time()
+            rank_local_agent_and_neighbor_adts.append(tensor)
+            tensor_times.append((i, t_prop_end - t_prop_start))
+        t_tensor_convert_end = time.time()
 
         # Property 1 (locations) needs special handling: replace NaN with -1 and convert to int32
         # OPTIMIZATION: Do this entirely on GPU to avoid CPU->GPU roundtrip
+        t_loc_start = time.time()
         locations_for_kernel = None
         if len(rank_local_agent_and_neighbor_adts) > 1:
             locations_gpu = rank_local_agent_and_neighbor_adts[1]
             # Do NaN replacement and conversion entirely on GPU using CuPy
             locations_for_kernel = cp.where(cp.isnan(locations_gpu), -1, locations_gpu).astype(cp.int32)
+        t_loc_end = time.time()
 
         # Create write buffers for properties that need them
+        t_buf_start = time.time()
         write_buffers = []
         for prop_idx in self._write_property_indices:
             # Create a copy of the tensor for writing
@@ -622,8 +671,18 @@ class Model:
             else:
                 all_args.append(tensor)  # Use original
         all_args = all_args + write_buffers
+        t_buf_end = time.time()
+        t_data_prep_end = time.time()
+
+        if self._verbose:
+            # Find slowest tensor conversions
+            tensor_times.sort(key=lambda x: x[1], reverse=True)
+            top3 = tensor_times[:3]
+            top3_str = ", ".join([f"prop{i}={t:.3f}s" for i, t in top3])
+            print(f"[Rank {worker}] Tick {self.tick}: combine_lists={t_combine_end - t_combine_start:.3f}s, tensor_convert={t_tensor_convert_end - t_tensor_convert_start:.3f}s (top3: {top3_str}), loc_kernel={t_loc_end - t_loc_start:.3f}s, buffers={t_buf_end - t_buf_start:.3f}s", flush=True)
 
         # CROSS-BREED SYNCHRONIZATION: Process breeds sequentially within each tick
+        t_gpu_kernel_start = time.time()
         for tick_offset in range(sync_workers_every_n_ticks):
             current_tick = self.tick + tick_offset
 
@@ -654,8 +713,13 @@ class Model:
 
         # Update global tick counter after all threads have completed
         self.tick += sync_workers_every_n_ticks
+        t_gpu_kernel_end = time.time()
+
+        if self._verbose:
+            print(f"[Rank {worker}] Tick {self.tick}: gpu_kernel={t_gpu_kernel_end - t_gpu_kernel_start:.3f}s", flush=True)
 
         cp.get_default_memory_pool().free_all_blocks()
+        t_post_start = time.time()
 
         # Convert GPU tensors back to CPU lists for next iteration
         # Property 1 (locations) contains indices after GPU processing - convert back to agent IDs
@@ -677,36 +741,27 @@ class Model:
                 data = rank_local_agent_and_neighbor_adts[i][:num_agents].tolist()
             self.__rank_local_agent_data_tensors.append(data)
 
+        t_post_end = time.time()
+
         # CRITICAL FIX: Ensure all workers have finished processing before syncing neighbor data
         # Without this barrier, the next call to contextualize_agent_data_tensors() may see
         # stale data from some workers that haven't finished their GPU kernels yet
+        t_before_barrier = time.time()
         if num_workers > 1:
-            if self._verbose:
-                t_before_barrier = time.time()
-                if self.tick % 5 == 0:
-                    print(f"[Rank {worker}] Tick {self.tick}: entering barrier...")
             comm.barrier()
-            if self._verbose:
-                t_after_barrier = time.time()
-                if self.tick % 5 == 0:
-                    print(f"[Rank {worker}] Tick {self.tick}: barrier took {t_after_barrier - t_before_barrier:.3f}s")
+        t_after_barrier = time.time()
 
-        """worker_agent_and_neighbor_data_tensors = (
-            self._agent_factory.reduce_agent_data_tensors(
-                worker_agent_and_neighbor_data_tensors,
-                agent_and_neighbor_ids_in_subcontext,
-                self._reduce_func,
-            )
-        )
-        """
+        t_before_allreduce = time.time()
         self._global_data_vector = comm.allreduce(
             self._global_data_vector.tolist(), op=reduce_global_data_vector
         )
+        t_after_allreduce = time.time()
 
+        t_end = time.time()
         if self._verbose:
-            t_end = time.time()
-            if self.tick % 5 == 0:
-                print(f"[Rank {worker}] Tick {self.tick}: worker_coroutine total time {t_end - t_start:.3f}s\n")
+            barrier_time = t_after_barrier - t_before_barrier
+            print(f"[Rank {worker}] Tick {self.tick}: post_process={t_post_end - t_post_start:.3f}s, barrier={barrier_time:.3f}s, allreduce={t_after_allreduce - t_before_allreduce:.3f}s", flush=True)
+            print(f"[Rank {worker}] Tick {self.tick}: === TOTAL worker_coroutine={t_end - t_start:.3f}s ===", flush=True)
 
 
 def reduce_global_data_vector(A, B):

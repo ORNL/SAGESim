@@ -500,6 +500,7 @@ class AgentFactory:
         """
         import math
         import time
+        t_ctx_start = time.time()
 
         # Build neighbor-visible indices cache if not already built
         if not self._neighbor_visible_indices and self.num_properties > 0:
@@ -675,12 +676,10 @@ class AgentFactory:
             if self._verbose:
                 num_irecv_ops += 1
 
-        if self._verbose:
-            t_before_wait1 = time.time()
+        t_before_wait1 = time.time()
         MPI.Request.waitall(sends_num_chunks)
         recvs_num_chunks = MPI.Request.waitall(recvs_num_chunks_requests)
-        if self._verbose:
-            t_after_wait1 = time.time()
+        t_after_wait1 = time.time()
 
         # Send the chunks
         send_chunk_requests = []
@@ -718,8 +717,7 @@ class AgentFactory:
         num_send_chunk_requests = len(send_chunk_requests)
         num_recv_chunk_requests = len(recv_chunk_requests)
 
-        if self._verbose:
-            t_before_wait2 = time.time()
+        t_before_wait2 = time.time()
         for i in range(max(num_send_chunk_requests, num_recv_chunk_requests)):
             if i < num_send_chunk_requests:
                 MPI.Request.waitall(send_chunk_requests[i])
@@ -727,8 +725,7 @@ class AgentFactory:
                 received_data_ranks_chunk = MPI.Request.waitall(recv_chunk_requests[i])
                 for received_data_rank_chunk in received_data_ranks_chunk:
                     received_data.extend(received_data_rank_chunk)
-        if self._verbose:
-            t_after_wait2 = time.time()
+        t_after_wait2 = time.time()
 
         # Process received chunks
         # OPTIMIZATION: Reconstruct full property list from neighbor-visible subset
@@ -757,16 +754,11 @@ class AgentFactory:
                     # (it won't be read by neighbors anyway)
                     received_neighbor_adts[prop_idx].append(None)
 
+        t_ctx_end = time.time()
         if self._verbose:
-            t_ctx_end = time.time()
             total_agents_to_send = sum(len(v) for v in neighborrank2agentidandadt.values())
-            print(f"  [Rank {worker}] [contextualize] Total time: {t_ctx_end - t_ctx_start:.3f}s")
-            print(f"  [Rank {worker}] [contextualize] - Wait for chunk counts: {t_after_wait1 - t_before_wait1:.3f}s")
-            print(f"  [Rank {worker}] [contextualize] - Wait for chunks: {t_after_wait2 - t_before_wait2:.3f}s")
-            print(f"  [Rank {worker}] [contextualize] - Agents to send: {total_agents_to_send}, Received: {len(received_neighbor_ids)}")
-            print(f"  [Rank {worker}] [MPI ops] isend: {num_isend_ops}, irecv: {num_irecv_ops}")
-            print(f"  [Rank {worker}] [MPI data] Sent: {total_bytes_sent/1024/1024:.2f} MB, Recv: {total_bytes_recv/1024/1024:.2f} MB")
-
+            print(f"  [Rank {worker}] [contextualize] Total={t_ctx_end - t_ctx_start:.3f}s (wait_counts={t_after_wait1 - t_before_wait1:.3f}s, wait_chunks={t_after_wait2 - t_before_wait2:.3f}s)", flush=True)
+            print(f"  [Rank {worker}] [contextualize] Sent={total_agents_to_send} agents, Received={len(received_neighbor_ids)} agents", flush=True)
         return (
             agent_ids_chunk,
             agent_data_tensors,
