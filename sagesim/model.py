@@ -584,7 +584,7 @@ class Model:
         def create_zero_placeholder(sample):
             """Recursively create a zero-filled copy matching the structure of sample."""
             if isinstance(sample, np.ndarray):
-                return np.zeros_like(sample).tolist()
+                return np.zeros_like(sample)  # Keep as numpy array for fast vectorized path
             elif isinstance(sample, (list, tuple)):
                 if len(sample) == 0:
                     return []

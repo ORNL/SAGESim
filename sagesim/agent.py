@@ -58,6 +58,18 @@ class AgentFactory:
 
         self._prev_agent_data = {}
 
+        # MPI stats tracking for benchmarking
+        self._mpi_stats = {
+            'num_isend_ops': 0,
+            'num_irecv_ops': 0,
+            'total_bytes_sent': 0,
+            'total_bytes_recv': 0,
+            'total_agents_sent': 0,
+            'total_agents_recv': 0,
+            'contextualize_calls': 0,
+            'contextualize_total_time': 0.0,
+        }
+
     def clear_agent_data_cache(self):
         """Clear the previous agent data cache to force resending all agent data.
 
@@ -697,7 +709,7 @@ class AgentFactory:
                     )
                     if self._verbose:
                         num_isend_ops += 1
-                        total_bytes_sent += sys.getsizeof(chunk)
+                        total_bytes_sent += len(pickle.dumps(chunk))  # Actual serialized size
                     if i >= len(send_chunk_requests):
                         send_chunk_requests.append([])
                     send_chunk_requests[i].append(send_chunk_request)
@@ -741,7 +753,7 @@ class AgentFactory:
         for neighbor_idx, (neighbor_id, adts_visible) in enumerate(received_data):
             received_neighbor_ids.append(neighbor_id)
             if self._verbose:
-                total_bytes_recv += sys.getsizeof(neighbor_id) + sys.getsizeof(adts_visible)
+                total_bytes_recv += len(pickle.dumps((neighbor_id, adts_visible)))  # Actual serialized size
 
             # Reconstruct full property list from neighbor-visible subset
             for prop_idx in range(self.num_properties):
@@ -759,6 +771,17 @@ class AgentFactory:
             total_agents_to_send = sum(len(v) for v in neighborrank2agentidandadt.values())
             print(f"  [Rank {worker}] [contextualize] Total={t_ctx_end - t_ctx_start:.3f}s (wait_counts={t_after_wait1 - t_before_wait1:.3f}s, wait_chunks={t_after_wait2 - t_before_wait2:.3f}s)", flush=True)
             print(f"  [Rank {worker}] [contextualize] Sent={total_agents_to_send} agents, Received={len(received_neighbor_ids)} agents", flush=True)
+            print(f"  [Rank {worker}] [contextualize] MPI ops: isend={num_isend_ops}, irecv={num_irecv_ops}", flush=True)
+            print(f"  [Rank {worker}] [contextualize] Data transfer: sent={total_bytes_sent} bytes, recv={total_bytes_recv} bytes", flush=True)
+            # Accumulate stats
+            self._mpi_stats['num_isend_ops'] += num_isend_ops
+            self._mpi_stats['num_irecv_ops'] += num_irecv_ops
+            self._mpi_stats['total_bytes_sent'] += total_bytes_sent
+            self._mpi_stats['total_bytes_recv'] += total_bytes_recv
+            self._mpi_stats['total_agents_sent'] += total_agents_to_send
+            self._mpi_stats['total_agents_recv'] += len(received_neighbor_ids)
+            self._mpi_stats['contextualize_calls'] += 1
+            self._mpi_stats['contextualize_total_time'] += (t_ctx_end - t_ctx_start)
         return (
             agent_ids_chunk,
             agent_data_tensors,
