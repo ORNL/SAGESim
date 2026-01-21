@@ -274,18 +274,39 @@ class Model:
         space: Space,
         threads_per_block: int = 32,
         step_function_file_path: str = "step_func_code.py",
-        verbose: bool = False,
+        verbose_timing: bool = False,
+        verbose_mpi_transfer: bool = False,
     ) -> None:
         self._threads_per_block = threads_per_block
         self._step_function_file_path = step_function_file_path
-        self._verbose = verbose
-        self._agent_factory = AgentFactory(space, verbose=verbose)
+        self._verbose_timing = verbose_timing
+        self._verbose_mpi_transfer = verbose_mpi_transfer
+        self._agent_factory = AgentFactory(space, verbose_timing=verbose_timing, verbose_mpi_transfer=verbose_mpi_transfer)
         self._is_setup = False
         self.globals = {}
         self.tick = 0
         self._write_property_indices = set()  # Cache for write property indices
         # following may be set later in setup if distributed execution
 
+    @property
+    def verbose_timing(self) -> bool:
+        """Enable timing verbose output for debugging performance."""
+        return self._verbose_timing
+
+    @verbose_timing.setter
+    def verbose_timing(self, value: bool) -> None:
+        self._verbose_timing = value
+        self._agent_factory._verbose_timing = value
+
+    @property
+    def verbose_mpi_transfer(self) -> bool:
+        """Enable MPI transfer verbose output to track bytes sent/received between workers."""
+        return self._verbose_mpi_transfer
+
+    @verbose_mpi_transfer.setter
+    def verbose_mpi_transfer(self, value: bool) -> None:
+        self._verbose_mpi_transfer = value
+        self._agent_factory._verbose_mpi_transfer = value
 
     def register_breed(self, breed: Breed) -> None:
         if self._agent_factory.num_agents > 0:
@@ -431,7 +452,7 @@ class Model:
                 rank = self._agent_factory._agent2rank.get(agent_id, -1)
                 agents_per_rank[rank] = agents_per_rank.get(rank, 0) + 1
 
-            if self._verbose:
+            if self._verbose_timing:
                 print(f"\n{'='*60}")
                 print(f"[SAGESim] Agent Distribution Across Workers")
                 print(f"{'='*60}")
@@ -541,7 +562,7 @@ class Model:
             self._agent_factory._rank2agentid2agentidx[worker].keys()
         )
 
-        if self._verbose:
+        if self._verbose_timing:
             print(f"[Rank {worker}] Tick {self.tick}: worker_coroutine started, local agents: {len(self.__rank_local_agent_ids)}", flush=True)
 
         threadsperblock = 32
@@ -568,7 +589,7 @@ class Model:
         )
         t_after_context = time.time()
 
-        if self._verbose:
+        if self._verbose_timing:
             print(f"[Rank {worker}] Tick {self.tick}: neighbor_compute={t_neighbor_end - t_neighbor_start:.3f}s, contextualize={t_after_context - t_before_context:.3f}s, received {len(received_neighbor_ids)} neighbors", flush=True)
 
         t_data_prep_start = time.time()
@@ -622,7 +643,7 @@ class Model:
 
             if i == 1:  # Property 1 is 'locations' (neighbors/connections)
                 # DEBUG: Check data types on Tick 1+
-                if self._verbose and self.tick > 0 and worker == 0:
+                if self._verbose_timing and self.tick > 0 and worker == 0:
                     local_sample = self.__rank_local_agent_data_tensors[i][0] if self.__rank_local_agent_data_tensors[i] else None
                     recv_sample = received_data[0] if received_data else None
                     print(f"[DEBUG] Tick {self.tick}: local_type={type(local_sample).__name__}, recv_type={type(recv_sample).__name__}")
@@ -674,7 +695,7 @@ class Model:
         t_buf_end = time.time()
         t_data_prep_end = time.time()
 
-        if self._verbose:
+        if self._verbose_timing:
             # Find slowest tensor conversions
             tensor_times.sort(key=lambda x: x[1], reverse=True)
             top3 = tensor_times[:3]
@@ -715,7 +736,7 @@ class Model:
         self.tick += sync_workers_every_n_ticks
         t_gpu_kernel_end = time.time()
 
-        if self._verbose:
+        if self._verbose_timing:
             print(f"[Rank {worker}] Tick {self.tick}: gpu_kernel={t_gpu_kernel_end - t_gpu_kernel_start:.3f}s", flush=True)
 
         cp.get_default_memory_pool().free_all_blocks()
@@ -758,7 +779,7 @@ class Model:
         t_after_allreduce = time.time()
 
         t_end = time.time()
-        if self._verbose:
+        if self._verbose_timing:
             barrier_time = t_after_barrier - t_before_barrier
             print(f"[Rank {worker}] Tick {self.tick}: post_process={t_post_end - t_post_start:.3f}s, barrier={barrier_time:.3f}s, allreduce={t_after_allreduce - t_before_allreduce:.3f}s", flush=True)
             print(f"[Rank {worker}] Tick {self.tick}: === TOTAL worker_coroutine={t_end - t_start:.3f}s ===", flush=True)

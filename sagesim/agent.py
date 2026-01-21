@@ -23,10 +23,11 @@ worker = comm.Get_rank()
 
 
 class AgentFactory:
-    def __init__(self, space: Space, verbose: bool = False) -> None:
+    def __init__(self, space: Space, verbose_timing: bool = False, verbose_mpi_transfer: bool = False) -> None:
         self._breeds: Dict[str, Breed] = OrderedDict()
         self._space: Space = space
-        self._verbose = verbose
+        self._verbose_timing = verbose_timing
+        self._verbose_mpi_transfer = verbose_mpi_transfer
         self._space._agent_factory = self
         self._num_breeds = 0
         self._num_agents = 0
@@ -60,13 +61,8 @@ class AgentFactory:
 
         # MPI stats tracking for benchmarking
         self._mpi_stats = {
-            'num_isend_ops': 0,
-            'num_irecv_ops': 0,
             'total_bytes_sent': 0,
             'total_bytes_recv': 0,
-            'total_agents_sent': 0,
-            'total_agents_recv': 0,
-            'contextualize_calls': 0,
             'contextualize_total_time': 0.0,
         }
 
@@ -113,7 +109,7 @@ class AgentFactory:
             for agent_id, rank in partition_dict.items():
                 agents_per_rank[rank] = agents_per_rank.get(rank, 0) + 1
 
-            if self._verbose:
+            if self._verbose_timing:
                 print(f"[SAGESim] Loaded partition from dictionary")
                 print(f"[SAGESim] Number of agents in partition: {num_agents_in_partition}")
                 print(f"[SAGESim] Agents per rank: {dict(sorted(agents_per_rank.items()))}")
@@ -246,7 +242,7 @@ class AgentFactory:
             for agent_id, rank in partition_mapping.items():
                 agents_per_rank[rank] = agents_per_rank.get(rank, 0) + 1
 
-            if self._verbose:
+            if self._verbose_timing:
                 print(f"[SAGESim] Loaded network partition from: {partition_file}")
                 print(f"[SAGESim] Partition format: {format}")
                 print(f"[SAGESim] Number of agents in partition: {num_agents_in_partition}")
@@ -358,12 +354,12 @@ class AgentFactory:
             # Use pre-loaded partition
             assigned_rank = self._partition_mapping[agent_id]
             # Debug: Print first few partition assignments
-            if self._verbose and agent_id < 5 and worker == 0:
+            if self._verbose_timing and agent_id < 5 and worker == 0:
                 print(f"[SAGESim] Agent {agent_id} assigned to rank {assigned_rank} (from METIS partition)")
         else:
             # Fall back to round-robin assignment
             assigned_rank = self._current_rank
-            if self._verbose and agent_id < 5 and worker == 0:
+            if self._verbose_timing and agent_id < 5 and worker == 0:
                 print(f"[SAGESim] Agent {agent_id} assigned to rank {assigned_rank} (round-robin)")
             self._current_rank += 1
             if self._current_rank >= num_workers:
@@ -518,10 +514,7 @@ class AgentFactory:
         if not self._neighbor_visible_indices and self.num_properties > 0:
             self._build_neighbor_visible_indices()
 
-        if self._verbose:
-            t_ctx_start = time.time()
-            num_isend_ops = 0
-            num_irecv_ops = 0
+        if self._verbose_mpi_transfer:
             total_bytes_sent = 0
             total_bytes_recv = 0
 
@@ -665,9 +658,6 @@ class AgentFactory:
                         tag=0,
                     )
                 )
-                if self._verbose:
-                    num_isend_ops += 1
-                    total_bytes_sent += sys.getsizeof(num_chunks)
             else:
                 # No data to send to this rank
                 torank2numchunks[to_rank] = 0
@@ -678,15 +668,10 @@ class AgentFactory:
                         tag=0,
                     )
                 )
-                if self._verbose:
-                    num_isend_ops += 1
-                    total_bytes_sent += sys.getsizeof(0)
         # Receive num_chunks from all ranks
         recvs_num_chunks_requests = []
         for from_rank in other_ranks_from:
             recvs_num_chunks_requests.append(comm.irecv(source=from_rank, tag=0))
-            if self._verbose:
-                num_irecv_ops += 1
 
         t_before_wait1 = time.time()
         MPI.Request.waitall(sends_num_chunks)
@@ -707,9 +692,8 @@ class AgentFactory:
                         dest=to_rank,
                         tag=i + 1,
                     )
-                    if self._verbose:
-                        num_isend_ops += 1
-                        total_bytes_sent += len(pickle.dumps(chunk))  # Actual serialized size
+                    if self._verbose_mpi_transfer:
+                        total_bytes_sent += len(pickle.dumps(chunk))
                     if i >= len(send_chunk_requests):
                         send_chunk_requests.append([])
                     send_chunk_requests[i].append(send_chunk_request)
@@ -719,8 +703,6 @@ class AgentFactory:
             num_chunks = recvs_num_chunks[i]
             for j in range(num_chunks):
                 received_chunk_request = comm.irecv(source=from_rank, tag=j + 1)
-                if self._verbose:
-                    num_irecv_ops += 1
                 if j >= len(recv_chunk_requests):
                     recv_chunk_requests.append([])
                 recv_chunk_requests[j].append(received_chunk_request)
@@ -752,8 +734,8 @@ class AgentFactory:
 
         for neighbor_idx, (neighbor_id, adts_visible) in enumerate(received_data):
             received_neighbor_ids.append(neighbor_id)
-            if self._verbose:
-                total_bytes_recv += len(pickle.dumps((neighbor_id, adts_visible)))  # Actual serialized size
+            if self._verbose_mpi_transfer:
+                total_bytes_recv += len(pickle.dumps((neighbor_id, adts_visible)))
 
             # Reconstruct full property list from neighbor-visible subset
             for prop_idx in range(self.num_properties):
@@ -767,21 +749,16 @@ class AgentFactory:
                     received_neighbor_adts[prop_idx].append(None)
 
         t_ctx_end = time.time()
-        if self._verbose:
-            total_agents_to_send = sum(len(v) for v in neighborrank2agentidandadt.values())
+
+        # Timing verbose output
+        if self._verbose_timing:
             print(f"  [Rank {worker}] [contextualize] Total={t_ctx_end - t_ctx_start:.3f}s (wait_counts={t_after_wait1 - t_before_wait1:.3f}s, wait_chunks={t_after_wait2 - t_before_wait2:.3f}s)", flush=True)
-            print(f"  [Rank {worker}] [contextualize] Sent={total_agents_to_send} agents, Received={len(received_neighbor_ids)} agents", flush=True)
-            print(f"  [Rank {worker}] [contextualize] MPI ops: isend={num_isend_ops}, irecv={num_irecv_ops}", flush=True)
-            print(f"  [Rank {worker}] [contextualize] Data transfer: sent={total_bytes_sent} bytes, recv={total_bytes_recv} bytes", flush=True)
-            # Accumulate stats
-            self._mpi_stats['num_isend_ops'] += num_isend_ops
-            self._mpi_stats['num_irecv_ops'] += num_irecv_ops
+            self._mpi_stats['contextualize_total_time'] += (t_ctx_end - t_ctx_start)
+
+        # MPI transfer tracking (accumulate stats silently, summary printed at end)
+        if self._verbose_mpi_transfer:
             self._mpi_stats['total_bytes_sent'] += total_bytes_sent
             self._mpi_stats['total_bytes_recv'] += total_bytes_recv
-            self._mpi_stats['total_agents_sent'] += total_agents_to_send
-            self._mpi_stats['total_agents_recv'] += len(received_neighbor_ids)
-            self._mpi_stats['contextualize_calls'] += 1
-            self._mpi_stats['contextualize_total_time'] += (t_ctx_end - t_ctx_start)
         return (
             agent_ids_chunk,
             agent_data_tensors,
