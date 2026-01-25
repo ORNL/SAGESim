@@ -23,10 +23,11 @@ worker = comm.Get_rank()
 
 
 class AgentFactory:
-    def __init__(self, space: Space, verbose: bool = False) -> None:
+    def __init__(self, space: Space, verbose_timing: bool = False, verbose_mpi_transfer: bool = False) -> None:
         self._breeds: Dict[str, Breed] = OrderedDict()
         self._space: Space = space
-        self._verbose = verbose
+        self._verbose_timing = verbose_timing
+        self._verbose_mpi_transfer = verbose_mpi_transfer
         self._space._agent_factory = self
         self._num_breeds = 0
         self._num_agents = 0
@@ -43,6 +44,12 @@ class AgentFactory:
             "breed": 0,
             "locations": 1,
         }
+        # Track which properties need to be sent to neighbors during MPI sync
+        # Default: breed and locations are NOT neighbor-visible (never read by neighbors)
+        self._property_name_2_neighbor_visible = OrderedDict(
+            {"breed": False, "locations": False}
+        )
+        self._neighbor_visible_indices: List[int] = []  # Cached list of neighbor-visible property indices
         self._agent2rank = {}  # global
         self._rank2agentid2agentidx = {}  # global
 
@@ -51,6 +58,13 @@ class AgentFactory:
         self._partition_mapping: Optional[Dict[int, int]] = None  # agent_id -> rank mapping
 
         self._prev_agent_data = {}
+
+        # MPI stats tracking for benchmarking
+        self._mpi_stats = {
+            'total_bytes_sent': 0,
+            'total_bytes_recv': 0,
+            'contextualize_total_time': 0.0,
+        }
 
     def clear_agent_data_cache(self):
         """Clear the previous agent data cache to force resending all agent data.
@@ -95,7 +109,7 @@ class AgentFactory:
             for agent_id, rank in partition_dict.items():
                 agents_per_rank[rank] = agents_per_rank.get(rank, 0) + 1
 
-            if self._verbose:
+            if self._verbose_timing:
                 print(f"[SAGESim] Loaded partition from dictionary")
                 print(f"[SAGESim] Number of agents in partition: {num_agents_in_partition}")
                 print(f"[SAGESim] Agents per rank: {dict(sorted(agents_per_rank.items()))}")
@@ -228,7 +242,7 @@ class AgentFactory:
             for agent_id, rank in partition_mapping.items():
                 agents_per_rank[rank] = agents_per_rank.get(rank, 0) + 1
 
-            if self._verbose:
+            if self._verbose_timing:
                 print(f"[SAGESim] Loaded network partition from: {partition_file}")
                 print(f"[SAGESim] Partition format: {format}")
                 print(f"[SAGESim] Number of agents in partition: {num_agents_in_partition}")
@@ -271,6 +285,25 @@ class AgentFactory:
         """
         return len(self._property_name_2_agent_data_tensor)
 
+    def _build_neighbor_visible_indices(self) -> None:
+        """Build cached list of property indices that are neighbor-visible.
+
+        Called lazily on first contextualization or can be called explicitly after setup.
+        """
+        self._neighbor_visible_indices = [
+            idx for name, idx in self._property_name_2_index.items()
+            if self._property_name_2_neighbor_visible.get(name, True)
+        ]
+        if worker == 0:
+            visible_props = [
+                name for name, visible in self._property_name_2_neighbor_visible.items()
+                if visible
+            ]
+            total_props = len(self._property_name_2_agent_data_tensor)
+            print(f"[SAGESim] Selective Property Sync: {len(visible_props)}/{total_props} properties are neighbor-visible")
+            if visible_props:
+                print(f"[SAGESim] Neighbor-visible properties: {visible_props}")
+
     def register_breed(self, breed: Breed) -> None:
         """
         Registered agent breed in the model so that agents can be created under
@@ -283,9 +316,16 @@ class AgentFactory:
         self._num_breeds += 1
         self._breeds[breed.name] = breed
         for property_name, default in breed.properties.items():
+            # Get neighbor_visible flag from breed (default True for backward compatibility)
+            neighbor_visible = breed.prop2neighbor_visible.get(property_name, True)
+
             if property_name in self._property_name_2_agent_data_tensor:
                 # If the property is already registered, just update the default value
                 self._property_name_2_defaults[property_name] = default
+                # Update neighbor_visible (use OR to be conservative - if any breed marks it visible, it's visible)
+                self._property_name_2_neighbor_visible[property_name] = (
+                    self._property_name_2_neighbor_visible.get(property_name, False) or neighbor_visible
+                )
             else:
                 # Register the new property
                 self._property_name_2_index[property_name] = len(
@@ -293,6 +333,7 @@ class AgentFactory:
                 )
                 self._property_name_2_agent_data_tensor[property_name] = []
                 self._property_name_2_defaults[property_name] = default
+                self._property_name_2_neighbor_visible[property_name] = neighbor_visible
 
     def create_agent(self, breed: Breed, **kwargs) -> int:
         """
@@ -313,12 +354,12 @@ class AgentFactory:
             # Use pre-loaded partition
             assigned_rank = self._partition_mapping[agent_id]
             # Debug: Print first few partition assignments
-            if self._verbose and agent_id < 5 and worker == 0:
+            if self._verbose_timing and agent_id < 5 and worker == 0:
                 print(f"[SAGESim] Agent {agent_id} assigned to rank {assigned_rank} (from METIS partition)")
         else:
             # Fall back to round-robin assignment
             assigned_rank = self._current_rank
-            if self._verbose and agent_id < 5 and worker == 0:
+            if self._verbose_timing and agent_id < 5 and worker == 0:
                 print(f"[SAGESim] Agent {agent_id} assigned to rank {assigned_rank} (round-robin)")
             self._current_rank += 1
             if self._current_rank >= num_workers:
@@ -456,6 +497,9 @@ class AgentFactory:
         Chunks agent data tensors so that each distributed worker does not
         get more data than the agents that worker processes actually need.
 
+        Uses selective property synchronization to only send properties marked
+        as neighbor_visible=True, reducing MPI communication overhead.
+
         :return: 2-tuple.
             1. agent_ids_chunks: List of Lists of agent_ids to be processed
                 by each worker.
@@ -464,11 +508,13 @@ class AgentFactory:
         """
         import math
         import time
+        t_ctx_start = time.time()
 
-        if self._verbose:
-            t_ctx_start = time.time()
-            num_isend_ops = 0
-            num_irecv_ops = 0
+        # Build neighbor-visible indices cache if not already built
+        if not self._neighbor_visible_indices and self.num_properties > 0:
+            self._build_neighbor_visible_indices()
+
+        if self._verbose_mpi_transfer:
             total_bytes_sent = 0
             total_bytes_recv = 0
 
@@ -485,6 +531,13 @@ class AgentFactory:
 
         for agent_idx in range(num_agents_this_rank):
             agent_id = agent_ids_chunk[agent_idx]
+            # OPTIMIZATION: Only collect neighbor-visible properties for sending
+            # This reduces MPI message size significantly
+            agent_adts_visible = [
+                agent_data_tensors[idx][agent_idx]
+                for idx in self._neighbor_visible_indices
+            ] if self._neighbor_visible_indices else []
+            # Keep full adts for local cache comparison
             agent_adts = [adt[agent_idx] for adt in agent_data_tensors]
             agent_neighbors = all_neighbors_list[agent_idx]
 
@@ -562,8 +615,9 @@ class AgentFactory:
                     neighborrankandagentidsvisited.add((neighbor_rank, agent_id))
                     if neighbor_rank not in neighborrank2agentidandadt.keys():
                         neighborrank2agentidandadt[neighbor_rank] = []
+                    # OPTIMIZATION: Only send neighbor-visible properties
                     neighborrank2agentidandadt[neighbor_rank].append(
-                        (agent_id, agent_adts)
+                        (agent_id, agent_adts_visible)
                     )
 
         received_neighbor_adts = []
@@ -604,9 +658,6 @@ class AgentFactory:
                         tag=0,
                     )
                 )
-                if self._verbose:
-                    num_isend_ops += 1
-                    total_bytes_sent += sys.getsizeof(num_chunks)
             else:
                 # No data to send to this rank
                 torank2numchunks[to_rank] = 0
@@ -617,22 +668,15 @@ class AgentFactory:
                         tag=0,
                     )
                 )
-                if self._verbose:
-                    num_isend_ops += 1
-                    total_bytes_sent += sys.getsizeof(0)
         # Receive num_chunks from all ranks
         recvs_num_chunks_requests = []
         for from_rank in other_ranks_from:
             recvs_num_chunks_requests.append(comm.irecv(source=from_rank, tag=0))
-            if self._verbose:
-                num_irecv_ops += 1
 
-        if self._verbose:
-            t_before_wait1 = time.time()
+        t_before_wait1 = time.time()
         MPI.Request.waitall(sends_num_chunks)
         recvs_num_chunks = MPI.Request.waitall(recvs_num_chunks_requests)
-        if self._verbose:
-            t_after_wait1 = time.time()
+        t_after_wait1 = time.time()
 
         # Send the chunks
         send_chunk_requests = []
@@ -648,9 +692,8 @@ class AgentFactory:
                         dest=to_rank,
                         tag=i + 1,
                     )
-                    if self._verbose:
-                        num_isend_ops += 1
-                        total_bytes_sent += sys.getsizeof(chunk)
+                    if self._verbose_mpi_transfer:
+                        total_bytes_sent += len(pickle.dumps(chunk))
                     if i >= len(send_chunk_requests):
                         send_chunk_requests.append([])
                     send_chunk_requests[i].append(send_chunk_request)
@@ -660,8 +703,6 @@ class AgentFactory:
             num_chunks = recvs_num_chunks[i]
             for j in range(num_chunks):
                 received_chunk_request = comm.irecv(source=from_rank, tag=j + 1)
-                if self._verbose:
-                    num_irecv_ops += 1
                 if j >= len(recv_chunk_requests):
                     recv_chunk_requests.append([])
                 recv_chunk_requests[j].append(received_chunk_request)
@@ -670,8 +711,7 @@ class AgentFactory:
         num_send_chunk_requests = len(send_chunk_requests)
         num_recv_chunk_requests = len(recv_chunk_requests)
 
-        if self._verbose:
-            t_before_wait2 = time.time()
+        t_before_wait2 = time.time()
         for i in range(max(num_send_chunk_requests, num_recv_chunk_requests)):
             if i < num_send_chunk_requests:
                 MPI.Request.waitall(send_chunk_requests[i])
@@ -679,29 +719,46 @@ class AgentFactory:
                 received_data_ranks_chunk = MPI.Request.waitall(recv_chunk_requests[i])
                 for received_data_rank_chunk in received_data_ranks_chunk:
                     received_data.extend(received_data_rank_chunk)
-        if self._verbose:
-            t_after_wait2 = time.time()
+        t_after_wait2 = time.time()
 
         # Process received chunks
+        # OPTIMIZATION: Reconstruct full property list from neighbor-visible subset
         received_neighbor_adts = [[] for _ in range(self.num_properties)]
         received_neighbor_ids = []
-        for neighbor_idx, (neighbor_id, adts) in enumerate(received_data):
+
+        # Build mapping: prop_idx -> visible_idx (position in adts_visible)
+        prop_idx_to_visible_idx = {
+            prop_idx: visible_idx
+            for visible_idx, prop_idx in enumerate(self._neighbor_visible_indices)
+        }
+
+        for neighbor_idx, (neighbor_id, adts_visible) in enumerate(received_data):
             received_neighbor_ids.append(neighbor_id)
-            if self._verbose:
-                total_bytes_recv += sys.getsizeof(neighbor_id) + sys.getsizeof(adts)
+            if self._verbose_mpi_transfer:
+                total_bytes_recv += len(pickle.dumps((neighbor_id, adts_visible)))
+
+            # Reconstruct full property list from neighbor-visible subset
             for prop_idx in range(self.num_properties):
-                received_neighbor_adts[prop_idx].append(adts[prop_idx])
+                if prop_idx in prop_idx_to_visible_idx:
+                    # This property was sent - get its value from adts_visible
+                    visible_idx = prop_idx_to_visible_idx[prop_idx]
+                    received_neighbor_adts[prop_idx].append(adts_visible[visible_idx])
+                else:
+                    # This property was not sent - use None as placeholder
+                    # (it won't be read by neighbors anyway)
+                    received_neighbor_adts[prop_idx].append(None)
 
-        if self._verbose:
-            t_ctx_end = time.time()
-            total_agents_to_send = sum(len(v) for v in neighborrank2agentidandadt.values())
-            print(f"  [Rank {worker}] [contextualize] Total time: {t_ctx_end - t_ctx_start:.3f}s")
-            print(f"  [Rank {worker}] [contextualize] - Wait for chunk counts: {t_after_wait1 - t_before_wait1:.3f}s")
-            print(f"  [Rank {worker}] [contextualize] - Wait for chunks: {t_after_wait2 - t_before_wait2:.3f}s")
-            print(f"  [Rank {worker}] [contextualize] - Agents to send: {total_agents_to_send}, Received: {len(received_neighbor_ids)}")
-            print(f"  [Rank {worker}] [MPI ops] isend: {num_isend_ops}, irecv: {num_irecv_ops}")
-            print(f"  [Rank {worker}] [MPI data] Sent: {total_bytes_sent/1024/1024:.2f} MB, Recv: {total_bytes_recv/1024/1024:.2f} MB")
+        t_ctx_end = time.time()
 
+        # Timing verbose output
+        if self._verbose_timing:
+            print(f"  [Rank {worker}] [contextualize] Total={t_ctx_end - t_ctx_start:.3f}s (wait_counts={t_after_wait1 - t_before_wait1:.3f}s, wait_chunks={t_after_wait2 - t_before_wait2:.3f}s)", flush=True)
+            self._mpi_stats['contextualize_total_time'] += (t_ctx_end - t_ctx_start)
+
+        # MPI transfer tracking (accumulate stats silently, summary printed at end)
+        if self._verbose_mpi_transfer:
+            self._mpi_stats['total_bytes_sent'] += total_bytes_sent
+            self._mpi_stats['total_bytes_recv'] += total_bytes_recv
         return (
             agent_ids_chunk,
             agent_data_tensors,
