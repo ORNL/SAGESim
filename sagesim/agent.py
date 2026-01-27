@@ -294,15 +294,6 @@ class AgentFactory:
             idx for name, idx in self._property_name_2_index.items()
             if self._property_name_2_neighbor_visible.get(name, True)
         ]
-        if worker == 0:
-            visible_props = [
-                name for name, visible in self._property_name_2_neighbor_visible.items()
-                if visible
-            ]
-            total_props = len(self._property_name_2_agent_data_tensor)
-            print(f"[SAGESim] Selective Property Sync: {len(visible_props)}/{total_props} properties are neighbor-visible")
-            if visible_props:
-                print(f"[SAGESim] Neighbor-visible properties: {visible_props}")
 
     def register_breed(self, breed: Breed) -> None:
         """
@@ -353,14 +344,9 @@ class AgentFactory:
         if self._partition_loaded and agent_id in self._partition_mapping:
             # Use pre-loaded partition
             assigned_rank = self._partition_mapping[agent_id]
-            # Debug: Print first few partition assignments
-            if self._verbose_timing and agent_id < 5 and worker == 0:
-                print(f"[SAGESim] Agent {agent_id} assigned to rank {assigned_rank} (from METIS partition)")
         else:
             # Fall back to round-robin assignment
             assigned_rank = self._current_rank
-            if self._verbose_timing and agent_id < 5 and worker == 0:
-                print(f"[SAGESim] Agent {agent_id} assigned to rank {assigned_rank} (round-robin)")
             self._current_rank += 1
             if self._current_rank >= num_workers:
                 self._current_rank = 0

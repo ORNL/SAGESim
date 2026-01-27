@@ -297,7 +297,6 @@ class TestDoubleBuffer(unittest.TestCase):
         
         # Run simulation
         # test with 1 tick to make sure infection spreads only to the middle agents
-        print(f"Running simulation with 1 tick, sync_workers_every_n_ticks=1")
         self.model.simulate(1, sync_workers_every_n_ticks=1)
 
         
@@ -324,7 +323,6 @@ class TestDoubleBuffer(unittest.TestCase):
         self.model.setup(use_gpu=True) 
         
         # Run simulation for 2 ticks
-        print(f"Running SIR simulation with 2 ticks, sync_workers_every_n_ticks=1")
         self.model.simulate(2, sync_workers_every_n_ticks=1)
         
         # After 2 ticks with SIR model (infection and recovery prob = 1):

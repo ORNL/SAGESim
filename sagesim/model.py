@@ -435,7 +435,7 @@ class Model:
         # Exclude no_double_buffer properties from write buffer creation
         self._write_property_indices = self._write_property_indices - no_double_buffer_indices
 
-        if worker == 0 and no_double_buffer_indices:
+        if self._verbose_timing and worker == 0 and no_double_buffer_indices:
             excluded_props = [
                 name for name, idx in self._agent_factory._property_name_2_index.items()
                 if idx in no_double_buffer_indices
@@ -457,8 +457,11 @@ class Model:
         comm.barrier()
 
         # Import and cache the step function once during setup
+        # Suppress expected CuPy/Numba JIT compilation warnings
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            warnings.filterwarnings("ignore", message=".*numba.*", category=Warning)
             step_func_module = importlib.import_module(
                 os.path.splitext(self._step_function_file_path)[0]
             )

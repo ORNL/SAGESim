@@ -122,7 +122,7 @@ self._neighbor_visible_indices: List[int] = []  # Cached list of neighbor-visibl
 
 ### Step 1: Build Neighbor-Visible Index Cache
 
-**Location:** `sagesim/agent.py:288-306`
+**Location:** `sagesim/agent.py:288-296`
 
 At simulation start, the system builds a cached list of which property indices are neighbor-visible:
 
@@ -136,15 +136,6 @@ def _build_neighbor_visible_indices(self) -> None:
         idx for name, idx in self._property_name_2_index.items()
         if self._property_name_2_neighbor_visible.get(name, True)
     ]
-    if worker == 0:
-        visible_props = [
-            name for name, visible in self._property_name_2_neighbor_visible.items()
-            if visible
-        ]
-        total_props = len(self._property_name_2_agent_data_tensor)
-        print(f"[SAGESim] Selective Property Sync: {len(visible_props)}/{total_props} properties are neighbor-visible")
-        if visible_props:
-            print(f"[SAGESim] Neighbor-visible properties: {visible_props}")
 ```
 
 **Example:**
