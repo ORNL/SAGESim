@@ -637,12 +637,14 @@ class Model:
             """Recursively create a zero-filled copy matching the structure of sample."""
             if isinstance(sample, np.ndarray):
                 return np.zeros_like(sample)  # Keep as numpy array for fast vectorized path
-            elif isinstance(sample, (list, tuple)):
+            elif isinstance(sample, (list, tuple, set)):
                 if len(sample) == 0:
                     return []
-                # Check if elements are nested (lists/tuples) or scalars
-                if isinstance(sample[0], (list, tuple, np.ndarray)):
-                    return [create_zero_placeholder(elem) for elem in sample]
+                # Convert set to list for indexing
+                sample_list = list(sample) if isinstance(sample, set) else sample
+                # Check if elements are nested (lists/tuples/sets) or scalars
+                if isinstance(sample_list[0], (list, tuple, set, np.ndarray)):
+                    return [create_zero_placeholder(elem) for elem in sample_list]
                 else:
                     return [0.0] * len(sample)
             else:

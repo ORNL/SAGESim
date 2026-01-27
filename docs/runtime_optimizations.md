@@ -676,7 +676,7 @@ Total: 14.33s
 4. **RCCL/NCCL Integration**: Use GPU-native collectives for global reductions
 5. **Kernel Fusion**: Combine multiple priority groups when safe
 
-See `docs/GPU_OPTIMIZATION_ROADMAP.md` for detailed plans.
+See `gpu_optimization_roadmap.md` for detailed plans.
 
 ### Profiling Tools
 
