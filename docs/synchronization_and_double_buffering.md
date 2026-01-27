@@ -179,13 +179,13 @@ Thread 2:  │ A0=S    │──read──►compute──► │ A2=S    │
 
 ## Implementation in SAGESim
 
-### Buffer Creation (`model.py:678-684`)
+### Buffer Creation (`model.py:701-707`)
 
 ```python
 # Create write buffers for properties that need them
 write_buffers = []
 for prop_idx in self._write_property_indices:
-    # Create a COPY of the read tensor
+    # Create a copy of the tensor for writing
     write_buffer = cp.array(rank_local_agent_and_neighbor_adts[prop_idx])
     write_buffers.append(write_buffer)
 ```
@@ -195,14 +195,18 @@ Key points:
 - Write buffer starts as a **copy** of read buffer
 - Separate GPU memory allocation
 
-### Kernel Arguments (`model.py:686-694`)
+### Kernel Arguments (`model.py:709-717`)
 
 ```python
 # Prepare all arguments: read tensors + write tensors
+# Use converted locations for kernel, but keep original in rank_local_agent_and_neighbor_adts
 all_args = []
 for i, tensor in enumerate(rank_local_agent_and_neighbor_adts):
-    all_args.append(tensor)  # Read tensors first
-all_args = all_args + write_buffers  # Write tensors after
+    if i == 1 and locations_for_kernel is not None:
+        all_args.append(locations_for_kernel)  # Use converted indices for kernel
+    else:
+        all_args.append(tensor)  # Use original
+all_args = all_args + write_buffers
 ```
 
 The generated kernel receives both:
@@ -237,10 +241,11 @@ if read_health[agent_idx] == SUSCEPTIBLE:
             break
 ```
 
-### Buffer Copy After Tick (`model.py:728-729`)
+### Buffer Copy After Tick (`model.py:745-748`)
 
 ```python
 # Copy write buffers back to read buffers after ALL priority groups complete
+# This ensures all priorities execute with the same read buffer (state at start of tick)
 for i, prop_idx in enumerate(self._write_property_indices):
     rank_local_agent_and_neighbor_adts[prop_idx][:len(self.__rank_local_agent_ids)] = \
         write_buffers[i][:len(self.__rank_local_agent_ids)]
@@ -290,15 +295,32 @@ SAGESim allows **step functions** to be registered with different priorities. Th
 
 ### API: Registering Step Functions with Priorities
 
-**Location:** `sagesim/breed.py:60-67`
+**Location:** `sagesim/breed.py:66-94`
 
 ```python
-def register_step_func(self, step_func: Callable, module_fpath: str, priority: int = 0):
+def register_step_func(
+    self,
+    step_func: Callable,
+    module_fpath: str,
+    priority: int = 0,
+    no_double_buffer: Optional[List[str]] = None,
+):
     """
-    Register a step function with a specific priority.
-    Lower priority numbers execute first.
+    What the agent is supposed to do during a simulation step.
+
+    :param step_func: The step function to execute
+    :param module_fpath: Path to the module containing the step function
+    :param priority: Execution priority (lower values execute first)
+    :param no_double_buffer: List of property names that should NOT use double
+        buffering in this step function. These properties will write directly
+        to the read buffer, making changes visible to subsequent priorities
+        within the same tick.
     """
     self._step_funcs[priority] = (step_func, module_fpath)
+
+    # Accumulate no_double_buffer properties from all step functions
+    if no_double_buffer:
+        self._no_double_buffer_props.update(no_double_buffer)
 ```
 
 ### Example: Single Breed with Multiple Priorities
@@ -374,7 +396,7 @@ self._breed_idx_2_step_func_by_priority: List[Dict[int, Callable]] = []
 heap_priority_breedidx_func = []
 
 # Collect all (priority, breed_idx, func) tuples
-for breed in self._breeds:
+for breed in self._agent_factory.breeds:
     for priority, func in breed.step_funcs.items():
         heap_priority_breedidx_func.append((priority, (breed._breedidx, func)))
 
@@ -386,10 +408,14 @@ while heap_priority_breedidx_func:
     priority, breed_idx_func = heapq.heappop(heap_priority_breedidx_func)
     if last_priority == priority:
         # Same priority: add to current group
-        self._breed_idx_2_step_func_by_priority[-1].update({breed_idx_func[0]: breed_idx_func[1]})
+        self._breed_idx_2_step_func_by_priority[-1].update(
+            {breed_idx_func[0]: breed_idx_func[1]}
+        )
     else:
         # New priority: create new group
-        self._breed_idx_2_step_func_by_priority.append({breed_idx_func[0]: breed_idx_func[1]})
+        self._breed_idx_2_step_func_by_priority.append(
+            {breed_idx_func[0]: breed_idx_func[1]}
+        )
         last_priority = priority
 ```
 
@@ -430,29 +456,35 @@ All priorities within a tick see the **same state** (the state at tick start). T
 
 ### Execution Flow with Priorities
 
-**Location:** `sagesim/model.py:706-734`
+**Location:** `sagesim/model.py:725-756`
 
 ```python
 for tick_offset in range(sync_workers_every_n_ticks):
     current_tick = self.tick + tick_offset
 
-    # Execute each priority group with GPU synchronization
+    # Execute each breed priority group separately with synchronization
     for priority_idx, priority_group in enumerate(self._breed_idx_2_step_func_by_priority):
-        # Launch kernel for this priority group only
-        self._step_func[blocks, threads](
-            current_tick, global_data, *all_args,
-            1, num_local_agents, agent_ids,
-            priority_idx  # Which priority group to execute
+        # Execute step functions for this breed priority group only
+        self._step_func[blockspergrid, threadsperblock](
+            current_tick,
+            self._global_data_vector,
+            *all_args,
+            1,  # Process exactly 1 tick
+            cp.float32(len(self.__rank_local_agent_ids)),
+            rank_local_agent_and_non_local_neighbor_ids,
+            priority_idx,  # Which priority group to execute
         )
 
-        # GPU SYNC: Wait for all threads in this priority to complete
+        # Synchronization barrier: Wait for all blocks to complete this breed phase
         cp.cuda.Stream.null.synchronize()
 
-    # BUFFER COPY: Only after ALL priorities complete
+    # Copy write buffers back to read buffers after ALL priority groups complete
+    # This ensures all priorities execute with the same read buffer (state at start of tick)
     for i, prop_idx in enumerate(self._write_property_indices):
-        read_buffer[prop_idx][:num_local] = write_buffer[i][:num_local]
+        rank_local_agent_and_neighbor_adts[prop_idx][:len(self.__rank_local_agent_ids)] = \
+            write_buffers[i][:len(self.__rank_local_agent_ids)]
 
-    # GPU SYNC: Ensure copy completes before next tick
+    # Final synchronization before next tick
     cp.cuda.Stream.null.synchronize()
 ```
 
@@ -543,6 +575,96 @@ Buffer copy: write_buffer → read_buffer  ← Only once per tick
 
 ---
 
+## Disabling Double Buffering: `no_double_buffer`
+
+### When to Disable Double Buffering
+
+By default, all written properties use double buffering for safety. However, there are cases where you want a later priority to see changes made by an earlier priority **within the same tick**:
+
+```
+Priority 1: Gap writes litter_accum
+Priority 2: Site reads litter_accum → Needs to see the value written at P1!
+```
+
+With double buffering, Site would see the **start-of-tick** value, not the updated value. The `no_double_buffer` parameter solves this.
+
+### API: Disabling Double Buffering
+
+**Location:** `sagesim/breed.py:66-94`
+
+```python
+def register_step_func(
+    self,
+    step_func: Callable,
+    module_fpath: str,
+    priority: int = 0,
+    no_double_buffer: Optional[List[str]] = None,
+):
+    """
+    :param no_double_buffer: List of property names that should NOT use double
+        buffering in this step function. These properties will write directly
+        to the read buffer, making changes visible to subsequent priorities
+        within the same tick.
+    """
+```
+
+### Usage Example
+
+```python
+# Gap breed writes states at P1, Site reads at P2
+gap_breed.register_step_func(
+    gap_aggregate_step, __file__, priority=1,
+    no_double_buffer=["params", "states"],  # Site needs to see these changes
+)
+
+# Site reads Gap.states at P2 - sees the updated value from P1!
+site_breed.register_step_func(site_soil_step, __file__, priority=2)
+```
+
+### Implementation
+
+**Location:** `sagesim/model.py:411-443`
+
+During setup, SAGESim collects all `no_double_buffer` properties from all breeds and excludes them from write buffer creation:
+
+```python
+# Collect all no_double_buffer property names from all breeds
+no_double_buffer_prop_names = set()
+for breed in self._agent_factory.breeds:
+    no_double_buffer_prop_names.update(breed.no_double_buffer_props)
+
+# Convert property names to indices
+no_double_buffer_indices = set()
+for prop_name in no_double_buffer_prop_names:
+    if prop_name in self._agent_factory._property_name_2_index:
+        no_double_buffer_indices.add(
+            self._agent_factory._property_name_2_index[prop_name]
+        )
+
+# Exclude no_double_buffer properties from write buffer creation
+self._write_property_indices = self._write_property_indices - no_double_buffer_indices
+```
+
+### When to Use `no_double_buffer`
+
+| Scenario | Use `no_double_buffer`? | Why |
+|----------|------------------------|-----|
+| Same-priority parallel reads | **NO** | Need buffering to prevent race conditions |
+| Later priority reads earlier write (same tick) | **YES** | Must see updated value |
+| Earlier priority reads later write | No (doesn't matter) | Reader runs first anyway |
+| Cross-tick visibility is acceptable | No | Double buffering works fine |
+
+### Trade-offs
+
+| With Double Buffering | Without Double Buffering (`no_double_buffer`) |
+|----------------------|----------------------------------------------|
+| Consistent tick-start snapshot | Mid-tick visibility |
+| Safe for same-priority reads | **UNSAFE** for same-priority reads |
+| Extra memory for write buffer | Direct write to read buffer |
+| Later priorities see old values | Later priorities see updated values |
+
+---
+
 ## Synchronization Levels
 
 ### Level 1: MPI Worker Synchronization (CPU)
@@ -576,25 +698,32 @@ comm.allreduce(global_data_vector, op=reduce_func)
 
 ### Level 2: GPU Thread Synchronization (Within Worker)
 
-**Location**: `model.py` `worker_coroutine()` lines 706-734
+**Location**: `model.py` `worker_coroutine()` lines 725-756
 
 ```python
 for tick_offset in range(sync_workers_every_n_ticks):
     current_tick = self.tick + tick_offset
 
-    for priority_idx, priority_group in enumerate(breed_priority_groups):
-        # Launch GPU kernel for this priority
-        self._step_func[blocks, threads](
-            current_tick, global_data, *all_args,
-            1, num_local_agents, agent_ids, priority_idx
+    # Execute each breed priority group separately with synchronization
+    for priority_idx, priority_group in enumerate(self._breed_idx_2_step_func_by_priority):
+        # Execute step functions for this breed priority group only
+        self._step_func[blockspergrid, threadsperblock](
+            current_tick,
+            self._global_data_vector,
+            *all_args,
+            1,  # Process exactly 1 tick
+            cp.float32(len(self.__rank_local_agent_ids)),
+            rank_local_agent_and_non_local_neighbor_ids,
+            priority_idx,  # Which priority group to execute
         )
 
         # SYNC POINT 1: Wait for all GPU threads to finish this priority
         cp.cuda.Stream.null.synchronize()
 
     # Copy write buffers → read buffers (once per tick, after all priorities)
-    for i, prop_idx in enumerate(write_property_indices):
-        read_buffer[prop_idx][:num_local] = write_buffer[i][:num_local]
+    for i, prop_idx in enumerate(self._write_property_indices):
+        rank_local_agent_and_neighbor_adts[prop_idx][:len(self.__rank_local_agent_ids)] = \
+            write_buffers[i][:len(self.__rank_local_agent_ids)]
 
     # SYNC POINT 2: Ensure copy completes before next tick
     cp.cuda.Stream.null.synchronize()
@@ -666,10 +795,13 @@ The small overhead of double buffering (extra memory + one GPU-to-GPU copy per t
 
 | Component | File | Lines |
 |-----------|------|-------|
-| Write property detection | `model.py` | `analyze_step_function_for_writes()` |
-| Double buffer creation | `model.py` | 678-684 |
-| Kernel argument setup | `model.py` | 686-694 |
-| Priority loop + sync | `model.py` | 706-734 |
-| Buffer copy | `model.py` | 728-729 |
-| GPU kernel generation | `model.py` | `generate_gpu_func()` |
-| MPI contextualization | `agent.py` | `contextualize_agent_data_tensors()` |
+| Write property detection | `model.py` | 225-267 (`analyze_step_function_for_writes()`) |
+| Double buffer creation | `model.py` | 701-707 |
+| Kernel argument setup | `model.py` | 709-717 |
+| Priority loop + sync | `model.py` | 725-756 |
+| Buffer copy | `model.py` | 745-748 |
+| no_double_buffer handling | `model.py` | 411-443 |
+| GPU kernel generation | `model.py` | 820-1130 (`generate_gpu_func()`) |
+| Priority group organization | `model.py` | 388-408 |
+| Step function registration | `breed.py` | 66-94 |
+| MPI contextualization | `agent.py` | 493-767 (`contextualize_agent_data_tensors()`) |

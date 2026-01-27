@@ -53,7 +53,7 @@ Data per tick = 500,000 agents × 3 properties × 4 bytes = 6 MB per worker pair
 
 ### API: Registering Properties
 
-**Location:** `sagesim/breed.py:37-58`
+**Location:** `sagesim/breed.py:38-59`
 
 ```python
 def register_property(
@@ -61,7 +61,7 @@ def register_property(
     name: str,
     default: Union[int, float, List] = nan,
     max_dims: Optional[List[int]] = None,
-    neighbor_visible: bool = True,  # NEW PARAMETER
+    neighbor_visible: bool = True,
 ) -> None:
     """
     Register a property for this breed.
@@ -73,6 +73,11 @@ def register_property(
         neighboring workers during MPI synchronization. Set to False for properties
         that are never read by neighbors to reduce communication overhead.
     """
+    self._properties[name] = default
+    self._prop2pos[name] = self._num_properties
+    self._num_properties += 1
+    self._prop2maxdims[name] = max_dims
+    self._prop2neighbor_visible[name] = neighbor_visible
 ```
 
 ### Usage Example
@@ -96,7 +101,7 @@ class Neuron(Breed):
 
 By default, `breed` and `locations` are marked as NOT neighbor-visible:
 
-**Location:** `sagesim/agent.py:48-51`
+**Location:** `sagesim/agent.py:47-51`
 
 ```python
 # Track which properties need to be sent to neighbors during MPI sync
@@ -104,6 +109,7 @@ By default, `breed` and `locations` are marked as NOT neighbor-visible:
 self._property_name_2_neighbor_visible = OrderedDict(
     {"breed": False, "locations": False}
 )
+self._neighbor_visible_indices: List[int] = []  # Cached list of neighbor-visible property indices
 ```
 
 **Why?**
@@ -116,17 +122,29 @@ self._property_name_2_neighbor_visible = OrderedDict(
 
 ### Step 1: Build Neighbor-Visible Index Cache
 
-**Location:** `sagesim/agent.py:288-302`
+**Location:** `sagesim/agent.py:288-306`
 
 At simulation start, the system builds a cached list of which property indices are neighbor-visible:
 
 ```python
 def _build_neighbor_visible_indices(self) -> None:
-    """Build cached list of property indices that are neighbor-visible."""
+    """Build cached list of property indices that are neighbor-visible.
+
+    Called lazily on first contextualization or can be called explicitly after setup.
+    """
     self._neighbor_visible_indices = [
         idx for name, idx in self._property_name_2_index.items()
         if self._property_name_2_neighbor_visible.get(name, True)
     ]
+    if worker == 0:
+        visible_props = [
+            name for name, visible in self._property_name_2_neighbor_visible.items()
+            if visible
+        ]
+        total_props = len(self._property_name_2_agent_data_tensor)
+        print(f"[SAGESim] Selective Property Sync: {len(visible_props)}/{total_props} properties are neighbor-visible")
+        if visible_props:
+            print(f"[SAGESim] Neighbor-visible properties: {visible_props}")
 ```
 
 **Example:**
@@ -180,11 +198,12 @@ neighborrank2agentidandadt[neighbor_rank].append(
 
 ### Step 4: Reconstruct Full Property List on Receive
 
-**Location:** `sagesim/agent.py:725-749`
+**Location:** `sagesim/agent.py:724-749`
 
 The receiving worker must reconstruct the full property list, inserting `None` placeholders for non-visible properties:
 
 ```python
+# Process received chunks
 # OPTIMIZATION: Reconstruct full property list from neighbor-visible subset
 received_neighbor_adts = [[] for _ in range(self.num_properties)]
 received_neighbor_ids = []
@@ -197,6 +216,8 @@ prop_idx_to_visible_idx = {
 
 for neighbor_idx, (neighbor_id, adts_visible) in enumerate(received_data):
     received_neighbor_ids.append(neighbor_id)
+    if self._verbose_mpi_transfer:
+        total_bytes_recv += len(pickle.dumps((neighbor_id, adts_visible)))
 
     # Reconstruct full property list from neighbor-visible subset
     for prop_idx in range(self.num_properties):
@@ -224,21 +245,27 @@ Reconstructed full list:
 
 ### Step 5: Handle None Placeholders in Data Preparation
 
-**Location:** `sagesim/model.py:627-640`
+**Location:** `sagesim/model.py:651-668`
 
 During GPU data preparation, `None` placeholders are replaced with zero-filled arrays matching the expected structure:
 
 ```python
-# Handle non-neighbor-visible properties: replace None with placeholder values
-# For properties not sent during MPI sync, received_neighbor_adts contains None
-if received_data and received_data[0] is None:
-    # Use placeholder matching the structure of local data
-    local_data = self.__rank_local_agent_data_tensors[i]
-    if local_data:
-        placeholder = create_zero_placeholder(local_data[0])
-    else:
-        placeholder = 0.0
-    received_data = [placeholder for _ in range(len(received_data))]
+for i in range(self._agent_factory.num_properties):
+    received_data = received_neighbor_adts[i]
+
+    # Handle non-neighbor-visible properties: replace None with placeholder values
+    # For properties not sent during MPI sync, received_neighbor_adts contains None
+    if received_data and received_data[0] is None:
+        # Use placeholder matching the structure of local data
+        # Note: This assumes all agents have the same structure for each property.
+        local_data = self.__rank_local_agent_data_tensors[i]
+        if local_data:
+            placeholder = create_zero_placeholder(local_data[0])
+        else:
+            placeholder = 0.0
+        received_data = [placeholder for _ in range(len(received_data))]
+
+    combined = self.__rank_local_agent_data_tensors[i] + received_data
 ```
 
 **Why zero placeholders?**
@@ -306,13 +333,18 @@ Agent 5 properties:
 
 When multiple breeds share a property name, the `neighbor_visible` flags are merged using OR logic:
 
-**Location:** `sagesim/agent.py:325-328`
+**Location:** `sagesim/agent.py:320-328`
+
+During breed registration, if the property already exists, the visibility flag is merged:
 
 ```python
-# Update neighbor_visible (use OR to be conservative - if any breed marks it visible, it's visible)
-self._property_name_2_neighbor_visible[property_name] = (
-    self._property_name_2_neighbor_visible.get(property_name, False) or neighbor_visible
-)
+if property_name in self._property_name_2_agent_data_tensor:
+    # If the property is already registered, just update the default value
+    self._property_name_2_defaults[property_name] = default
+    # Update neighbor_visible (use OR to be conservative - if any breed marks it visible, it's visible)
+    self._property_name_2_neighbor_visible[property_name] = (
+        self._property_name_2_neighbor_visible.get(property_name, False) or neighbor_visible
+    )
 ```
 
 **Example:**
@@ -421,10 +453,12 @@ model.simulate(100)
 
 | Component | File | Lines |
 |-----------|------|-------|
-| Property registration API | `breed.py` | 37-58 |
-| Default visibility (breed, locations) | `agent.py` | 48-51 |
-| Build visible indices cache | `agent.py` | 288-302 |
+| Property registration API | `breed.py` | 38-59 |
+| Default visibility (breed, locations) | `agent.py` | 47-52 |
+| Build visible indices cache | `agent.py` | 288-306 |
 | Filter during MPI send | `agent.py` | 534-539 |
-| Reconstruct on receive | `agent.py` | 725-749 |
-| Handle None placeholders | `model.py` | 627-640 |
+| Send filtered data via MPI | `agent.py` | 618-621 |
+| Reconstruct on receive | `agent.py` | 724-749 |
+| Handle None placeholders | `model.py` | 651-668 |
 | Visibility merging (OR logic) | `agent.py` | 325-328 |
+| Breed registration (OR merge) | `agent.py` | 307-336 |

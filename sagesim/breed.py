@@ -1,4 +1,4 @@
-from typing import Any, Callable, List, Dict, Optional, Union
+from typing import Any, Callable, List, Dict, Optional, Union, Set
 from collections import OrderedDict
 from math import nan
 
@@ -16,6 +16,7 @@ class Breed:
         self._num_properties: int = 0
         self._prop2maxdims: Dict[str, List[int]] = {}
         self._prop2neighbor_visible: Dict[str, bool] = {}
+        self._no_double_buffer_props: Set[str] = set()  # Properties that should not use double buffering
 
     @property
     def name(self) -> str:
@@ -57,11 +58,37 @@ class Breed:
         self._prop2maxdims[name] = max_dims
         self._prop2neighbor_visible[name] = neighbor_visible
 
+    @property
+    def no_double_buffer_props(self) -> Set[str]:
+        """Returns the set of property names that should not use double buffering."""
+        return self._no_double_buffer_props
+
     def register_step_func(
-        self, step_func: Callable, module_fpath: str, priority: int = 0
+        self,
+        step_func: Callable,
+        module_fpath: str,
+        priority: int = 0,
+        no_double_buffer: Optional[List[str]] = None,
     ):
         """
         What the agent is supposed to do during a simulation step.
 
+        :param step_func: The step function to execute
+        :param module_fpath: Path to the module containing the step function
+        :param priority: Execution priority (lower values execute first)
+        :param no_double_buffer: List of property names that should NOT use double
+            buffering in this step function. These properties will write directly
+            to the read buffer, making changes visible to subsequent priorities
+            within the same tick. Default is None (all written properties use
+            double buffering for safety).
+
+            Use this when:
+            - Reader priority < Writer priority (reader runs before writer)
+            - Accessing different indices (e.g., temporal arrays with t vs t-1)
+            - You explicitly want same-tick visibility between priorities
         """
         self._step_funcs[priority] = (step_func, module_fpath)
+
+        # Accumulate no_double_buffer properties from all step functions
+        if no_double_buffer:
+            self._no_double_buffer_props.update(no_double_buffer)

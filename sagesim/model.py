@@ -408,6 +408,22 @@ class Model:
                 last_priority = priority
 
 
+        # Collect all no_double_buffer property names from all breeds
+        no_double_buffer_prop_names = set()
+        for breed in self._agent_factory.breeds:
+            no_double_buffer_prop_names.update(breed.no_double_buffer_props)
+
+        # Convert property names to indices
+        no_double_buffer_indices = set()
+        for prop_name in no_double_buffer_prop_names:
+            if prop_name in self._agent_factory._property_name_2_index:
+                no_double_buffer_indices.add(
+                    self._agent_factory._property_name_2_index[prop_name]
+                )
+            else:
+                if worker == 0:
+                    print(f"[SAGESim] Warning: no_double_buffer property '{prop_name}' not found")
+
         # Determine and cache write property indices once during setup
         self._write_property_indices = set()
         for breed_idx_2_step_func in self._breed_idx_2_step_func_by_priority:
@@ -416,11 +432,21 @@ class Model:
                 write_indices = analyze_step_function_for_writes(breed_step_func_impl, self._agent_factory.num_properties)
                 self._write_property_indices.update(write_indices)
 
+        # Exclude no_double_buffer properties from write buffer creation
+        self._write_property_indices = self._write_property_indices - no_double_buffer_indices
+
+        if worker == 0 and no_double_buffer_indices:
+            excluded_props = [
+                name for name, idx in self._agent_factory._property_name_2_index.items()
+                if idx in no_double_buffer_indices
+            ]
+            print(f"[SAGESim] Double buffering disabled for properties: {excluded_props}")
+
         # Sort write property indices for consistent ordering
         self._write_property_indices = sorted(self._write_property_indices)
 
         if worker == 0:
-            with open(self._step_function_file_path, "w") as f:
+            with open(self._step_function_file_path, "w", encoding="utf-8") as f:
                 f.write(
                     generate_gpu_func(
                         self._agent_factory.num_properties,
@@ -562,8 +588,8 @@ class Model:
             self._agent_factory._rank2agentid2agentidx[worker].keys()
         )
 
-        if self._verbose_timing:
-            print(f"[Rank {worker}] Tick {self.tick}: worker_coroutine started, local agents: {len(self.__rank_local_agent_ids)}", flush=True)
+        # Timing variables for verbose output (collected throughout, printed at end)
+        timing_data = {} if self._verbose_timing else None
 
         threadsperblock = 32
         blockspergrid = int(
@@ -590,7 +616,9 @@ class Model:
         t_after_context = time.time()
 
         if self._verbose_timing:
-            print(f"[Rank {worker}] Tick {self.tick}: neighbor_compute={t_neighbor_end - t_neighbor_start:.3f}s, contextualize={t_after_context - t_before_context:.3f}s, received {len(received_neighbor_ids)} neighbors", flush=True)
+            timing_data['neighbor'] = t_neighbor_end - t_neighbor_start
+            timing_data['contextualize'] = t_after_context - t_before_context
+            timing_data['num_neighbors'] = len(received_neighbor_ids)
 
         t_data_prep_start = time.time()
         self._global_data_vector = cp.array(self._global_data_vector)
@@ -642,11 +670,6 @@ class Model:
             combined = self.__rank_local_agent_data_tensors[i] + received_data
 
             if i == 1:  # Property 1 is 'locations' (neighbors/connections)
-                # DEBUG: Check data types on Tick 1+
-                if self._verbose_timing and self.tick > 0 and worker == 0:
-                    local_sample = self.__rank_local_agent_data_tensors[i][0] if self.__rank_local_agent_data_tensors[i] else None
-                    recv_sample = received_data[0] if received_data else None
-                    print(f"[DEBUG] Tick {self.tick}: local_type={type(local_sample).__name__}, recv_type={type(recv_sample).__name__}")
                 # Convert agent IDs to local indices while still a list
                 combined = convert_agent_ids_to_indices(combined, agent_id_to_index)
 
@@ -696,11 +719,7 @@ class Model:
         t_data_prep_end = time.time()
 
         if self._verbose_timing:
-            # Find slowest tensor conversions
-            tensor_times.sort(key=lambda x: x[1], reverse=True)
-            top3 = tensor_times[:3]
-            top3_str = ", ".join([f"prop{i}={t:.3f}s" for i, t in top3])
-            print(f"[Rank {worker}] Tick {self.tick}: combine_lists={t_combine_end - t_combine_start:.3f}s, tensor_convert={t_tensor_convert_end - t_tensor_convert_start:.3f}s (top3: {top3_str}), loc_kernel={t_loc_end - t_loc_start:.3f}s, buffers={t_buf_end - t_buf_start:.3f}s", flush=True)
+            timing_data['data_prep'] = t_data_prep_end - t_data_prep_start
 
         # CROSS-BREED SYNCHRONIZATION: Process breeds sequentially within each tick
         t_gpu_kernel_start = time.time()
@@ -737,7 +756,7 @@ class Model:
         t_gpu_kernel_end = time.time()
 
         if self._verbose_timing:
-            print(f"[Rank {worker}] Tick {self.tick}: gpu_kernel={t_gpu_kernel_end - t_gpu_kernel_start:.3f}s", flush=True)
+            timing_data['gpu_kernel'] = t_gpu_kernel_end - t_gpu_kernel_start
 
         cp.get_default_memory_pool().free_all_blocks()
         t_post_start = time.time()
@@ -780,9 +799,17 @@ class Model:
 
         t_end = time.time()
         if self._verbose_timing:
-            barrier_time = t_after_barrier - t_before_barrier
-            print(f"[Rank {worker}] Tick {self.tick}: post_process={t_post_end - t_post_start:.3f}s, barrier={barrier_time:.3f}s, allreduce={t_after_allreduce - t_before_allreduce:.3f}s", flush=True)
-            print(f"[Rank {worker}] Tick {self.tick}: === TOTAL worker_coroutine={t_end - t_start:.3f}s ===", flush=True)
+            timing_data['post'] = t_post_end - t_post_start
+            timing_data['sync'] = (t_after_barrier - t_before_barrier) + (t_after_allreduce - t_before_allreduce)
+            timing_data['total'] = t_end - t_start
+
+            # Print single clean summary line
+            print(f"[Rank {worker}] Tick {self.tick}: "
+                  f"total={timing_data['total']:.3f}s | "
+                  f"prep={timing_data['data_prep']:.3f}s, "
+                  f"gpu={timing_data['gpu_kernel']:.3f}s, "
+                  f"post={timing_data['post']:.3f}s, "
+                  f"sync={timing_data['sync']:.3f}s", flush=True)
 
 
 def reduce_global_data_vector(A, B):
