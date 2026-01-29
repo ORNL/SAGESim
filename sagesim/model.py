@@ -435,7 +435,7 @@ class Model:
         # Exclude no_double_buffer properties from write buffer creation
         self._write_property_indices = self._write_property_indices - no_double_buffer_indices
 
-        if worker == 0 and no_double_buffer_indices:
+        if self._verbose_timing and worker == 0 and no_double_buffer_indices:
             excluded_props = [
                 name for name, idx in self._agent_factory._property_name_2_index.items()
                 if idx in no_double_buffer_indices
@@ -457,8 +457,11 @@ class Model:
         comm.barrier()
 
         # Import and cache the step function once during setup
+        # Suppress expected CuPy/Numba JIT compilation warnings
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            warnings.filterwarnings("ignore", message=".*numba.*", category=Warning)
             step_func_module = importlib.import_module(
                 os.path.splitext(self._step_function_file_path)[0]
             )
@@ -634,12 +637,14 @@ class Model:
             """Recursively create a zero-filled copy matching the structure of sample."""
             if isinstance(sample, np.ndarray):
                 return np.zeros_like(sample)  # Keep as numpy array for fast vectorized path
-            elif isinstance(sample, (list, tuple)):
+            elif isinstance(sample, (list, tuple, set)):
                 if len(sample) == 0:
                     return []
-                # Check if elements are nested (lists/tuples) or scalars
-                if isinstance(sample[0], (list, tuple, np.ndarray)):
-                    return [create_zero_placeholder(elem) for elem in sample]
+                # Convert set to list for indexing
+                sample_list = list(sample) if isinstance(sample, set) else sample
+                # Check if elements are nested (lists/tuples/sets) or scalars
+                if isinstance(sample_list[0], (list, tuple, set, np.ndarray)):
+                    return [create_zero_placeholder(elem) for elem in sample_list]
                 else:
                     return [0.0] * len(sample)
             else:

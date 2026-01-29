@@ -108,19 +108,3 @@ if __name__ == "__main__":
         )
     df = pd.DataFrame(result)
     df.to_csv("sfr_results.csv", index=False)
-
-    # if worker == 0:
-    #     with open("execution_times.csv", "a") as f:
-    #         f.write(
-    #             f"{num_agents}, {num_edges}, {num_nodes}, {num_workers}, {model_creation_duration}, {simulate_duration}\n"
-    #         )
-
-    # if worker == 0:
-    #     print(
-    #         [
-    #             SFRState(
-    #                 model.get_agent_property_value(agent_id, property_name="state")
-    #             )
-    #             for agent_id in range(num_agents)
-    #         ]
-    #     )

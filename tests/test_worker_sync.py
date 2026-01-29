@@ -85,8 +85,9 @@ class SIRBreed(Breed):
         name = "SIR"
         super().__init__(name)
         # Register properties for the breed
+        # Use single-element buffer as default (circular buffer with modulo indexing)
         self.register_property("state", SIRState.SUSCEPTIBLE.value)
-        self.register_property("state_history_buffer", [])  # Buffer to track state at each tick
+        self.register_property("state_history_buffer", [0.0] * 10)
         # Register the step function
         self.register_step_func(step_func, __file__, 0)
 
@@ -97,7 +98,7 @@ class SIRModel(Model):
     Inherits from the Model class in the sagesim library.
     """
 
-    def __init__(self, p_infection=0.2, p_recovery=0.2, enable_state_tracking=True) -> None:
+    def __init__(self, p_infection=0.2, p_recovery=0.2) -> None:
         space = NetworkSpace()
         super().__init__(space)
         self._sir_breed = SIRBreed()
@@ -109,9 +110,6 @@ class SIRModel(Model):
         self.register_global_property("p_infection", p_infection)
         self.register_global_property("p_recovery", p_recovery)
 
-        # Store state tracking setting
-        self.enable_state_tracking = enable_state_tracking
-
     # create_agent method takes user-defined properties, that is, the state to create an agent
     def create_agent(self, state):
         agent_id = self.create_agent_of_breed(
@@ -122,39 +120,13 @@ class SIRModel(Model):
     def connect_agents(self, agent_0, agent_1):
         self.get_space().connect_agents(agent_0, agent_1)
 
-    def simulate(self, ticks: int, sync_workers_every_n_ticks: int = 1) -> None:
-        """
-        Override simulate to allocate state_history_buffer before simulation.
-        """
-        # Allocate state_history_buffer for all agents
-        for agent_id in range(self._agent_factory.num_agents):
-            current_state = self.get_agent_property_value(agent_id, "state")
-
-            if self.enable_state_tracking:
-                # Allocate buffer for all ticks
-                state_history_buffer = [current_state for _ in range(ticks)]
-            else:
-                # Allocate single-element buffer that will be overwritten
-                state_history_buffer = [current_state]
-
-            self.set_agent_property_value(
-                id=agent_id,
-                property_name="state_history_buffer",
-                value=state_history_buffer
-            )
-
-        # Call parent simulate
-        super().simulate(ticks, sync_workers_every_n_ticks)
-
     def get_state_history(self, agent_id: int):
         """
         Get the state history for a specific agent.
 
         Returns:
-            List of states for each tick if tracking enabled, otherwise list with final state
+            List of states for each tick
         """
-        if not self.enable_state_tracking:
-            return None
         return self.get_agent_property_value(agent_id, "state_history_buffer")
 
 
@@ -208,12 +180,16 @@ if __name__ == "__main__":
     num_ticks = 10
     random_seed = 2  # Set seed for reproducible results
 
-    model = SIRModel(p_infection=1.0, p_recovery=1.0, enable_state_tracking=True)
-    model.setup(use_gpu=True)
+    model = SIRModel(p_infection=1.0, p_recovery=1.0)
 
     model = generate_chain_of_agents(
         model, num_agents, num_infected=1, seed=random_seed
     )
+
+    # Setup must be called AFTER creating agents
+    model.setup(use_gpu=True)
+
+    print(f"Buffer size: 10")
 
     # Print which agents are assigned (non-ghost) to each worker
     # Use the framework's internal agent-to-rank mapping for accurate results
@@ -240,21 +216,24 @@ if __name__ == "__main__":
         if model.get_agent_property_value(agent_id, property_name="state") is not None
     ]
 
-    # Collect state history for all agents first (all workers participate)
-    all_state_histories = {}
+    # Collect state history for agents owned by this worker
+    local_state_histories = {}
     for agent_id in range(num_agents):
         state_history = model.get_state_history(agent_id)
         if state_history is not None:
-            all_state_histories[agent_id] = state_history
+            local_state_histories[agent_id] = state_history
 
-    # Synchronize all workers before writing
-    comm.Barrier()
+    # Gather all state histories to worker 0
+    all_local_histories = comm.gather(local_state_histories, root=0)
 
+    # Merge all histories on worker 0
+    all_state_histories = {}
     if worker == 0:
+        for local_hist in all_local_histories:
+            all_state_histories.update(local_hist)
         print(f"Collected state histories for {len(all_state_histories)} agents")
 
-    # Save state history to CSV (only on worker 0 to avoid duplicates)
-    if worker == 0:
+        # Save state history to CSV (only on worker 0)
         with open('test_worker_sync_results.csv', 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             # Write header
