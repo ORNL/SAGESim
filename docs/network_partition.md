@@ -216,12 +216,26 @@ def measure_edge_cut(graph, partition):
     return ratio
 ```
 
-## Example
+## Command-Line Tool
 
-See `examples/generate_partition.py` for a complete working example.
+SAGESim includes a CLI tool for generating partitions from network files:
+
+```bash
+python -m sagesim.generate_partition \
+    --input network.graphml \
+    --output partition.pkl \
+    --method metis \
+    --workers 4
+```
+
+**Options:**
+- `--method`: `metis` (recommended), `community`, `random`, `roundrobin`
+- `--format`: `pickle`, `json`, `numpy`, `text`, or `auto` (detect from extension)
+- `--workers`: Number of MPI workers
 
 ## See Also
 
-- `sagesim/partition_utils.py` - Partition utility functions
+- `sagesim/partition_utils.py` - Partition utility functions (for programmatic use)
+- `sagesim/generate_partition.py` - CLI tool for generating partitions
 - `gpu_cpu_data_flow.md` - How data flows in distributed simulation
 - `selective_property_synchronization.md` - Reducing MPI message size
