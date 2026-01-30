@@ -182,21 +182,3 @@ Contributions are welcome! Please see the [GitHub repository](https://github.com
 ## License
 
 MIT License - Oak Ridge National Laboratory
-
-## Authors
-
-- Chathika Gunaratne (chathikagunaratne@gmail.com)
-- Xi Zhang (cc.zhang1992@gmail.com)
-
-## Citation
-
-If you use SAGESim in your research, please cite:
-
-```bibtex
-@software{sagesim,
-  title = {SAGESim: Scalable Agent-based GPU-Enabled Simulator},
-  author = {Gunaratne, Chathika and Zhang, Xi},
-  year = {2024},
-  url = {https://github.com/ORNL/sagesim}
-}
-```
