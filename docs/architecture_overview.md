@@ -7,6 +7,10 @@ SAGESim (Scalable Agent-based GPU-accelerated Simulation) is a distributed GPU-a
 1. **MPI-level parallelism**: Multiple worker processes (MPI ranks), each with its own GPU
 2. **GPU-level parallelism**: Thousands of threads per GPU, with each thread processing one agent
 
+> **Recommendation: One Worker = One GPU**
+>
+> For best performance, use one MPI worker per physical GPU. While multiple workers can share a single GPU, this adds MPI overhead without performance benefit. If your simulation fits in one GPU, use a single worker.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         SAGESim Architecture                                 │

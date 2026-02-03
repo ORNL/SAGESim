@@ -355,9 +355,9 @@ Priority 2: All neurons check firing (in parallel)
 Buffer copy: write → read
 ```
 
-### Example: Multiple Breeds with Different Priorities
+### Example: Multiple Breeds with Step Functions at Various Priorities
 
-Different breeds can have step functions at different or same priorities:
+Step function priorities are independent of breeds. A single breed can have multiple step functions at different priorities, and different breeds can share the same priority:
 
 ```python
 # Prey moves first
@@ -419,7 +419,7 @@ while heap_priority_breedidx_func:
         last_priority = priority
 ```
 
-**Result:** A list of dictionaries, where each dictionary contains all breed step functions that share the same priority:
+**Result:** A list of dictionaries, where each dictionary maps breed index to the step function for that priority. Step functions from different breeds (or multiple from the same breed) can share a priority group:
 
 ```
 _breed_idx_2_step_func_by_priority = [
@@ -462,9 +462,9 @@ All priorities within a tick see the **same state** (the state at tick start). T
 for tick_offset in range(sync_workers_every_n_ticks):
     current_tick = self.tick + tick_offset
 
-    # Execute each breed priority group separately with synchronization
+    # Execute each priority group separately with synchronization
     for priority_idx, priority_group in enumerate(self._breed_idx_2_step_func_by_priority):
-        # Execute step functions for this breed priority group only
+        # Execute step functions for this priority group
         self._step_func[blockspergrid, threadsperblock](
             current_tick,
             self._global_data_vector,
@@ -704,9 +704,9 @@ comm.allreduce(global_data_vector, op=reduce_func)
 for tick_offset in range(sync_workers_every_n_ticks):
     current_tick = self.tick + tick_offset
 
-    # Execute each breed priority group separately with synchronization
+    # Execute each priority group separately with synchronization
     for priority_idx, priority_group in enumerate(self._breed_idx_2_step_func_by_priority):
-        # Execute step functions for this breed priority group only
+        # Execute step functions for this priority group
         self._step_func[blockspergrid, threadsperblock](
             current_tick,
             self._global_data_vector,
