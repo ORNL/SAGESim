@@ -168,3 +168,8 @@ step_func_code*.py
 
 # Output files
 *.csv
+
+# Local development examples (not for release)
+examples/ordered_neighbors_example.py
+examples/sir/run_frontier.py
+examples/sir_ver2/

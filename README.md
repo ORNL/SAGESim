@@ -125,6 +125,8 @@ Comprehensive documentation is available in the `docs/` directory:
 | [Runtime Optimizations](docs/runtime_optimizations.md) | Performance tuning techniques |
 | [Selective Sync](docs/selective_property_synchronization.md) | Reducing MPI overhead |
 | [Property History](docs/property_history_tracking.md) | Tracking property changes over time |
+| [Ordered Neighbors](docs/ordered_neighbors.md) | Ordered neighbor storage for agent networks |
+| [GPU-CPU Data Flow](docs/gpu_cpu_data_flow.md) | Data flow between CPU and GPU |
 
 ## HPC Deployment
 
