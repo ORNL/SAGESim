@@ -24,6 +24,7 @@ from mpi4py import MPI
 from sagesim.agent import AgentFactory, Breed
 from sagesim.space import Space
 from sagesim.internal_utils import convert_to_equal_side_tensor, build_csr_from_ragged
+from sagesim.gpu_kernels import GPUBufferManager, GPUHashMap
 
 
 def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
@@ -371,6 +372,9 @@ class Model:
 
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
         if self._is_setup:
+            # Ensure CPU-side data is in sync with GPU buffers
+            if hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
+                self._sync_gpu_to_cpu_if_needed()
             self._agent_factory._update_agent_property(
                 self.__rank_local_agent_data_tensors, id, property_name
             )
@@ -382,6 +386,28 @@ class Model:
         self._agent_factory.set_agent_property_value(
             property_name=property_name, agent_id=id, value=value
         )
+        # GPU buffers are now stale — force rebuild on next tick
+        if hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
+            self._gpu_buffers.is_initialized = False
+
+    def _sync_gpu_to_cpu_if_needed(self):
+        """Download local agent data from GPU to CPU if GPU buffers are the source of truth."""
+        buf = self._gpu_buffers
+        num_local = buf.num_local_agents
+        for i in range(self._agent_factory.num_properties):
+            if i == 1:
+                # Property 1 (locations/CSR): reconstruct ragged lists from dual CSR
+                cpu_offsets = buf.neighbor_offsets[:num_local + 1].get()
+                cpu_values_ids = buf.neighbor_values_ids.get()
+                data = []
+                for agent_idx in range(num_local):
+                    start = int(cpu_offsets[agent_idx])
+                    end = int(cpu_offsets[agent_idx + 1])
+                    neighbor_ids = cpu_values_ids[start:end].tolist()
+                    data.append(neighbor_ids)
+            else:
+                data = buf.property_tensors[i][:num_local].get().tolist()
+            self.__rank_local_agent_data_tensors[i] = data
 
     def get_space(self) -> Space:
         return self._agent_factory._space
@@ -544,15 +570,23 @@ class Model:
 
         self._is_setup = True
 
+        # Initialize GPU buffer manager (buffers allocated lazily on first tick)
+        self._gpu_buffers = GPUBufferManager()
+
     def reset(self) -> None:
         # Generate global data tensor
         self._global_data_vector = list(self.globals.values())
         self.tick = 0
-        
+
         # Generate agent data tensors
         self.__rank_local_agent_data_tensors = (
             self._agent_factory._generate_agent_data_tensors()
         )
+
+        # Invalidate GPU buffers so they are rebuilt on next tick
+        if hasattr(self, '_gpu_buffers'):
+            self._gpu_buffers.free()
+            self._gpu_buffers = GPUBufferManager()
 
 
     def simulate(
@@ -588,6 +622,242 @@ class Model:
 
                 self.worker_coroutine(sync_workers_every_n_ticks)
 
+    # ----------------------------------------------------------------
+    # GPU-resident buffer helpers
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    def _create_zero_placeholder(sample):
+        """Recursively create a zero-filled copy matching the structure of sample."""
+        if isinstance(sample, np.ndarray):
+            return np.zeros_like(sample)
+        elif isinstance(sample, (list, tuple, set)):
+            if len(sample) == 0:
+                return []
+            sample_list = list(sample) if isinstance(sample, set) else sample
+            if isinstance(sample_list[0], (list, tuple, set, np.ndarray)):
+                return [Model._create_zero_placeholder(elem) for elem in sample_list]
+            else:
+                return [0.0] * len(sample)
+        else:
+            return 0.0
+
+    def _build_gpu_buffers(self, received_neighbor_ids, received_neighbor_adts, num_local_agents):
+        """Build all persistent GPU buffers on first tick.
+
+        Performs the same work as the original per-tick data prep, but stores
+        results in self._gpu_buffers for reuse on subsequent ticks.
+        """
+        buf = self._gpu_buffers
+        buf.num_local_agents = num_local_agents
+        num_ghost = len(received_neighbor_ids)
+
+        # 1. Build agent ID list and CPU hash map
+        all_agent_ids_list = self.__rank_local_agent_ids + received_neighbor_ids
+        agent_id_to_index = {int(agent_id): idx for idx, agent_id in enumerate(all_agent_ids_list)}
+        buf.all_agent_ids_list = all_agent_ids_list
+        buf.agent_id_to_index = agent_id_to_index
+        buf.num_total_agents = len(all_agent_ids_list)
+        buf.prev_ghost_ids_set = set(received_neighbor_ids)
+
+        # 2. Pre-allocate capacity with slack
+        agent_capacity = max(GPUBufferManager.MIN_CAPACITY,
+                             int(buf.num_total_agents * GPUBufferManager.AGENT_SLACK_FACTOR))
+
+        # 3. Upload agent IDs to GPU with slack
+        agent_ids_padded = np.full(agent_capacity, -1, dtype=np.float32)
+        agent_ids_padded[:buf.num_total_agents] = np.array(all_agent_ids_list, dtype=np.float32)
+        buf.agent_ids_gpu = cp.array(agent_ids_padded)
+
+        # 4. Upload global data vector
+        buf.global_data_vector = cp.array(self._global_data_vector)
+
+        # 5. Build GPU hash map
+        agent_ids_np = np.array(all_agent_ids_list, dtype=np.int64)
+        buffer_indices_np = np.arange(len(all_agent_ids_list), dtype=np.int32)
+        hash_capacity = max(GPUBufferManager.MIN_CAPACITY, len(all_agent_ids_list) * 2)
+        buf.hash_map = GPUHashMap(hash_capacity)
+        buf.hash_map.build_from_arrays(agent_ids_np, buffer_indices_np)
+
+        # 6. Combine local + neighbor data and build GPU arrays
+        combined_lists = []
+        for i in range(self._agent_factory.num_properties):
+            received_data = received_neighbor_adts[i]
+
+            # Handle non-neighbor-visible properties
+            if received_data and received_data[0] is None:
+                local_data = self.__rank_local_agent_data_tensors[i]
+                placeholder = self._create_zero_placeholder(local_data[0]) if local_data else 0.0
+                received_data = [placeholder for _ in range(len(received_data))]
+
+            combined = self.__rank_local_agent_data_tensors[i] + received_data
+
+            if i == 1:
+                # Build dual CSR: values with agent IDs (for MPI) and local indices (for kernel)
+                combined_for_ids = list(combined)  # preserve original agent IDs
+                combined_indices = convert_agent_ids_to_indices(combined, agent_id_to_index)
+                offsets_np, values_np = build_csr_from_ragged(combined_indices)
+                _, values_ids_np = build_csr_from_ragged(combined_for_ids)
+                buf.allocate_csr(offsets_np, values_np, values_ids_np, buf.num_total_agents)
+
+            combined_lists.append(combined)
+
+        # 7. Allocate property tensors on GPU with slack
+        buf.allocate_property_tensors(
+            self._agent_factory.num_properties,
+            combined_lists,
+            agent_capacity,
+            convert_to_equal_side_tensor,
+        )
+        buf.agent_capacity = agent_capacity
+
+        # 8. Create write buffers
+        sorted_write_indices = sorted(i for i in self._write_property_indices if i != 1)
+        buf.allocate_write_buffers(sorted_write_indices)
+
+        buf.is_initialized = True
+
+    def _upload_ghost_values(self, received_neighbor_ids, received_neighbor_adts, num_local_agents):
+        """Fast path: ghost set unchanged, only update property values in existing GPU slots."""
+        buf = self._gpu_buffers
+        num_ghosts = len(received_neighbor_ids)
+        if num_ghosts == 0:
+            return
+
+        ghost_start = num_local_agents
+
+        for prop_idx in range(self._agent_factory.num_properties):
+            if prop_idx == 1:
+                # CSR (locations) — unchanged when ghost set is stable
+                continue
+
+            received_data = received_neighbor_adts[prop_idx]
+            if received_data and received_data[0] is None:
+                # Non-visible property — GPU already has placeholders
+                continue
+
+            tensor = buf.property_tensors[prop_idx]
+            if tensor is None:
+                continue
+
+            # Build ghost values in buffer order and upload as a batch
+            # received_neighbor_ids may be in different order than all_agent_ids_list
+            if tensor.ndim == 1:
+                ghost_cpu = np.zeros(num_ghosts, dtype=np.float32)
+                for ghost_idx, ghost_id in enumerate(received_neighbor_ids):
+                    buffer_idx = buf.agent_id_to_index.get(int(ghost_id))
+                    if buffer_idx is not None:
+                        local_ghost_offset = buffer_idx - ghost_start
+                        ghost_cpu[local_ghost_offset] = float(received_data[ghost_idx])
+                buf.property_tensors[prop_idx][ghost_start:ghost_start + num_ghosts] = cp.array(ghost_cpu)
+            else:
+                # For multi-dim properties: download current ghost region, update, re-upload
+                ghost_region = tensor[ghost_start:ghost_start + num_ghosts].get()
+                for ghost_idx, ghost_id in enumerate(received_neighbor_ids):
+                    buffer_idx = buf.agent_id_to_index.get(int(ghost_id))
+                    if buffer_idx is not None:
+                        local_ghost_offset = buffer_idx - ghost_start
+                        val = received_data[ghost_idx]
+                        if isinstance(val, (list, tuple)):
+                            arr = np.array(val, dtype=np.float32)
+                            ghost_region[local_ghost_offset, :len(arr)] = arr
+                        elif isinstance(val, np.ndarray):
+                            ghost_region[local_ghost_offset, :len(val)] = val.astype(np.float32)
+                        else:
+                            ghost_region[local_ghost_offset, 0] = float(val)
+                buf.property_tensors[prop_idx][ghost_start:ghost_start + num_ghosts] = cp.array(ghost_region)
+
+            # Also update write buffers for ghost region if this property has one
+            if prop_idx in buf.sorted_write_indices:
+                wb_idx = buf.sorted_write_indices.index(prop_idx)
+                buf.write_buffers[wb_idx][ghost_start:ghost_start + num_ghosts] = \
+                    buf.property_tensors[prop_idx][ghost_start:ghost_start + num_ghosts]
+
+    def _rebuild_gpu_buffers(self, received_neighbor_ids, received_neighbor_adts, num_local_agents):
+        """Rebuild path: ghost set or topology changed. Rebuild CSR, hash map, ghost region.
+
+        Local agent data in property_tensors[0:num_local] stays on GPU untouched.
+        """
+        buf = self._gpu_buffers
+        num_ghost = len(received_neighbor_ids)
+        buf.num_local_agents = num_local_agents
+
+        # 1. Rebuild agent ID list and CPU hash map
+        all_agent_ids_list = self.__rank_local_agent_ids + received_neighbor_ids
+        agent_id_to_index = {int(agent_id): idx for idx, agent_id in enumerate(all_agent_ids_list)}
+        buf.all_agent_ids_list = all_agent_ids_list
+        buf.agent_id_to_index = agent_id_to_index
+        buf.num_total_agents = len(all_agent_ids_list)
+        buf.prev_ghost_ids_set = set(received_neighbor_ids)
+
+        # 2. Ensure capacity
+        buf.ensure_agent_capacity(buf.num_total_agents)
+
+        # 3. Rebuild GPU hash map
+        agent_ids_np = np.array(all_agent_ids_list, dtype=np.int64)
+        buffer_indices_np = np.arange(len(all_agent_ids_list), dtype=np.int32)
+        hash_capacity = max(GPUBufferManager.MIN_CAPACITY, len(all_agent_ids_list) * 2)
+        if buf.hash_map is None or hash_capacity > buf.hash_map.capacity:
+            if buf.hash_map is not None:
+                buf.hash_map.free()
+            buf.hash_map = GPUHashMap(hash_capacity)
+        buf.hash_map.build_from_arrays(agent_ids_np, buffer_indices_np)
+
+        # 4. Update agent IDs on GPU
+        agent_ids_padded = np.full(buf.agent_capacity, -1, dtype=np.float32)
+        agent_ids_padded[:buf.num_total_agents] = np.array(all_agent_ids_list, dtype=np.float32)
+        buf.agent_ids_gpu = cp.array(agent_ids_padded)
+
+        # 5. Rebuild property data for ghost region and CSR
+        for i in range(self._agent_factory.num_properties):
+            received_data = received_neighbor_adts[i]
+
+            if received_data and received_data[0] is None:
+                local_data = self.__rank_local_agent_data_tensors[i]
+                placeholder = self._create_zero_placeholder(local_data[0]) if local_data else 0.0
+                received_data = [placeholder for _ in range(len(received_data))]
+
+            combined = self.__rank_local_agent_data_tensors[i] + received_data
+
+            if i == 1:
+                # Rebuild dual CSR
+                combined_for_ids = list(combined)
+                combined_indices = convert_agent_ids_to_indices(combined, agent_id_to_index)
+                offsets_np, values_np = build_csr_from_ragged(combined_indices)
+                _, values_ids_np = build_csr_from_ragged(combined_for_ids)
+                total_edges = len(values_np)
+                buf.ensure_csr_capacity(total_edges)
+                # Write into existing GPU arrays
+                buf.neighbor_offsets[:len(offsets_np)] = cp.array(offsets_np)
+                buf.neighbor_values[:total_edges] = cp.array(values_np)
+                buf.neighbor_values_ids[:total_edges] = cp.array(values_ids_np)
+            else:
+                # Rebuild combined tensor and update ghost region on GPU
+                # Local region [0:num_local] already correct on GPU from kernel writes
+                tensor = convert_to_equal_side_tensor(combined)
+                if tensor.ndim == 1:
+                    buf.property_tensors[i][:len(tensor)] = tensor
+                else:
+                    buf.property_tensors[i][:tensor.shape[0]] = tensor
+
+        # 6. Rebuild write buffers
+        buf.write_buffers = []
+        for prop_idx in buf.sorted_write_indices:
+            buf.write_buffers.append(buf.property_tensors[prop_idx].copy())
+
+    def _download_local_data_to_cpu(self, num_local_agents):
+        """Download only modified local agent data from GPU to CPU.
+
+        Only downloads properties that the kernel could have written to.
+        Unwritten properties retain their CPU-side values (unchanged by kernel).
+        Property 1 (CSR/locations) is read-only — skip unless topology changed.
+        """
+        buf = self._gpu_buffers
+
+        for prop_idx in buf.sorted_write_indices:
+            self.__rank_local_agent_data_tensors[prop_idx] = \
+                buf.property_tensors[prop_idx][:num_local_agents].get().tolist()
+
     def save(self, app: "Model", fpath: str) -> None:
         """
         Saves model. Must be overridden if additional data
@@ -618,21 +888,11 @@ class Model:
         sync_workers_every_n_ticks,
     ):
         """
-        Corountine that exec's cuda kernel. This coroutine should
-        eventually be distributed among dask workers with agent
-        data partitioning and data reduction.
+        Coroutine that executes CUDA kernel with GPU-resident persistent buffers.
 
-        :param device_global_data_vector: cuda device array containing
-            SAGESim global properties
-        :param agent_data_tensors: listof property data tensors defined by user.
-            Contains all agent info. Each inner list represents a particular property and may
-            itself be a multidimensional list. This is also where the
-            cuda kernels will make modifications as agent properties
-            are updated.
-        :param current_tick: Current simulation tick
-        :param sync_workers_every_n_ticks: number of ticks to forward
-            the simulation by
-        :param agent_ids: agents to process by this cudakernel call
+        On first call: builds all GPU buffers from scratch and stores them persistently.
+        On subsequent calls: selectively downloads modified properties for MPI,
+        exchanges data, selectively uploads ghost values, then runs the kernel.
         """
         import time
         t_start = time.time()
@@ -641,217 +901,176 @@ class Model:
             self._agent_factory._rank2agentid2agentidx[worker].keys()
         )
 
-        # Timing variables for verbose output (collected throughout, printed at end)
         timing_data = {} if self._verbose_timing else None
 
+        num_local_agents = len(self.__rank_local_agent_ids)
         threadsperblock = 32
-        blockspergrid = int(
-            math.ceil(len(self.__rank_local_agent_ids) / threadsperblock)
-        )
+        blockspergrid = int(math.ceil(num_local_agents / threadsperblock))
 
-        t_neighbor_start = time.time()
-        rank_local_agents_neighbors = self.get_space()._neighbor_compute_func(
-            self.__rank_local_agent_data_tensors[1]
-        )
-        t_neighbor_end = time.time()
+        buf = self._gpu_buffers
 
-        t_before_context = time.time()
-        (
-            self.__rank_local_agent_ids,
-            self.__rank_local_agent_data_tensors,
-            received_neighbor_ids,
-            received_neighbor_adts,
-        ) = self._agent_factory.contextualize_agent_data_tensors(
-            self.__rank_local_agent_data_tensors,
-            self.__rank_local_agent_ids,
-            rank_local_agents_neighbors,
-        )
-        t_after_context = time.time()
-
-        if self._verbose_timing:
-            timing_data['neighbor'] = t_neighbor_end - t_neighbor_start
-            timing_data['contextualize'] = t_after_context - t_before_context
-            timing_data['num_neighbors'] = len(received_neighbor_ids)
-
+        # ============================================================
+        # DATA PREPARATION: first-tick vs subsequent-tick paths
+        # ============================================================
         t_data_prep_start = time.time()
-        self._global_data_vector = cp.array(self._global_data_vector)
 
-        # Create agent ID to local index mapping for fast lookups
-        all_agent_ids_list = self.__rank_local_agent_ids + received_neighbor_ids
-        agent_id_to_index = {int(agent_id): idx for idx, agent_id in enumerate(all_agent_ids_list)}
+        if not buf.is_initialized:
+            # --- FIRST TICK: full build ---
+            t_neighbor_start = time.time()
+            rank_local_agents_neighbors = self.get_space()._neighbor_compute_func(
+                self.__rank_local_agent_data_tensors[1]
+            )
+            t_neighbor_end = time.time()
 
-        rank_local_agent_and_non_local_neighbor_ids = cp.array(all_agent_ids_list)
+            t_before_context = time.time()
+            (
+                self.__rank_local_agent_ids,
+                self.__rank_local_agent_data_tensors,
+                received_neighbor_ids,
+                received_neighbor_adts,
+            ) = self._agent_factory.contextualize_agent_data_tensors(
+                self.__rank_local_agent_data_tensors,
+                self.__rank_local_agent_ids,
+                rank_local_agents_neighbors,
+            )
+            t_after_context = time.time()
 
-        # Helper function to create zero-filled placeholder matching nested structure
-        def create_zero_placeholder(sample):
-            """Recursively create a zero-filled copy matching the structure of sample."""
-            if isinstance(sample, np.ndarray):
-                return np.zeros_like(sample)  # Keep as numpy array for fast vectorized path
-            elif isinstance(sample, (list, tuple, set)):
-                if len(sample) == 0:
-                    return []
-                # Convert set to list for indexing
-                sample_list = list(sample) if isinstance(sample, set) else sample
-                # Check if elements are nested (lists/tuples/sets) or scalars
-                if isinstance(sample_list[0], (list, tuple, set, np.ndarray)):
-                    return [create_zero_placeholder(elem) for elem in sample_list]
-                else:
-                    return [0.0] * len(sample)
+            if self._verbose_timing:
+                timing_data['neighbor'] = t_neighbor_end - t_neighbor_start
+                timing_data['contextualize'] = t_after_context - t_before_context
+                timing_data['num_neighbors'] = len(received_neighbor_ids)
+
+            # Update num_local_agents after contextualize (may reorder)
+            num_local_agents = len(self.__rank_local_agent_ids)
+            blockspergrid = int(math.ceil(num_local_agents / threadsperblock))
+
+            self._build_gpu_buffers(received_neighbor_ids, received_neighbor_adts, num_local_agents)
+
+        else:
+            # --- SUBSEQUENT TICK: selective download → MPI → selective upload ---
+
+            # 1. Selective download: only written properties for local agents → CPU
+            for i, prop_idx in enumerate(buf.sorted_write_indices):
+                cpu_data = buf.property_tensors[prop_idx][:num_local_agents].get().tolist()
+                self.__rank_local_agent_data_tensors[prop_idx] = cpu_data
+
+            # 2. Neighbor compute
+            t_neighbor_start = time.time()
+            rank_local_agents_neighbors = self.get_space()._neighbor_compute_func(
+                self.__rank_local_agent_data_tensors[1]
+            )
+            t_neighbor_end = time.time()
+
+            # 3. MPI exchange
+            t_before_context = time.time()
+            (
+                self.__rank_local_agent_ids,
+                self.__rank_local_agent_data_tensors,
+                received_neighbor_ids,
+                received_neighbor_adts,
+            ) = self._agent_factory.contextualize_agent_data_tensors(
+                self.__rank_local_agent_data_tensors,
+                self.__rank_local_agent_ids,
+                rank_local_agents_neighbors,
+            )
+            t_after_context = time.time()
+
+            if self._verbose_timing:
+                timing_data['neighbor'] = t_neighbor_end - t_neighbor_start
+                timing_data['contextualize'] = t_after_context - t_before_context
+                timing_data['num_neighbors'] = len(received_neighbor_ids)
+
+            # Update num_local_agents after contextualize
+            num_local_agents = len(self.__rank_local_agent_ids)
+            blockspergrid = int(math.ceil(num_local_agents / threadsperblock))
+
+            # 4. Change detection: compare ghost set
+            # TODO: Ghost set comparison alone is insufficient. Same ghost set with
+            # different wiring (who connects to who) will wrongly take the fast path.
+            # When property 1 (locations) becomes writable from the kernel:
+            #   - If 1 in self._write_property_indices: always rebuild CSR
+            #   - The kernel could modify neighbor lists directly on GPU with no
+            #     Python-level hook to detect it
+            # Also: connect_agents()/disconnect_agents() modify space._locations but
+            # not __rank_local_agent_data_tensors[1] (downloaded from GPU). Need to
+            # propagate space changes to the data tensors before MPI exchange.
+            current_ghost_set = set(received_neighbor_ids)
+            if current_ghost_set == buf.prev_ghost_ids_set:
+                # Fast path: ghost set unchanged, only update property values
+                self._upload_ghost_values(received_neighbor_ids, received_neighbor_adts, num_local_agents)
             else:
-                return 0.0
+                # Rebuild path: ghost set or topology changed
+                self._rebuild_gpu_buffers(received_neighbor_ids, received_neighbor_adts, num_local_agents)
 
-        # OPTIMIZATION: Convert agent IDs to indices on LISTS before GPU conversion
-        # This avoids GPU->CPU->GPU roundtrip and works on lists (faster than numpy arrays)
-        t_combine_start = time.time()
-        combined_lists = []
-        neighbor_offsets = None
-        neighbor_values = None
-        for i in range(self._agent_factory.num_properties):
-            received_data = received_neighbor_adts[i]
+            # 5. Update global_data_vector on GPU
+            buf.global_data_vector = cp.array(self._global_data_vector)
 
-            # Handle non-neighbor-visible properties: replace None with placeholder values
-            # For properties not sent during MPI sync, received_neighbor_adts contains None
-            if received_data and received_data[0] is None:
-                # Use placeholder matching the structure of local data
-                # Note: This assumes all agents have the same structure for each property.
-                # Edge case: If one rank has only somas and another only synapses with
-                # different structures, this will fail. Ensure networks have enough agents
-                # so each rank has mixed agent types.
-                local_data = self.__rank_local_agent_data_tensors[i]
-                if local_data:
-                    placeholder = create_zero_placeholder(local_data[0])
-                else:
-                    placeholder = 0.0
-                received_data = [placeholder for _ in range(len(received_data))]
-
-            combined = self.__rank_local_agent_data_tensors[i] + received_data
-
-            if i == 1:  # Property 1 is 'locations' (neighbors/connections)
-                # Convert agent IDs to local indices while still a list
-                combined = convert_agent_ids_to_indices(combined, agent_id_to_index)
-                # Build CSR from ragged neighbor lists instead of rectangular padding
-                offsets_np, values_np = build_csr_from_ragged(combined)
-                neighbor_offsets = cp.array(offsets_np)
-                neighbor_values = cp.array(values_np)
-
-            combined_lists.append(combined)
-        t_combine_end = time.time()
-
-        # Now convert all to GPU arrays (single CPU->GPU transfer per property)
-        # Property 1 (locations) uses CSR format — already on GPU as neighbor_offsets/neighbor_values
-        t_tensor_convert_start = time.time()
-        rank_local_agent_and_neighbor_adts = []
-        tensor_times = []
-        for i in range(self._agent_factory.num_properties):
-            t_prop_start = time.time()
-            if i == 1:
-                # Property 1 uses CSR — skip rectangular padding
-                rank_local_agent_and_neighbor_adts.append(None)
-            else:
-                tensor = convert_to_equal_side_tensor(combined_lists[i])
-                rank_local_agent_and_neighbor_adts.append(tensor)
-            t_prop_end = time.time()
-            tensor_times.append((i, t_prop_end - t_prop_start))
-        t_tensor_convert_end = time.time()
-
-        # Create write buffers for properties that need them
-        # Property 1 (CSR) is read-only in kernel — skip it
-        t_buf_start = time.time()
-        write_buffers = []
-        sorted_write_indices = sorted(i for i in self._write_property_indices if i != 1)
-        for prop_idx in sorted_write_indices:
-            write_buffer = cp.array(rank_local_agent_and_neighbor_adts[prop_idx])
-            write_buffers.append(write_buffer)
-
-        # Prepare all arguments: read tensors + write tensors
-        # Property 1 is replaced by neighbor_offsets and neighbor_values (CSR format)
-        all_args = []
-        for i, tensor in enumerate(rank_local_agent_and_neighbor_adts):
-            if i == 1:
-                all_args.append(neighbor_offsets)
-                all_args.append(neighbor_values)
-            else:
-                all_args.append(tensor)
-        all_args = all_args + write_buffers
-        t_buf_end = time.time()
         t_data_prep_end = time.time()
 
         if self._verbose_timing:
             timing_data['data_prep'] = t_data_prep_end - t_data_prep_start
 
-        # CROSS-BREED SYNCHRONIZATION: Process breeds sequentially within each tick
+        # ============================================================
+        # GPU KERNEL EXECUTION
+        # ============================================================
+
+        # Build all_args from persistent GPU buffers
+        all_args = []
+        for i in range(self._agent_factory.num_properties):
+            if i == 1:
+                all_args.append(buf.neighbor_offsets)
+                all_args.append(buf.neighbor_values)
+            else:
+                all_args.append(buf.property_tensors[i])
+        all_args = all_args + buf.write_buffers
+
         t_gpu_kernel_start = time.time()
         for tick_offset in range(sync_workers_every_n_ticks):
             current_tick = self.tick + tick_offset
 
-            # Execute each breed priority group separately with synchronization
             for priority_idx, priority_group in enumerate(self._breed_idx_2_step_func_by_priority):
-                # Execute step functions for this breed priority group only
                 self._step_func[blockspergrid, threadsperblock](
                     current_tick,
-                    self._global_data_vector,
+                    buf.global_data_vector,
                     *all_args,
-                    1,  # Process exactly 1 tick
-                    cp.float32(len(self.__rank_local_agent_ids)),
-                    rank_local_agent_and_non_local_neighbor_ids,
-                    priority_idx,  # Which priority group to execute
+                    1,
+                    cp.float32(num_local_agents),
+                    buf.agent_ids_gpu,
+                    priority_idx,
                 )
-
-                # Synchronization barrier: Wait for all blocks to complete this breed phase
                 cp.cuda.Stream.null.synchronize()
-            ####===============================================
-            # Copy write buffers back to read buffers after ALL priority groups complete
-            # This ensures all priorities execute with the same read buffer (state at start of tick)
-            for i, prop_idx in enumerate(sorted_write_indices):
-                rank_local_agent_and_neighbor_adts[prop_idx][:len(self.__rank_local_agent_ids)] = write_buffers[i][:len(self.__rank_local_agent_ids)]
-            ####===============================================
 
-            # Final synchronization before next tick
+            # Copy write buffers back to read buffers after ALL priority groups complete
+            for i, prop_idx in enumerate(buf.sorted_write_indices):
+                buf.property_tensors[prop_idx][:num_local_agents] = \
+                    buf.write_buffers[i][:num_local_agents]
+
             cp.cuda.Stream.null.synchronize()
 
-        # Update global tick counter after all threads have completed
         self.tick += sync_workers_every_n_ticks
         t_gpu_kernel_end = time.time()
 
         if self._verbose_timing:
             timing_data['gpu_kernel'] = t_gpu_kernel_end - t_gpu_kernel_start
 
-        cp.get_default_memory_pool().free_all_blocks()
+        # ============================================================
+        # POST-KERNEL: download for MPI next tick and user queries
+        # ============================================================
         t_post_start = time.time()
-
-        # Convert GPU tensors back to CPU lists for next iteration
-        # Property 1 (locations) is in CSR format — reconstruct ragged lists with agent IDs
-        num_agents = len(self.__rank_local_agent_ids)
-        self.__rank_local_agent_data_tensors = []
-        for i in range(self._agent_factory.num_properties):
-            if i == 1:  # Property 1 is locations — reconstruct from CSR
-                cpu_offsets = neighbor_offsets[:num_agents + 1].get()
-                cpu_values = neighbor_values.get()
-                data = []
-                for agent_idx in range(num_agents):
-                    start = int(cpu_offsets[agent_idx])
-                    end = int(cpu_offsets[agent_idx + 1])
-                    neighbor_indices = cpu_values[start:end]
-                    # Convert local indices back to agent IDs for MPI exchange
-                    agent_neighbor_ids = [int(all_agent_ids_list[idx]) for idx in neighbor_indices if idx >= 0]
-                    data.append(agent_neighbor_ids)
-            else:
-                data = rank_local_agent_and_neighbor_adts[i][:num_agents].tolist()
-            self.__rank_local_agent_data_tensors.append(data)
-
+        self._download_local_data_to_cpu(num_local_agents)
         t_post_end = time.time()
 
-        # CRITICAL FIX: Ensure all workers have finished processing before syncing neighbor data
-        # Without this barrier, the next call to contextualize_agent_data_tensors() may see
-        # stale data from some workers that haven't finished their GPU kernels yet
+        # Ensure all workers have finished before syncing neighbor data
         t_before_barrier = time.time()
         if num_workers > 1:
             comm.barrier()
         t_after_barrier = time.time()
 
+        # Global data vector: download from GPU, allreduce, store for next tick upload
         t_before_allreduce = time.time()
+        global_cpu = buf.global_data_vector.tolist()
         self._global_data_vector = comm.allreduce(
-            self._global_data_vector.tolist(), op=reduce_global_data_vector
+            global_cpu, op=reduce_global_data_vector
         )
         t_after_allreduce = time.time()
 
@@ -861,7 +1080,6 @@ class Model:
             timing_data['sync'] = (t_after_barrier - t_before_barrier) + (t_after_allreduce - t_before_allreduce)
             timing_data['total'] = t_end - t_start
 
-            # Print single clean summary line
             print(f"[Rank {worker}] Tick {self.tick}: "
                   f"total={timing_data['total']:.3f}s | "
                   f"prep={timing_data['data_prep']:.3f}s, "
