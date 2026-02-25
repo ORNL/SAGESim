@@ -1,0 +1,20 @@
+# Include essential files
+include LICENSE
+include README.md
+include CHANGELOG.md
+include requirements.txt
+
+# Include sagesim package
+recursive-include sagesim *.py
+
+# Include main example
+recursive-include examples/sir *.py *.sh *.ipynb
+exclude examples/sir/run_frontier.py
+exclude examples/sir/step_func_code.py
+
+# Exclude local development files
+prune examples/sir_ver2
+exclude examples/ordered_neighbors_example.py
+
+# Exclude test artifacts
+recursive-exclude tests step_func_code*.py

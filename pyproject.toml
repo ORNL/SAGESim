@@ -13,14 +13,14 @@ authors = [
   {name = "Xi Zhang", email = "cc.zhang1992@gmail.com"}
 ]
 maintainers = [
-  {name = "Chathika Gunaratne", email = "chathikagunaratne@gmail.com"},
   {name = "Xi Zhang", email = "cc.zhang1992@gmail.com"}
 ]
 
 description = "Scalable Agent-based GPU Enabled Simulator."
 
 readme = "README.md"
-license = {file = "LICENSE", type = "text/plain"}
+license = "MIT"
+license-files = ["LICENSE"]
 
 keywords = ["agent-based", "hpc", "gpu"]
 
