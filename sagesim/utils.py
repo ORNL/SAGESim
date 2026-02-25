@@ -29,6 +29,36 @@ Users should now access data directly using the pre-converted indices.
 from cupyx import jit
 
 
+# ─── CSR Neighbor Access Sugar Functions ───────────────────────────────
+# These are intended for use inside @jit.rawkernel step functions.
+# They provide a clean API for accessing neighbors stored in CSR format.
+
+@jit.rawkernel(device="cuda")
+def get_num_neighbors(agent_index, neighbor_offsets):
+    """
+    Return the number of neighbors for the given agent.
+
+    Usage in step function:
+        for i in range(get_num_neighbors(agent_index, neighbor_offsets)):
+            ...
+    """
+    return neighbor_offsets[agent_index + 1] - neighbor_offsets[agent_index]
+
+
+@jit.rawkernel(device="cuda")
+def get_neighbor(agent_index, i, neighbor_offsets, neighbor_values):
+    """
+    Return the local buffer index of the i-th neighbor of the given agent.
+
+    Usage in step function:
+        neighbor_idx = get_neighbor(agent_index, i, neighbor_offsets, neighbor_values)
+        neighbor_state = state_tensor[neighbor_idx]
+    """
+    return neighbor_values[neighbor_offsets[agent_index] + i]
+
+
+# ─── Legacy Utility Functions ──────────────────────────────────────────
+
 @jit.rawkernel(device="cuda")
 def get_this_agent_data_from_tensor(agent_index, property_tensor):
     """

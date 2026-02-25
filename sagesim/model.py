@@ -23,7 +23,7 @@ from mpi4py import MPI
 
 from sagesim.agent import AgentFactory, Breed
 from sagesim.space import Space
-from sagesim.internal_utils import convert_to_equal_side_tensor
+from sagesim.internal_utils import convert_to_equal_side_tensor, build_csr_from_ragged
 
 
 def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
@@ -222,6 +222,55 @@ num_workers = comm.Get_size()
 worker = comm.Get_rank()
 
 
+def _build_param_to_property_index(param_names: list, num_properties: int) -> dict:
+    """
+    Build mapping from ORIGINAL step function parameter names to property indices.
+
+    The last num_properties params map 1:1 to property indices.
+
+    The parameter order in the user's step function is:
+        tick, agent_index, globals, agent_ids,
+        breeds, locations, prop2, prop3, ...
+        ^-- property params (num_properties total) --^
+
+    Returns dict: {param_name: property_index}
+    """
+    prop_params = param_names[-num_properties:]
+    return {name: idx for idx, name in enumerate(prop_params)}
+
+
+def _build_param_to_property_index_csr(param_names: list, num_properties: int) -> dict:
+    """
+    Build mapping from CSR-TRANSFORMED step function parameter names to property indices.
+
+    After CSR transformation, property 1 (locations) is split into two parameters
+    (neighbor_offsets, neighbor_values), so the function has num_properties + 1
+    property-like parameters.
+
+    The parameter order after CSR transformation:
+        tick, agent_index, globals, agent_ids,
+        breeds, neighbor_offsets, neighbor_values, prop2, prop3, ...
+        ^-- property-like params (num_properties + 1 total) --^
+
+    Returns dict: {param_name: property_index} where CSR params map to -1.
+    """
+    n_prop_params = num_properties + 1
+    prop_params = param_names[-n_prop_params:]
+
+    mapping = {}
+    prop_idx = 0
+    for i, name in enumerate(prop_params):
+        if i == 1 or i == 2:
+            mapping[name] = -1
+        else:
+            mapping[name] = prop_idx
+            prop_idx += 1
+            if prop_idx == 1:
+                prop_idx = 2
+
+    return mapping
+
+
 def analyze_step_function_for_writes(step_func: Callable, num_properties: int) -> Set[int]:
     """Analyze step function to find which property indices need write buffers."""
     write_property_indices = set()
@@ -230,17 +279,19 @@ def analyze_step_function_for_writes(step_func: Callable, num_properties: int) -
     tree = ast.parse(source)
     signature = inspect.signature(step_func)
     param_names = list(signature.parameters.keys())
-    
-    # In SAGESim, the actual agent properties are the last N parameters
-    # where N = num_properties
-    property_params = param_names[-num_properties:]  # Take last N parameters as properties
-    
+
+    # Build param name → property index mapping (for ORIGINAL user step function)
+    param_to_prop = _build_param_to_property_index(param_names, num_properties)
+
+    # Get just the property param names for checking
+    property_params = param_names[-num_properties:]
+
     def check_target_for_writes(target_node):
         if isinstance(target_node, ast.Name):
             # Direct assignment: param_name = value
-            if target_node.id in property_params:
-                property_index = property_params.index(target_node.id)
-                write_property_indices.add(property_index)
+            if target_node.id in param_to_prop:
+                prop_idx = param_to_prop[target_node.id]
+                write_property_indices.add(prop_idx)
         elif isinstance(target_node, ast.Subscript):
             # Subscript assignment: param_name[...] = value or nested subscripts
             check_target_for_writes(target_node.value)
@@ -253,9 +304,8 @@ def analyze_step_function_for_writes(step_func: Callable, num_properties: int) -
                     tensor_arg = node.args[1]
                     if isinstance(tensor_arg, ast.Name):
                         tensor_name = tensor_arg.id
-                        if tensor_name in property_params:
-                            property_index = property_params.index(tensor_name)
-                            write_property_indices.add(property_index)
+                        if tensor_name in param_to_prop:
+                            write_property_indices.add(param_to_prop[tensor_name])
         elif isinstance(node, ast.Assign):
             # Check for all types of assignments to property parameters
             for target in node.targets:
@@ -654,6 +704,8 @@ class Model:
         # This avoids GPU->CPU->GPU roundtrip and works on lists (faster than numpy arrays)
         t_combine_start = time.time()
         combined_lists = []
+        neighbor_offsets = None
+        neighbor_values = None
         for i in range(self._agent_factory.num_properties):
             received_data = received_neighbor_adts[i]
 
@@ -677,48 +729,49 @@ class Model:
             if i == 1:  # Property 1 is 'locations' (neighbors/connections)
                 # Convert agent IDs to local indices while still a list
                 combined = convert_agent_ids_to_indices(combined, agent_id_to_index)
+                # Build CSR from ragged neighbor lists instead of rectangular padding
+                offsets_np, values_np = build_csr_from_ragged(combined)
+                neighbor_offsets = cp.array(offsets_np)
+                neighbor_values = cp.array(values_np)
 
             combined_lists.append(combined)
         t_combine_end = time.time()
 
         # Now convert all to GPU arrays (single CPU->GPU transfer per property)
+        # Property 1 (locations) uses CSR format — already on GPU as neighbor_offsets/neighbor_values
         t_tensor_convert_start = time.time()
         rank_local_agent_and_neighbor_adts = []
         tensor_times = []
         for i in range(self._agent_factory.num_properties):
             t_prop_start = time.time()
-            tensor = convert_to_equal_side_tensor(combined_lists[i])
+            if i == 1:
+                # Property 1 uses CSR — skip rectangular padding
+                rank_local_agent_and_neighbor_adts.append(None)
+            else:
+                tensor = convert_to_equal_side_tensor(combined_lists[i])
+                rank_local_agent_and_neighbor_adts.append(tensor)
             t_prop_end = time.time()
-            rank_local_agent_and_neighbor_adts.append(tensor)
             tensor_times.append((i, t_prop_end - t_prop_start))
         t_tensor_convert_end = time.time()
 
-        # Property 1 (locations) needs special handling: replace NaN with -1 and convert to int32
-        # OPTIMIZATION: Do this entirely on GPU to avoid CPU->GPU roundtrip
-        t_loc_start = time.time()
-        locations_for_kernel = None
-        if len(rank_local_agent_and_neighbor_adts) > 1:
-            locations_gpu = rank_local_agent_and_neighbor_adts[1]
-            # Do NaN replacement and conversion entirely on GPU using CuPy
-            locations_for_kernel = cp.where(cp.isnan(locations_gpu), -1, locations_gpu).astype(cp.int32)
-        t_loc_end = time.time()
-
         # Create write buffers for properties that need them
+        # Property 1 (CSR) is read-only in kernel — skip it
         t_buf_start = time.time()
         write_buffers = []
-        for prop_idx in self._write_property_indices:
-            # Create a copy of the tensor for writing
+        sorted_write_indices = sorted(i for i in self._write_property_indices if i != 1)
+        for prop_idx in sorted_write_indices:
             write_buffer = cp.array(rank_local_agent_and_neighbor_adts[prop_idx])
             write_buffers.append(write_buffer)
 
         # Prepare all arguments: read tensors + write tensors
-        # Use converted locations for kernel, but keep original in rank_local_agent_and_neighbor_adts
+        # Property 1 is replaced by neighbor_offsets and neighbor_values (CSR format)
         all_args = []
         for i, tensor in enumerate(rank_local_agent_and_neighbor_adts):
-            if i == 1 and locations_for_kernel is not None:
-                all_args.append(locations_for_kernel)  # Use converted indices for kernel
+            if i == 1:
+                all_args.append(neighbor_offsets)
+                all_args.append(neighbor_values)
             else:
-                all_args.append(tensor)  # Use original
+                all_args.append(tensor)
         all_args = all_args + write_buffers
         t_buf_end = time.time()
         t_data_prep_end = time.time()
@@ -749,7 +802,7 @@ class Model:
             ####===============================================
             # Copy write buffers back to read buffers after ALL priority groups complete
             # This ensures all priorities execute with the same read buffer (state at start of tick)
-            for i, prop_idx in enumerate(self._write_property_indices):
+            for i, prop_idx in enumerate(sorted_write_indices):
                 rank_local_agent_and_neighbor_adts[prop_idx][:len(self.__rank_local_agent_ids)] = write_buffers[i][:len(self.__rank_local_agent_ids)]
             ####===============================================
 
@@ -767,21 +820,21 @@ class Model:
         t_post_start = time.time()
 
         # Convert GPU tensors back to CPU lists for next iteration
-        # Property 1 (locations) contains indices after GPU processing - convert back to agent IDs
+        # Property 1 (locations) is in CSR format — reconstruct ragged lists with agent IDs
         num_agents = len(self.__rank_local_agent_ids)
         self.__rank_local_agent_data_tensors = []
         for i in range(self._agent_factory.num_properties):
-            if i == 1:  # Property 1 is locations - convert indices back to IDs
-                # Keep as numpy array for fast vectorized conversion
-                gpu_data = rank_local_agent_and_neighbor_adts[i][:num_agents]
-                # Convert cupy to numpy if needed
-                if hasattr(gpu_data, 'get'):
-                    cpu_array = gpu_data.get()  # cupy -> numpy (2D array)
-                else:
-                    cpu_array = np.array(gpu_data) if not isinstance(gpu_data, np.ndarray) else gpu_data
-
-                # Pass numpy arrays (rows) to conversion function for vectorization
-                data = convert_agent_indices_to_ids(cpu_array, all_agent_ids_list)
+            if i == 1:  # Property 1 is locations — reconstruct from CSR
+                cpu_offsets = neighbor_offsets[:num_agents + 1].get()
+                cpu_values = neighbor_values.get()
+                data = []
+                for agent_idx in range(num_agents):
+                    start = int(cpu_offsets[agent_idx])
+                    end = int(cpu_offsets[agent_idx + 1])
+                    neighbor_indices = cpu_values[start:end]
+                    # Convert local indices back to agent IDs for MPI exchange
+                    agent_neighbor_ids = [int(all_agent_ids_list[idx]) for idx in neighbor_indices if idx >= 0]
+                    data.append(agent_neighbor_ids)
             else:
                 data = rank_local_agent_and_neighbor_adts[i][:num_agents].tolist()
             self.__rank_local_agent_data_tensors.append(data)
@@ -820,6 +873,201 @@ class Model:
 def reduce_global_data_vector(A, B):
     values = np.stack([A, B], axis=1)
     return np.max(values, axis=1)
+
+
+class _CSRBodyTransformer(ast.NodeTransformer):
+    """AST transformer that rewrites neighbor access patterns for CSR format.
+
+    Handles these patterns in the step function body:
+      - var = locations[agent_index]  → removed (var is tracked)
+      - len(var)                      → neighbor_offsets[ai+1] - neighbor_offsets[ai]
+      - var[i] != -1  (sentinel)      → removed from boolean conditions
+      - var[i]                        → neighbor_values[neighbor_offsets[ai] + i]
+      - locations[agent_index][i]     → neighbor_values[neighbor_offsets[ai] + i]
+    """
+
+    def __init__(self, locations_param, agent_index_param, neighbor_var):
+        self.loc_param = locations_param
+        self.agent_idx = agent_index_param
+        self.nvar = neighbor_var  # May be None if no intermediate variable
+
+    def _is_neighbor_var_subscript(self, node):
+        """Check if node is neighbor_var[expr]."""
+        return (self.nvar is not None and
+                isinstance(node, ast.Subscript) and
+                isinstance(node.value, ast.Name) and
+                node.value.id == self.nvar)
+
+    def _is_locations_agent_subscript(self, node):
+        """Check if node is locations[agent_index]."""
+        return (isinstance(node, ast.Subscript) and
+                isinstance(node.value, ast.Name) and
+                node.value.id == self.loc_param and
+                isinstance(node.slice, ast.Name) and
+                node.slice.id == self.agent_idx)
+
+    def _make_num_neighbors(self):
+        """AST for: neighbor_offsets[agent_index + 1] - neighbor_offsets[agent_index]"""
+        return ast.BinOp(
+            left=ast.Subscript(
+                value=ast.Name(id='neighbor_offsets', ctx=ast.Load()),
+                slice=ast.BinOp(
+                    left=ast.Name(id=self.agent_idx, ctx=ast.Load()),
+                    op=ast.Add(),
+                    right=ast.Constant(value=1)
+                ),
+                ctx=ast.Load()
+            ),
+            op=ast.Sub(),
+            right=ast.Subscript(
+                value=ast.Name(id='neighbor_offsets', ctx=ast.Load()),
+                slice=ast.Name(id=self.agent_idx, ctx=ast.Load()),
+                ctx=ast.Load()
+            )
+        )
+
+    def _make_csr_access(self, index_expr):
+        """AST for: neighbor_values[neighbor_offsets[agent_index] + expr]"""
+        return ast.Subscript(
+            value=ast.Name(id='neighbor_values', ctx=ast.Load()),
+            slice=ast.BinOp(
+                left=ast.Subscript(
+                    value=ast.Name(id='neighbor_offsets', ctx=ast.Load()),
+                    slice=ast.Name(id=self.agent_idx, ctx=ast.Load()),
+                    ctx=ast.Load()
+                ),
+                op=ast.Add(),
+                right=index_expr
+            ),
+            ctx=ast.Load()
+        )
+
+    def _is_sentinel_check(self, node):
+        """Check if node is: var[expr] != -1 or var[expr] == -1."""
+        if not isinstance(node, ast.Compare):
+            return False
+        if len(node.ops) != 1 or len(node.comparators) != 1:
+            return False
+        if not isinstance(node.ops[0], (ast.NotEq, ast.Eq)):
+            return False
+        if not self._is_neighbor_var_subscript(node.left):
+            return False
+        comp = node.comparators[0]
+        if isinstance(comp, ast.UnaryOp) and isinstance(comp.op, ast.USub):
+            if isinstance(comp.operand, ast.Constant) and comp.operand.value == 1:
+                return True
+        if isinstance(comp, ast.Constant) and comp.value == -1:
+            return True
+        return False
+
+    def visit_Assign(self, node):
+        """Remove: var = locations[agent_index]"""
+        if (self.nvar is not None and
+            len(node.targets) == 1 and
+            isinstance(node.targets[0], ast.Name) and
+            node.targets[0].id == self.nvar and
+            self._is_locations_agent_subscript(node.value)):
+            return None  # Remove the assignment
+        return self.generic_visit(node)
+
+    def visit_BoolOp(self, node):
+        """Remove sentinel checks from And conditions, then visit remaining children."""
+        if isinstance(node.op, ast.And):
+            new_values = []
+            for val in node.values:
+                if self._is_sentinel_check(val):
+                    continue  # Remove sentinel check
+                new_val = self.visit(val)
+                if new_val is not None:
+                    new_values.append(new_val)
+            if len(new_values) == 0:
+                return ast.Constant(value=True)
+            elif len(new_values) == 1:
+                return new_values[0]
+            node.values = new_values
+            return node
+        return self.generic_visit(node)
+
+    def visit_Call(self, node):
+        """Replace: len(neighbor_var) → CSR num_neighbors."""
+        self.generic_visit(node)
+        if (isinstance(node.func, ast.Name) and
+            node.func.id == 'len' and
+            len(node.args) == 1):
+            arg = node.args[0]
+            if isinstance(arg, ast.Name) and self.nvar and arg.id == self.nvar:
+                return self._make_num_neighbors()
+            if self._is_locations_agent_subscript(arg):
+                return self._make_num_neighbors()
+        return node
+
+    def visit_Subscript(self, node):
+        """Replace: neighbor_var[expr] or locations[agent_index][expr] → CSR access."""
+        self.generic_visit(node)
+        if self._is_neighbor_var_subscript(node):
+            return self._make_csr_access(node.slice)
+        if (isinstance(node.value, ast.Subscript) and
+            self._is_locations_agent_subscript(node.value)):
+            return self._make_csr_access(node.slice)
+        return node
+
+
+def _auto_transform_csr(source: str, num_properties: int) -> str:
+    """
+    Auto-transform a user's step function to use CSR format for property 1 (locations).
+
+    The user writes their step function with a single 'locations' parameter.
+    This function automatically:
+      1. Replaces the locations parameter with neighbor_offsets, neighbor_values
+      2. Transforms body access patterns (loops, indexing, sentinel checks)
+
+    This keeps the user-facing API unchanged while using efficient CSR internally.
+    """
+    tree = ast.parse(source)
+
+    func_def = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func_def = node
+            break
+
+    if func_def is None:
+        return source
+
+    param_names = [arg.arg for arg in func_def.args.args]
+
+    # Standard params: tick, agent_index, globals, agent_ids (indices 0-3)
+    # Property params start at index 4
+    # Property 1 (locations) is at index 5 (4 standard + property 0)
+    if len(param_names) < 6:
+        return source
+
+    agent_index_param = param_names[1]
+    locations_param = param_names[4 + 1]  # Property 1
+
+    # Step 1: Replace locations parameter with neighbor_offsets, neighbor_values
+    loc_idx = 5
+    func_def.args.args[loc_idx] = ast.arg(arg='neighbor_offsets')
+    func_def.args.args.insert(loc_idx + 1, ast.arg(arg='neighbor_values'))
+
+    # Step 2: Find `var = locations[agent_index]` assignment to track the local variable
+    neighbor_var = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and isinstance(node.value, ast.Subscript):
+                val = node.value
+                if (isinstance(val.value, ast.Name) and val.value.id == locations_param and
+                    isinstance(val.slice, ast.Name) and val.slice.id == agent_index_param):
+                    neighbor_var = target.id
+                    break
+
+    # Step 3: Transform the body
+    transformer = _CSRBodyTransformer(locations_param, agent_index_param, neighbor_var)
+    tree = transformer.visit(tree)
+    ast.fix_missing_locations(tree)
+
+    return ast.unparse(tree)
 
 
 def generate_gpu_func(
@@ -887,66 +1135,66 @@ def generate_gpu_func(
     """
     
     def generate_modified_step_func_code(step_func: Callable, write_indices: Set[int], num_properties: int) -> str:
-        """Generate modified step function code with write buffer parameters."""
+        """Generate modified step function code with CSR transformation and write buffer parameters.
+
+        Phase 1: Auto-transform locations parameter to CSR (neighbor_offsets, neighbor_values)
+        Phase 2: Add double buffering for writable properties
+        """
         source = inspect.getsource(step_func)
-        signature = inspect.signature(step_func)
-        param_names = list(signature.parameters.keys())
-        
-        # Use the same approach as analyze_step_function_for_writes
-        property_params = param_names[-num_properties:]  # Take last N parameters as properties
-        
+
+        # Phase 1: CSR auto-transformation
+        # Replaces locations param with neighbor_offsets, neighbor_values
+        # and transforms body access patterns (loops, indexing, sentinel checks)
+        source = _auto_transform_csr(source, num_properties)
+
+        # Phase 2: Double buffering
+        # Parse the CSR-transformed source
+        tree = ast.parse(source)
+        func_def = None
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func_def = node
+                break
+
+        param_names = [arg.arg for arg in func_def.args.args]
+
+        # Build CSR-aware mapping (function now has num_properties + 1 property-like params)
+        param_to_prop = _build_param_to_property_index_csr(param_names, num_properties)
+        n_prop_params = num_properties + 1
+        property_params = param_names[-n_prop_params:]
+
         # Create mapping from property parameter names to write parameter names
         param_to_write_param = {}
-        for i, param_name in enumerate(property_params):
-            if i in write_indices:
+        for param_name in property_params:
+            prop_idx = param_to_prop.get(param_name, -1)
+            if prop_idx >= 0 and prop_idx in write_indices:
                 param_to_write_param[param_name] = f"write_{param_name}"
-        
+
         if not param_to_write_param:
-            return source  # No modifications needed
-        
-        # Step 1: Add write parameters to function signature
-        # Find last parameter and add write parameters
-        last_param = property_params[-1]
-        write_params_list = list(param_to_write_param.values())
+            return source  # No double buffering needed
 
-        # Replace the closing ): with write parameters + ):
-        if f'{last_param},\n):' in source:
-            # Multi-line with trailing comma
-            write_params_str = '    ' + ',\n    '.join(write_params_list) + ',\n'
-            modified_source = source.replace(f'{last_param},\n):', f'{last_param},\n{write_params_str}):')
-        elif f'{last_param}\n):' in source:
-            # Multi-line without trailing comma
-            write_params_str = ',\n    ' + ',\n    '.join(write_params_list) + ',\n'
-            modified_source = source.replace(f'{last_param}\n):', f'{last_param}{write_params_str}):')
-        else:
-            # Fallback: try to find the closing ): and insert before it
-            write_params_str = ',\n    ' + ',\n    '.join(write_params_list)
-            modified_source = source.replace('\n):', f'{write_params_str},\n):')
+        # Add write parameters to function signature (AST-based)
+        for write_param_name in param_to_write_param.values():
+            func_def.args.args.append(ast.arg(arg=write_param_name))
 
-
-        # Step 2: Replace parameter names with write parameter names in WRITE contexts only
-        tree = ast.parse(modified_source)
-        
-        # Walk through AST and replace write operations
+        # Replace parameter names with write parameter names in WRITE contexts only
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 # Replace in set_this_agent_data_from_tensor calls
-                if (isinstance(node.func, ast.Name) and 
+                if (isinstance(node.func, ast.Name) and
                     node.func.id == 'set_this_agent_data_from_tensor' and
                     len(node.args) >= 2):
                     tensor_arg = node.args[1]
                     if isinstance(tensor_arg, ast.Name) and tensor_arg.id in param_to_write_param:
                         node.args[1] = ast.Name(id=param_to_write_param[tensor_arg.id], ctx=ast.Load())
-            
+
             elif isinstance(node, ast.Assign):
                 # Replace in all types of assignments to param_name
                 def replace_param_in_target(target_node):
                     if isinstance(target_node, ast.Name):
-                        # Direct assignment: param_name = value
                         if target_node.id in param_to_write_param:
                             target_node.id = param_to_write_param[target_node.id]
                     elif isinstance(target_node, ast.Subscript):
-                        # Subscript assignment: param_name[...] = value or nested subscripts
                         replace_param_in_target(target_node.value)
 
                 for target in node.targets:
@@ -958,75 +1206,57 @@ def generate_gpu_func(
                 def convert_aug_assign_target(target_node):
                     if isinstance(target_node, ast.Name):
                         if target_node.id in param_to_write_param:
-                            # Create new assignment: write_param = param + value
                             original_target = ast.Name(id=target_node.id, ctx=ast.Load())
                             write_target = ast.Name(id=param_to_write_param[target_node.id], ctx=ast.Store())
-
-                            new_value = ast.BinOp(
-                                left=original_target,
-                                op=node.op,
-                                right=node.value
-                            )
-
-                            new_assign = ast.Assign(targets=[write_target], value=new_value)
-                            return new_assign
+                            new_value = ast.BinOp(left=original_target, op=node.op, right=node.value)
+                            return ast.Assign(targets=[write_target], value=new_value)
                     elif isinstance(target_node, ast.Subscript):
-                        # Check if the base is a parameter that needs write buffering
                         base = target_node
                         while isinstance(base, ast.Subscript):
                             base = base.value
                         if isinstance(base, ast.Name) and base.id in param_to_write_param:
-                            # Create new assignment: write_param[...] = param[...] + value
-                            # Clone the entire target structure for read (original param)
                             import copy
                             read_target = copy.deepcopy(target_node)
                             read_target.ctx = ast.Load()
-
-                            # Clone the entire target structure for write (write param)
                             write_target = copy.deepcopy(target_node)
                             write_target.ctx = ast.Store()
-                            # Find and replace the base name with write version
                             current = write_target
                             while isinstance(current, ast.Subscript):
                                 if isinstance(current.value, ast.Name):
                                     current.value.id = param_to_write_param[current.value.id]
                                     break
                                 current = current.value
-
-                            new_value = ast.BinOp(
-                                left=read_target,
-                                op=node.op,
-                                right=node.value
-                            )
-
-                            new_assign = ast.Assign(targets=[write_target], value=new_value)
-                            return new_assign
+                            new_value = ast.BinOp(left=read_target, op=node.op, right=node.value)
+                            return ast.Assign(targets=[write_target], value=new_value)
                     return None
 
                 new_assign = convert_aug_assign_target(node.target)
                 if new_assign:
-                    # Replace the AugAssign node with the new Assign node
-                    # We need to track this for later replacement
                     node.__class__ = ast.Assign
                     node.targets = new_assign.targets
                     node.value = new_assign.value
-                    # Remove the op and target attributes
                     if hasattr(node, 'op'):
                         delattr(node, 'op')
                     if hasattr(node, 'target'):
                         delattr(node, 'target')
 
-        modified_source = ast.unparse(tree)
-        
-        return modified_source
+        return ast.unparse(tree)
 
     
     # Generate read arguments (original properties)
-    read_args = [f"a{i}" for i in range(n_properties)]
-    
+    # Property 1 (locations) is replaced by two CSR arrays: neighbor_offsets, neighbor_values
+    read_args = []
+    for i in range(n_properties):
+        if i == 1:
+            read_args.append("neighbor_offsets")
+            read_args.append("neighbor_values")
+        else:
+            read_args.append(f"a{i}")
+
     # Generate write arguments for properties that need write buffers
-    write_args = [f"write_a{i}" for i in sorted(write_property_indices)]
-    
+    # Property 1 (CSR) is never written in the kernel
+    write_args = [f"write_a{i}" for i in sorted(write_property_indices) if i != 1]
+
     # Combine all arguments
     args = read_args + write_args
     

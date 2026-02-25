@@ -10,6 +10,7 @@ from cupyx import jit
 from sagesim.breed import Breed
 from sagesim.model import Model
 from sagesim.space import NetworkSpace
+from sagesim.utils import get_num_neighbors, get_neighbor
 
 comm = MPI.COMM_WORLD
 num_workers = comm.Get_size()

@@ -96,6 +96,62 @@ def _convert_awkward(awkward_array, depth: int) -> cp.array:
     return ak.to_cupy(awkward_array).astype(np.float32)
 
 
+def build_csr_from_ragged(ragged_list: List[Any]):
+    """
+    Convert ragged list of neighbor lists to CSR (Compressed Sparse Row) format.
+
+    CSR uses two arrays instead of padding ragged lists to rectangular:
+      - offsets: array of length (num_agents + 1), where agent i's neighbors
+                 are values[offsets[i] : offsets[i+1]]
+      - values:  flat array of all neighbor entries concatenated
+
+    Input:  [[5, 2], [8, 3, 1], [], [7, 4, 9, 6]]
+    Output: offsets = np.array([0, 2, 5, 5, 9], dtype=np.int32)
+            values  = np.array([5, 2, 8, 3, 1, 7, 4, 9, 6], dtype=np.int32)
+
+    Handles sets (unordered), lists (ordered), numpy arrays, and empty entries.
+
+    :param ragged_list: List of lists/sets/arrays of neighbor IDs or indices
+    :return: (offsets, values) as numpy int32 arrays
+    """
+    if not ragged_list:
+        return np.array([0], dtype=np.int32), np.array([], dtype=np.int32)
+
+    # Compute offsets from lengths
+    lengths = []
+    for row in ragged_list:
+        if isinstance(row, (list, tuple, set, np.ndarray)):
+            lengths.append(len(row))
+        else:
+            lengths.append(0)
+
+    offsets = np.empty(len(lengths) + 1, dtype=np.int32)
+    offsets[0] = 0
+    np.cumsum(lengths, out=offsets[1:])
+
+    total_entries = offsets[-1]
+    values = np.empty(total_entries, dtype=np.int32)
+
+    # Fill values array
+    pos = 0
+    for row in ragged_list:
+        if isinstance(row, np.ndarray):
+            n = len(row)
+            if n > 0:
+                values[pos:pos + n] = row.astype(np.int32)
+            pos += n
+        elif isinstance(row, set):
+            for val in row:
+                values[pos] = int(val)
+                pos += 1
+        elif isinstance(row, (list, tuple)):
+            for val in row:
+                values[pos] = int(val)
+                pos += 1
+
+    return offsets, values
+
+
 def compress_tensor(regular_tensor: cp.array, min_axis: int = 1) -> List[Any]:
     awkward_tensor = ak.from_cupy(regular_tensor)
     awkward_tensor = ak.nan_to_none(awkward_tensor)

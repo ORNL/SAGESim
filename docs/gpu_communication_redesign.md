@@ -287,3 +287,90 @@ Net effect: total GPU memory goes **down** for any model where max_neighbors >> 
 | `sagesim/internal_utils.py` | Replace `convert_to_equal_side_tensor()` with CSR construction. Add GPU hash map utilities. |
 | `sagesim/space.py` | Update `NetworkSpace` to build CSR format instead of Python lists/sets. |
 | New: `sagesim/gpu_kernels.py` | GPU hash map (insert/lookup/delete), pack/unpack kernels for MPI buffers, ID→index conversion kernel. |
+
+---
+
+## Alternative Considered: NVSHMEM / rocSHMEM
+
+### What it is
+
+NVSHMEM (NVIDIA) and rocSHMEM (AMD) implement a Partitioned Global Address Space (PGAS) across GPUs. GPU kernels can directly read/write memory on remote GPUs — no MPI, no CPU involvement, no pack/unpack.
+
+```
+Our approach:     GPU kernel → finish → CPU issues Isend/Irecv/Waitall → GPU kernel
+NVSHMEM approach: GPU kernel reads remote data directly during execution → no CPU at all
+```
+
+### How it would work in SAGESim
+
+Each GPU stores only its own local agents in a symmetric buffer. During the step function kernel, when a thread needs a remote neighbor's data:
+
+```cuda
+pe = get_owner_pe(neighbor_id);
+offset = get_remote_offset(neighbor_id);
+neighbor_state = nvshmem_float_g(&state_buffer[offset], pe);
+```
+
+No ghost cells. No CSR index conversion. No hash map. No pack/unpack. No MPI. The kernel reads what it needs directly from the remote GPU's memory.
+
+### What it eliminates compared to our approach
+
+| Component | Our approach (CSR + MPI) | NVSHMEM |
+|-----------|--------------------------|---------|
+| Neighbor storage | CSR with dual arrays (IDs + local indices) | Simple list of agent IDs only — no index conversion needed |
+| ID→index conversion | GPU hash map | **Not needed** — address remote by (PE, offset) directly |
+| Ghost cells | Yes — copy remote data locally before kernel | **Not needed** — read remote in place |
+| Pack/unpack kernels | Yes — for MPI buffers | **Not needed** |
+| Hash map | Yes — agent_id → local_buffer_index | Replaced by simpler agent_id → (PE, offset) |
+| Data duplication | Local agents + ghost copies | **Zero duplication** — each agent exists on one GPU only |
+| CPU involvement | CPU issues MPI calls | **Zero** |
+
+### Why we chose our approach over NVSHMEM
+
+**1. Dynamic agents (birth/death) break symmetric allocation**
+
+NVSHMEM requires symmetric memory — all GPUs allocate the same buffer size collectively via `nvshmem_malloc`. When an agent is born and the local buffer is full, **all GPUs must stop, collectively reallocate, and copy data**. With our approach, one GPU grows its local buffer independently.
+
+Agent death wastes slots permanently unless compacted — but compaction requires updating a global directory and notifying all GPUs. With one-sided communication there's no notification mechanism. Our approach: remove from hash map + mark CSR range as zero-length, fully local.
+
+**2. Dynamic topology requires reimplementing messaging**
+
+When agent A (GPU 0) connects to agent B (GPU 1), GPU 1 must update B's neighbor list to include A. How does GPU 0 tell GPU 1? Options:
+- `nvshmem_put` into GPU 1's neighbor list — but must know the exact free slot offset, needs atomics
+- Queue-based inbox per GPU — GPU 0 writes to GPU 1's inbox, GPU 1 processes later — this is reimplementing MPI on top of SHMEM
+
+Our approach: update local CSR, exchange via MPI. Straightforward.
+
+**3. Agent ID → (PE, offset) directory problem**
+
+With static uniform partitioning, the mapping is trivial arithmetic: `pe = id / agents_per_pe`. But with dynamic populations (birth/death/migration), you need a distributed directory. Options:
+- Replicated directory: every GPU holds full copy. At 100B agents × 8 bytes = 800GB. Impossible.
+- Distributed hash table over SHMEM: two remote reads per neighbor (one for directory, one for data).
+- Static assignment, never move: wastes memory, causes load imbalance over time.
+
+Our approach: local GPU hash map, handles all dynamic cases.
+
+**4. Stale reads**
+
+With NVSHMEM, a GPU can read a remote agent's data while the remote GPU is writing to it — no error, just wrong data. Memory fences are needed for correctness. Our approach: MPI exchange happens between kernel invocations, so data is always consistent.
+
+**5. Vendor lock-in**
+
+NVSHMEM is NVIDIA-only. rocSHMEM is AMD-only (and the GDA backend for direct GPU-to-NIC was only added in ROCm 7.2.0). Need two code paths or an abstraction layer. MPI works everywhere.
+
+**6. CuPy integration**
+
+nvshmem4py exists for NVIDIA. No equivalent Python bindings confirmed for rocSHMEM. Would need C extensions for AMD.
+
+### Summary
+
+| Scenario | NVSHMEM | Our approach (CSR + MPI) |
+|----------|---------|--------------------------|
+| Static agents, static topology | Cleaner — no ghost cells, no hash map, no dual arrays | More machinery than needed |
+| Dynamic topology (edges change) | Must coordinate cross-GPU neighbor list updates | Update local CSR + hash map |
+| Agent birth | All GPUs must collectively reallocate | One GPU grows independently |
+| Agent death | Stale reads, wasted slots, global coordination to compact | Local hash map remove, local CSR mark |
+| Load rebalancing | Agent migration requires collective reallocation | Agent migration via MPI send/recv |
+| Portability | NVIDIA or AMD only | MPI works everywhere |
+
+**Conclusion:** NVSHMEM is ideal for static problems (fixed atoms, fixed bonds — like GROMACS). For SAGESim's general-purpose ABM with dynamic agents and topology, the complexity of managing symmetric memory and distributed directories exceeds the benefit. Our approach handles dynamic cases natively, with NVSHMEM/rocSHMEM as a possible future fast-path backend for static-topology models.
