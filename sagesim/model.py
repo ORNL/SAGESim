@@ -24,7 +24,7 @@ from mpi4py import MPI
 from sagesim.agent import AgentFactory, Breed
 from sagesim.space import Space
 from sagesim.internal_utils import convert_to_equal_side_tensor, build_csr_from_ragged
-from sagesim.gpu_kernels import GPUBufferManager, GPUHashMap
+from sagesim.gpu_kernels import GPUBufferManager, GPUHashMap, CommunicationManager
 
 
 def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
@@ -374,7 +374,9 @@ class Model:
         if self._is_setup:
             # Ensure CPU-side data is in sync with GPU buffers
             if hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
-                self._sync_gpu_to_cpu_if_needed()
+                if getattr(self, '_cpu_data_stale', False):
+                    self._sync_gpu_to_cpu_if_needed()
+                    self._cpu_data_stale = False
             self._agent_factory._update_agent_property(
                 self.__rank_local_agent_data_tensors, id, property_name
             )
@@ -572,6 +574,7 @@ class Model:
 
         # Initialize GPU buffer manager (buffers allocated lazily on first tick)
         self._gpu_buffers = GPUBufferManager()
+        self._cpu_data_stale = False
 
     def reset(self) -> None:
         # Generate global data tensor
@@ -845,6 +848,10 @@ class Model:
         for prop_idx in buf.sorted_write_indices:
             buf.write_buffers.append(buf.property_tensors[prop_idx].copy())
 
+        # 7. Rebuild communication maps to match new topology
+        if hasattr(self, '_comm_manager') and num_workers > 1:
+            self._comm_manager.build_communication_maps()
+
     def _download_local_data_to_cpu(self, num_local_agents):
         """Download only modified local agent data from GPU to CPU.
 
@@ -946,63 +953,26 @@ class Model:
 
             self._build_gpu_buffers(received_neighbor_ids, received_neighbor_adts, num_local_agents)
 
+            # Initialize CommunicationManager for GPU-direct MPI on subsequent ticks
+            if num_workers > 1:
+                self._comm_manager = CommunicationManager(
+                    buf, self._agent_factory, worker, num_workers, comm
+                )
+                self._comm_manager.build_communication_maps()
+
         else:
-            # --- SUBSEQUENT TICK: selective download → MPI → selective upload ---
-
-            # 1. Selective download: only written properties for local agents → CPU
-            for i, prop_idx in enumerate(buf.sorted_write_indices):
-                cpu_data = buf.property_tensors[prop_idx][:num_local_agents].get().tolist()
-                self.__rank_local_agent_data_tensors[prop_idx] = cpu_data
-
-            # 2. Neighbor compute
-            t_neighbor_start = time.time()
-            rank_local_agents_neighbors = self.get_space()._neighbor_compute_func(
-                self.__rank_local_agent_data_tensors[1]
-            )
-            t_neighbor_end = time.time()
-
-            # 3. MPI exchange
+            # --- SUBSEQUENT TICK: GPU-direct communication via CommunicationManager ---
             t_before_context = time.time()
-            (
-                self.__rank_local_agent_ids,
-                self.__rank_local_agent_data_tensors,
-                received_neighbor_ids,
-                received_neighbor_adts,
-            ) = self._agent_factory.contextualize_agent_data_tensors(
-                self.__rank_local_agent_data_tensors,
-                self.__rank_local_agent_ids,
-                rank_local_agents_neighbors,
-            )
+
+            if num_workers > 1 and hasattr(self, '_comm_manager') and self._comm_manager.is_initialized:
+                self._comm_manager.exchange_ghost_data()
+
             t_after_context = time.time()
 
             if self._verbose_timing:
-                timing_data['neighbor'] = t_neighbor_end - t_neighbor_start
                 timing_data['contextualize'] = t_after_context - t_before_context
-                timing_data['num_neighbors'] = len(received_neighbor_ids)
 
-            # Update num_local_agents after contextualize
-            num_local_agents = len(self.__rank_local_agent_ids)
-            blockspergrid = int(math.ceil(num_local_agents / threadsperblock))
-
-            # 4. Change detection: compare ghost set
-            # TODO: Ghost set comparison alone is insufficient. Same ghost set with
-            # different wiring (who connects to who) will wrongly take the fast path.
-            # When property 1 (locations) becomes writable from the kernel:
-            #   - If 1 in self._write_property_indices: always rebuild CSR
-            #   - The kernel could modify neighbor lists directly on GPU with no
-            #     Python-level hook to detect it
-            # Also: connect_agents()/disconnect_agents() modify space._locations but
-            # not __rank_local_agent_data_tensors[1] (downloaded from GPU). Need to
-            # propagate space changes to the data tensors before MPI exchange.
-            current_ghost_set = set(received_neighbor_ids)
-            if current_ghost_set == buf.prev_ghost_ids_set:
-                # Fast path: ghost set unchanged, only update property values
-                self._upload_ghost_values(received_neighbor_ids, received_neighbor_adts, num_local_agents)
-            else:
-                # Rebuild path: ghost set or topology changed
-                self._rebuild_gpu_buffers(received_neighbor_ids, received_neighbor_adts, num_local_agents)
-
-            # 5. Update global_data_vector on GPU
+            # Update global_data_vector on GPU
             buf.global_data_vector = cp.array(self._global_data_vector)
 
         t_data_prep_end = time.time()
@@ -1057,7 +1027,7 @@ class Model:
         # POST-KERNEL: download for MPI next tick and user queries
         # ============================================================
         t_post_start = time.time()
-        self._download_local_data_to_cpu(num_local_agents)
+        self._cpu_data_stale = True
         t_post_end = time.time()
 
         # Ensure all workers have finished before syncing neighbor data

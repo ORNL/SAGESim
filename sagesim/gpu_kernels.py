@@ -6,6 +6,7 @@ Provides persistent GPU buffer management to eliminate per-tick CPU rebuild cycl
 
 import numpy as np
 import cupy as cp
+from mpi4py import MPI
 
 
 class GPUHashMap:
@@ -329,3 +330,258 @@ class GPUBufferManager:
         self.all_agent_ids_list = []
         self.prev_ghost_ids_set = set()
         self.sorted_write_indices = []
+
+
+class CommunicationManager:
+    """Buffer-protocol MPI communication with GPU pack/unpack.
+
+    Replaces the Python-loop-based contextualize_agent_data_tensors() for
+    subsequent ticks. Pre-computes communication topology once, then each
+    tick does: GPU pack -> buffer-protocol MPI Isend/Irecv -> GPU unpack.
+    One contiguous message per peer rank, no pickle.
+    """
+
+    def __init__(self, buf, agent_factory, my_rank, num_workers, comm):
+        self.buf = buf
+        self.agent_factory = agent_factory
+        self.my_rank = my_rank
+        self.num_workers = num_workers
+        self.comm = comm
+
+        # Per-dest-rank: CuPy int32 arrays of local buffer indices to pack
+        self.send_indices_gpu = {}
+        self.send_counts = {}
+
+        # Per-src-rank: CuPy int32 arrays of ghost buffer indices to scatter into
+        self.recv_indices_gpu = {}
+        self.recv_counts = {}
+
+        # Property layout
+        self.visible_prop_indices = []
+        self.property_widths = {}
+        self.total_stride = 0
+
+        # Pre-allocated buffers (one per peer rank)
+        self.send_bufs_cpu = {}
+        self.recv_bufs_cpu = {}
+        self.send_bufs_gpu = {}
+
+        self._is_initialized = False
+
+    @property
+    def is_initialized(self):
+        return self._is_initialized
+
+    def build_communication_maps(self):
+        """Build pre-computed communication topology from CSR on GPU.
+
+        Runs once after _build_gpu_buffers() or when topology changes.
+        Replaces the per-agent Python loop in contextualize_agent_data_tensors().
+        """
+        buf = self.buf
+        num_local = buf.num_local_agents
+
+        # 1. Build property layout (visible props, skip prop 1 which is CSR)
+        if not self.agent_factory._neighbor_visible_indices:
+            self.agent_factory._build_neighbor_visible_indices()
+
+        self.visible_prop_indices = [
+            idx for idx in self.agent_factory._neighbor_visible_indices
+            if idx != 1
+        ]
+        self.property_widths = {}
+        self.total_stride = 0
+        for prop_idx in self.visible_prop_indices:
+            tensor = buf.property_tensors[prop_idx]
+            if tensor is None:
+                continue
+            width = 1 if tensor.ndim == 1 else tensor.shape[1]
+            self.property_widths[prop_idx] = width
+            self.total_stride += width
+
+        if self.total_stride == 0 or num_local == 0:
+            self._is_initialized = True
+            return
+
+        # 2. Download CSR for local agents from GPU
+        cpu_offsets = buf.neighbor_offsets[:num_local + 1].get()
+        cpu_offsets = np.asarray(cpu_offsets, dtype=np.int32)
+        total_edges_local = int(cpu_offsets[num_local])
+
+        if total_edges_local == 0:
+            self._is_initialized = True
+            return
+
+        cpu_values_ids = buf.neighbor_values_ids[:total_edges_local].get()
+        cpu_values_ids = np.asarray(cpu_values_ids, dtype=np.int32)
+
+        # 3. Vectorized: expand (local_agent_idx, neighbor_id) pairs from CSR
+        counts = np.diff(cpu_offsets)
+        local_agent_indices = np.repeat(np.arange(num_local, dtype=np.int32), counts)
+
+        # Filter invalid neighbor IDs (padding: -1)
+        valid_mask = cpu_values_ids >= 0
+        local_agent_indices = local_agent_indices[valid_mask]
+        neighbor_ids = cpu_values_ids[valid_mask]
+
+        if len(neighbor_ids) == 0:
+            self._is_initialized = True
+            return
+
+        # Build dense rank lookup: rank_lookup[agent_id] = rank
+        agent2rank = self.agent_factory._agent2rank
+        max_agent_id = max(agent2rank.keys())
+        rank_lookup = np.full(max_agent_id + 1, -1, dtype=np.int32)
+        for aid, r in agent2rank.items():
+            rank_lookup[aid] = r
+
+        # Vectorized rank lookup for all neighbors
+        in_range = neighbor_ids <= max_agent_id
+        neighbor_ranks = np.full(len(neighbor_ids), -1, dtype=np.int32)
+        neighbor_ranks[in_range] = rank_lookup[neighbor_ids[in_range]]
+
+        # Filter cross-rank edges
+        cross_mask = (neighbor_ranks != self.my_rank) & (neighbor_ranks >= 0)
+        cross_local_indices = local_agent_indices[cross_mask]
+        cross_neighbor_ranks = neighbor_ranks[cross_mask]
+
+        if len(cross_local_indices) == 0:
+            self._is_initialized = True
+            return
+
+        # Group by dest rank, unique local agent indices per rank
+        dest_ranks_unique = np.unique(cross_neighbor_ranks)
+        send_agent_ids_per_rank = {}
+
+        self.send_indices_gpu = {}
+        self.send_counts = {}
+
+        for dest_rank in dest_ranks_unique:
+            dest_rank = int(dest_rank)
+            mask = cross_neighbor_ranks == dest_rank
+            unique_local_indices = np.unique(cross_local_indices[mask])
+            self.send_indices_gpu[dest_rank] = cp.array(unique_local_indices, dtype=cp.int32)
+            self.send_counts[dest_rank] = len(unique_local_indices)
+            send_agent_ids_per_rank[dest_rank] = np.array(
+                [int(buf.all_agent_ids_list[idx]) for idx in unique_local_indices],
+                dtype=np.int32,
+            )
+
+        # 4. Exchange counts via Alltoall
+        send_counts_array = np.zeros(self.num_workers, dtype=np.int32)
+        for rank, count in self.send_counts.items():
+            send_counts_array[rank] = count
+        recv_counts_array = np.zeros(self.num_workers, dtype=np.int32)
+        self.comm.Alltoall(send_counts_array, recv_counts_array)
+
+        self.recv_counts = {}
+        for rank in range(self.num_workers):
+            if rank != self.my_rank and recv_counts_array[rank] > 0:
+                self.recv_counts[rank] = int(recv_counts_array[rank])
+
+        # 5. Exchange agent IDs so each rank knows which agents it will receive
+        send_id_requests = []
+        for dest_rank, agent_ids_np in send_agent_ids_per_rank.items():
+            req = self.comm.Isend([agent_ids_np, MPI.INT], dest=dest_rank, tag=100)
+            send_id_requests.append(req)
+
+        recv_agent_ids_per_rank = {}
+        recv_id_requests = []
+        for src_rank, count in self.recv_counts.items():
+            recv_buf = np.empty(count, dtype=np.int32)
+            recv_agent_ids_per_rank[src_rank] = recv_buf
+            req = self.comm.Irecv([recv_buf, MPI.INT], source=src_rank, tag=100)
+            recv_id_requests.append(req)
+
+        MPI.Request.Waitall(send_id_requests + recv_id_requests)
+
+        # 6. Map received agent IDs to ghost buffer indices
+        self.recv_indices_gpu = {}
+        for src_rank, agent_ids_np in recv_agent_ids_per_rank.items():
+            ghost_indices = np.array(
+                [buf.agent_id_to_index[int(aid)] for aid in agent_ids_np],
+                dtype=np.int32,
+            )
+            self.recv_indices_gpu[src_rank] = cp.array(ghost_indices, dtype=cp.int32)
+
+        # 7. Pre-allocate send/recv CPU and GPU buffers
+        self.send_bufs_cpu = {}
+        self.send_bufs_gpu = {}
+        self.recv_bufs_cpu = {}
+
+        for dest_rank, count in self.send_counts.items():
+            size = count * self.total_stride
+            self.send_bufs_cpu[dest_rank] = np.empty(size, dtype=np.float32)
+            self.send_bufs_gpu[dest_rank] = cp.empty(size, dtype=cp.float32)
+
+        for src_rank, count in self.recv_counts.items():
+            size = count * self.total_stride
+            self.recv_bufs_cpu[src_rank] = np.empty(size, dtype=np.float32)
+
+        self._is_initialized = True
+
+    def gpu_pack(self, dest_rank):
+        """Pack local agent data into contiguous send buffer on GPU."""
+        indices = self.send_indices_gpu[dest_rank]
+        n = len(indices)
+        buf_gpu = self.send_bufs_gpu[dest_rank]
+        offset = 0
+        for prop_idx in self.visible_prop_indices:
+            width = self.property_widths[prop_idx]
+            data = self.buf.property_tensors[prop_idx][indices]  # GPU fancy indexing
+            if width == 1:
+                buf_gpu[offset:offset + n] = data
+            else:
+                buf_gpu[offset:offset + n * width] = data.ravel()
+            offset += n * width
+        # ONE GPU->CPU transfer
+        self.send_bufs_cpu[dest_rank][:] = buf_gpu.get()
+
+    def mpi_exchange(self):
+        """Non-blocking buffer-protocol MPI send/recv (no pickle)."""
+        requests = []
+        for dest_rank, sbuf in self.send_bufs_cpu.items():
+            requests.append(self.comm.Isend([sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
+        for src_rank, rbuf in self.recv_bufs_cpu.items():
+            requests.append(self.comm.Irecv([rbuf, MPI.FLOAT], source=src_rank, tag=1))
+        MPI.Request.Waitall(requests)
+
+    def gpu_unpack(self, src_rank):
+        """Unpack received CPU buffer into ghost region on GPU."""
+        recv_gpu = cp.array(self.recv_bufs_cpu[src_rank])  # ONE CPU->GPU
+        ghost_indices = self.recv_indices_gpu[src_rank]
+        n = len(ghost_indices)
+        offset = 0
+        for prop_idx in self.visible_prop_indices:
+            width = self.property_widths[prop_idx]
+            if width == 1:
+                data = recv_gpu[offset:offset + n]
+            else:
+                data = recv_gpu[offset:offset + n * width].reshape(n, width)
+            self.buf.property_tensors[prop_idx][ghost_indices] = data  # GPU scatter
+            offset += n * width
+
+    def exchange_ghost_data(self):
+        """Full ghost exchange: GPU pack -> MPI -> GPU unpack -> sync write buffers."""
+        if not self._is_initialized:
+            return
+
+        # Pack all destinations
+        for dest_rank in self.send_counts:
+            self.gpu_pack(dest_rank)
+
+        # MPI exchange
+        if self.send_bufs_cpu or self.recv_bufs_cpu:
+            self.mpi_exchange()
+
+        # Unpack all sources
+        for src_rank in self.recv_counts:
+            self.gpu_unpack(src_rank)
+
+        # Update write buffers for ghost region
+        for i, prop_idx in enumerate(self.buf.sorted_write_indices):
+            if prop_idx in self.property_widths:
+                for src_rank in self.recv_indices_gpu:
+                    ghost_indices = self.recv_indices_gpu[src_rank]
+                    self.buf.write_buffers[i][ghost_indices] = \
+                        self.buf.property_tensors[prop_idx][ghost_indices]
