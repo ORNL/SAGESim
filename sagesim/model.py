@@ -989,7 +989,8 @@ class _CSRBodyTransformer(ast.NodeTransformer):
         return self.generic_visit(node)
 
     def visit_Call(self, node):
-        """Replace: len(neighbor_var) → CSR num_neighbors."""
+        """Replace: len(neighbor_var) → CSR num_neighbors.
+        Also replace bare 'locations' in function call args with CSR arrays."""
         self.generic_visit(node)
         if (isinstance(node.func, ast.Name) and
             node.func.id == 'len' and
@@ -999,6 +1000,21 @@ class _CSRBodyTransformer(ast.NodeTransformer):
                 return self._make_num_neighbors()
             if self._is_locations_agent_subscript(arg):
                 return self._make_num_neighbors()
+
+        # Replace bare 'locations' forwarded to sub-function calls
+        # e.g., other_func(..., locations, ...) → other_func(..., neighbor_offsets, neighbor_values, ...)
+        new_args = []
+        changed = False
+        for arg in node.args:
+            if isinstance(arg, ast.Name) and arg.id == self.loc_param:
+                new_args.append(ast.Name(id='neighbor_offsets', ctx=ast.Load()))
+                new_args.append(ast.Name(id='neighbor_values', ctx=ast.Load()))
+                changed = True
+            else:
+                new_args.append(arg)
+        if changed:
+            node.args = new_args
+
         return node
 
     def visit_Subscript(self, node):
@@ -1010,6 +1026,55 @@ class _CSRBodyTransformer(ast.NodeTransformer):
             self._is_locations_agent_subscript(node.value)):
             return self._make_csr_access(node.slice)
         return node
+
+
+def _find_forwarded_location_funcs(step_func, num_properties):
+    """Find device functions called from step_func that receive the locations parameter.
+
+    When a step function forwards 'locations' to a helper function (e.g., a dispatcher
+    pattern), the helper also needs CSR transformation. This function identifies such
+    helpers by scanning the step function's AST for calls that pass the locations
+    parameter as a bare argument.
+
+    Returns list of (func_name, func_object) pairs.
+    """
+    source = inspect.getsource(step_func)
+    tree = ast.parse(source)
+
+    func_def = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func_def = node
+            break
+
+    if func_def is None:
+        return []
+
+    param_names = [arg.arg for arg in func_def.args.args]
+    if len(param_names) < 6:
+        return []
+
+    locations_param = param_names[5]  # Property 1
+
+    # Find all calls that pass locations as a bare argument
+    called_funcs = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for arg in node.args:
+                if isinstance(arg, ast.Name) and arg.id == locations_param:
+                    if isinstance(node.func, ast.Name):
+                        called_funcs.add(node.func.id)
+                    break
+
+    # Resolve function names to actual function objects via the step function's module
+    module = inspect.getmodule(step_func)
+    result = []
+    for func_name in called_funcs:
+        func_obj = getattr(module, func_name, None)
+        if func_obj is not None and callable(func_obj):
+            result.append((func_name, func_obj))
+
+    return result
 
 
 def _auto_transform_csr(source: str, num_properties: int) -> str:
@@ -1266,12 +1331,13 @@ def generate_gpu_func(
     imported_modules = set()
 
     modified_step_functions = []
+    transformed_helpers = set()  # Track already-transformed helper functions
     for breed_idx_2_step_func in breed_idx_2_step_func_by_priority:
         for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
             breed_step_func_impl, module_fpath = breed_step_func_info
             step_func_name = getattr(breed_step_func_impl, "__name__", repr(callable))
             modified_step_func_name = f"{step_func_name}_double_buffer"
-            
+
             # Generate modified step function
             modified_step_func_code = generate_modified_step_func_code(breed_step_func_impl, write_property_indices, n_properties)
             modified_step_func_code = modified_step_func_code.replace(
@@ -1279,6 +1345,16 @@ def generate_gpu_func(
                 f"def {modified_step_func_name}("
             )
             modified_step_functions.append(modified_step_func_code)
+
+            # Transform helper functions that receive forwarded locations parameter
+            # (e.g., dispatcher pattern where step func calls other device functions)
+            forwarded_funcs = _find_forwarded_location_funcs(breed_step_func_impl, n_properties)
+            for helper_name, helper_obj in forwarded_funcs:
+                if helper_name not in transformed_helpers:
+                    helper_source = inspect.getsource(helper_obj)
+                    transformed_helper = _auto_transform_csr(helper_source, n_properties)
+                    modified_step_functions.append(transformed_helper)
+                    transformed_helpers.add(helper_name)
 
             module_fpath = Path(module_fpath).absolute()
             module_name = module_fpath.stem
