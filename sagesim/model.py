@@ -923,6 +923,7 @@ class Model:
 
         if not buf.is_initialized:
             # --- FIRST TICK: full build ---
+            print(f"  [SAGESim] FIRST TICK (tick={self.tick}): building GPU buffers, padding tensors, converting IDs to indices")
             t_neighbor_start = time.time()
             rank_local_agents_neighbors = self.get_space()._neighbor_compute_func(
                 self.__rank_local_agent_data_tensors[1]
@@ -951,7 +952,13 @@ class Model:
             num_local_agents = len(self.__rank_local_agent_ids)
             blockspergrid = int(math.ceil(num_local_agents / threadsperblock))
 
+            t_build_start = time.time()
             self._build_gpu_buffers(received_neighbor_ids, received_neighbor_adts, num_local_agents)
+            t_build_end = time.time()
+
+            print(f"  [SAGESim]   neighbor_compute={t_neighbor_end - t_neighbor_start:.3f}s, "
+                  f"contextualize={t_after_context - t_before_context:.3f}s, "
+                  f"build_gpu_buffers={t_build_end - t_build_start:.3f}s")
 
             # Initialize CommunicationManager for GPU-direct MPI on subsequent ticks
             if num_workers > 1:
@@ -961,7 +968,7 @@ class Model:
                 self._comm_manager.build_communication_maps()
 
         else:
-            # --- SUBSEQUENT TICK: GPU-direct communication via CommunicationManager ---
+            # --- SUBSEQUENT TICK: reuse existing GPU buffers ---
             t_before_context = time.time()
 
             if num_workers > 1 and hasattr(self, '_comm_manager') and self._comm_manager.is_initialized:
@@ -1056,6 +1063,13 @@ class Model:
                   f"gpu={timing_data['gpu_kernel']:.3f}s, "
                   f"post={timing_data['post']:.3f}s, "
                   f"sync={timing_data['sync']:.3f}s", flush=True)
+
+        # Always print chunk-level timing summary
+        print(f"  [SAGESim] worker_coroutine done: {sync_workers_every_n_ticks} ticks, "
+              f"data_prep={t_data_prep_end - t_data_prep_start:.3f}s, "
+              f"gpu_kernel={t_gpu_kernel_end - t_gpu_kernel_start:.3f}s, "
+              f"post+sync={t_end - t_post_start:.3f}s, "
+              f"total={t_end - t_start:.3f}s", flush=True)
 
 
 def reduce_global_data_vector(A, B):
