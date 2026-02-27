@@ -928,7 +928,7 @@ class Model:
         timing_data = {} if self._verbose_timing else None
 
         num_local_agents = len(self.__rank_local_agent_ids)
-        threadsperblock = 32
+        threadsperblock = 128
         blockspergrid = int(math.ceil(num_local_agents / threadsperblock))
 
         buf = self._gpu_buffers
