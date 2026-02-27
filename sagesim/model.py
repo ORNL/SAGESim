@@ -523,6 +523,23 @@ class Model:
         # Sort write property indices for consistent ordering
         self._write_property_indices = sorted(self._write_property_indices)
 
+        # Generate agent data tensors early so we can inspect property shapes
+        self.__rank_local_agent_data_tensors = (
+            self._agent_factory._generate_agent_data_tensors()
+        )
+
+        # Compute property column counts for write-back code generation
+        # 0 = scalar (1D array), >1 = number of columns (2D array)
+        property_ndims = {}
+        for prop_idx in self._write_property_indices:
+            if prop_idx == 1:
+                continue
+            data = self.__rank_local_agent_data_tensors[prop_idx]
+            if data and isinstance(data[0], (list, tuple, np.ndarray)):
+                property_ndims[prop_idx] = len(data[0])
+            else:
+                property_ndims[prop_idx] = 0  # scalar
+
         if worker == 0:
             with open(self._step_function_file_path, "w", encoding="utf-8") as f:
                 f.write(
@@ -530,6 +547,7 @@ class Model:
                         self._agent_factory.num_properties,
                         self._breed_idx_2_step_func_by_priority,
                         self._write_property_indices,
+                        property_ndims,
                     )
                 )
         comm.barrier()
@@ -545,11 +563,6 @@ class Model:
             )
         self._step_func = step_func_module.stepfunc
         ###
-
-        # Generate agent data tensors
-        self.__rank_local_agent_data_tensors = (
-            self._agent_factory._generate_agent_data_tensors()
-        )
 
         # Print agent distribution summary
         if worker == 0:
@@ -717,6 +730,10 @@ class Model:
         # 8. Create write buffers
         sorted_write_indices = sorted(i for i in self._write_property_indices if i != 1)
         buf.allocate_write_buffers(sorted_write_indices)
+
+        # 9. Allocate barrier counter for fused-kernel grid barrier
+        # Must be int32 to match barrier arithmetic (int32 num_blocks_param, int literals)
+        buf.barrier_counter = cp.zeros(1, dtype=cp.int32)
 
         buf.is_initialized = True
 
@@ -988,7 +1005,7 @@ class Model:
             timing_data['data_prep'] = t_data_prep_end - t_data_prep_start
 
         # ============================================================
-        # GPU KERNEL EXECUTION
+        # GPU KERNEL EXECUTION (fused: all ticks + priorities in one launch)
         # ============================================================
 
         # Build all_args from persistent GPU buffers
@@ -1001,28 +1018,40 @@ class Model:
                 all_args.append(buf.property_tensors[i])
         all_args = all_args + buf.write_buffers
 
+        # Compute max co-resident blocks for grid barrier safety
+        dev = cp.cuda.Device()
+        attrs = dev.attributes
+        max_threads_per_sm = attrs.get('MaxThreadsPerMultiProcessor', 2048)
+        max_blocks_per_sm = min(
+            attrs.get('MaxBlocksPerMultiprocessor', 16),
+            max_threads_per_sm // threadsperblock,
+        )
+        num_sms = attrs['MultiProcessorCount']
+        max_grid_blocks = max_blocks_per_sm * num_sms
+        effective_blocks = min(blockspergrid, max_grid_blocks)
+
         t_gpu_kernel_start = time.time()
-        for tick_offset in range(sync_workers_every_n_ticks):
-            current_tick = self.tick + tick_offset
 
-            for priority_idx, priority_group in enumerate(self._breed_idx_2_step_func_by_priority):
-                self._step_func[blockspergrid, threadsperblock](
-                    current_tick,
-                    buf.global_data_vector,
-                    *all_args,
-                    1,
-                    cp.float32(num_local_agents),
-                    buf.agent_ids_gpu,
-                    priority_idx,
-                )
-                cp.cuda.Stream.null.synchronize()
+        # Reset barrier counter and launch fused kernel
+        buf.barrier_counter[0] = 0
+        self._step_func[effective_blocks, threadsperblock](
+            self.tick,
+            buf.global_data_vector,
+            *all_args,
+            sync_workers_every_n_ticks,
+            cp.float32(num_local_agents),
+            buf.agent_ids_gpu,
+            buf.barrier_counter,
+            cp.int32(effective_blocks),
+        )
+        cp.cuda.Stream.null.synchronize()
 
-            # Copy write buffers back to read buffers after ALL priority groups complete
-            for i, prop_idx in enumerate(buf.sorted_write_indices):
-                buf.property_tensors[prop_idx][:num_local_agents] = \
-                    buf.write_buffers[i][:num_local_agents]
-
-            cp.cuda.Stream.null.synchronize()
+        # Final write-back: kernel does inter-tick write-backs on GPU,
+        # but ensure property_tensors match write_buffers for post-kernel reads
+        for i, prop_idx in enumerate(buf.sorted_write_indices):
+            buf.property_tensors[prop_idx][:num_local_agents] = \
+                buf.write_buffers[i][:num_local_agents]
+        cp.cuda.Stream.null.synchronize()
 
         self.tick += sync_workers_every_n_ticks
         t_gpu_kernel_end = time.time()
@@ -1337,10 +1366,32 @@ def _auto_transform_csr(source: str, num_properties: int) -> str:
     return ast.unparse(tree)
 
 
+def _gen_barrier_code(indent):
+    """Generate software grid barrier code lines for the fused kernel.
+
+    Uses atomic counter pattern: each block signals completion, then spins
+    until all blocks have arrived. Two threadfences bracket the atomic
+    operations to ensure global memory visibility.
+    """
+    return [
+        f"{indent}jit.syncthreads()",
+        f"{indent}if jit.threadIdx.x == 0:",
+        f"{indent}\tjit.threadfence()",
+        f"{indent}\tjit.atomic_add(barrier_counter, 0, 1)",
+        f"{indent}\t_barrier_target = (barrier_id + 1) * num_blocks_param",
+        f"{indent}\twhile jit.atomic_add(barrier_counter, 0, 0) < _barrier_target:",
+        f"{indent}\t\tpass",
+        f"{indent}\tjit.threadfence()",
+        f"{indent}jit.syncthreads()",
+        f"{indent}barrier_id = barrier_id + 1",
+    ]
+
+
 def generate_gpu_func(
     n_properties: int,
     breed_idx_2_step_func_by_priority: List[List[Union[int, Callable]]],
     write_property_indices: Set[int],
+    property_ndims: dict = None,
 ) -> str:
     """
     Generate GPU function string with double buffering support for race condition prevention.
@@ -1527,9 +1578,12 @@ def generate_gpu_func(
     # Combine all arguments
     args = read_args + write_args
     
-    # Generate modified step functions and simulation loop
-    sim_loop = []
-    step_sources = ["import os", "import sys"]
+    # Generate modified step functions
+    step_sources = [
+        "import os", "import sys",
+        "from sagesim.jit_extensions import install_jit_extensions",
+        "install_jit_extensions()",
+    ]
     imported_modules = set()
 
     modified_step_functions = []
@@ -1568,51 +1622,72 @@ def generate_gpu_func(
                     f"from {module_name} import *",
                 ]
                 imported_modules.add(module_fpath)
-            
-            # Generate step function call
-            sim_loop += [
-                f"if breed_id == {breedidx}:",
-                f"\t{modified_step_func_name}(",
-                "\t\tthread_local_tick,",
-                "\t\tagent_index,",
-                "\t\tdevice_global_data_vector,",
-                "\t\tagent_ids,",
-                f"\t\t{','.join(args)},",
-                "\t)",
-            ]
 
     step_sources = "\n".join(step_sources)
-
-    # Add modified step functions
     all_modified_step_functions = "\n\n".join(modified_step_functions)
-    
-    # Preprocess parts that would break in f-strings
-    joined_sim_loop = "\n\t\t\t".join(sim_loop)
     joined_args = ",".join(args)
 
-    # Generate breed-specific execution logic with proper indentation
-    breed_execution_code = []
+    if property_ndims is None:
+        property_ndims = {}
+
+    # ================================================================
+    # Generate fused kernel body: persistent threads + grid barriers
+    # All priorities and ticks execute in a single kernel launch.
+    # ================================================================
+    tick_body = []
+
     for priority_idx, breed_idx_2_step_func in enumerate(breed_idx_2_step_func_by_priority):
-        breed_execution_code.append(f"\t\t\tif current_priority_index == {priority_idx}:")
+        # Persistent thread loop for this priority
+        tick_body.append("\t\tagent_index = thread_id")
+        tick_body.append("\t\twhile agent_index < num_rank_local_agents:")
+        tick_body.append("\t\t\tbreed_id = a0[agent_index]")
+
         for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
             breed_step_func_impl, module_fpath = breed_step_func_info
             step_func_name = getattr(breed_step_func_impl, "__name__", repr(callable))
             modified_step_func_name = f"{step_func_name}_double_buffer"
 
-            breed_execution_code.append(f"\t\t\t\tif breed_id == {breedidx}:")
-            breed_execution_code.append(f"\t\t\t\t\t{modified_step_func_name}(")
-            breed_execution_code.append("\t\t\t\t\t\tthread_local_tick,")
-            breed_execution_code.append("\t\t\t\t\t\tagent_index,")
-            breed_execution_code.append("\t\t\t\t\t\tdevice_global_data_vector,")
-            breed_execution_code.append("\t\t\t\t\t\tagent_ids,")
-            breed_execution_code.append(f"\t\t\t\t\t\t{','.join(args)},")
-            breed_execution_code.append("\t\t\t\t\t)")
+            tick_body.append(f"\t\t\tif breed_id == {breedidx}:")
+            tick_body.append(f"\t\t\t\t{modified_step_func_name}(")
+            tick_body.append("\t\t\t\t\tthread_local_tick,")
+            tick_body.append("\t\t\t\t\tagent_index,")
+            tick_body.append("\t\t\t\t\tdevice_global_data_vector,")
+            tick_body.append("\t\t\t\t\tagent_ids,")
+            tick_body.append(f"\t\t\t\t\t{','.join(args)},")
+            tick_body.append("\t\t\t\t)")
 
-    joined_breed_execution = "\n".join(breed_execution_code)
+        tick_body.append("\t\t\tagent_index = agent_index + total_threads")
+
+        # Grid barrier after this priority
+        tick_body.append("")
+        tick_body += _gen_barrier_code("\t\t")
+
+    # Write-back: copy write buffers to read buffers (end of tick)
+    writeback_props = sorted(i for i in write_property_indices if i != 1)
+    if writeback_props:
+        tick_body.append("")
+        tick_body.append("\t\tagent_index = thread_id")
+        tick_body.append("\t\twhile agent_index < num_rank_local_agents:")
+
+        for prop_idx in writeback_props:
+            ncols = property_ndims.get(prop_idx, 0)
+            if ncols > 1:
+                tick_body.append(f"\t\t\tfor _wb_j in range({ncols}):")
+                tick_body.append(f"\t\t\t\ta{prop_idx}[agent_index][_wb_j] = write_a{prop_idx}[agent_index][_wb_j]")
+            else:
+                tick_body.append(f"\t\t\ta{prop_idx}[agent_index] = write_a{prop_idx}[agent_index]")
+
+        tick_body.append("\t\t\tagent_index = agent_index + total_threads")
+
+        # Final barrier (ensures write-back visible before next tick)
+        tick_body.append("")
+        tick_body += _gen_barrier_code("\t\t")
+
+    joined_tick_body = "\n".join(tick_body)
 
     func = [
-        "# Auto-generated GPU kernel with cross-breed synchronization",
-        "# Contains all necessary imports and modified step functions",
+        "# Auto-generated fused GPU kernel with grid barriers",
+        "# All priorities and ticks in a single kernel launch",
         "",
         step_sources,
         "",
@@ -1627,16 +1702,17 @@ def generate_gpu_func(
         "sync_workers_every_n_ticks,",
         "num_rank_local_agents,",
         "agent_ids,",
-        "current_priority_index,",
+        "barrier_counter,",
+        "num_blocks_param,",
         "):",
         "\tthread_id = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x",
-        "\tagent_index = thread_id",
-        "\tif agent_index < num_rank_local_agents:",
-        "\t\tbreed_id = a0[agent_index]",
-        "\t\tfor tick in range(sync_workers_every_n_ticks):",
-        "\t\t\tthread_local_tick = int(global_tick) + tick",
+        "\ttotal_threads = jit.gridDim.x * jit.blockDim.x",
+        "\tbarrier_id = 0",
         "",
-        joined_breed_execution,
+        "\tfor tick in range(sync_workers_every_n_ticks):",
+        "\t\tthread_local_tick = int(global_tick) + tick",
+        "",
+        joined_tick_body,
     ]
 
     func = "\n".join(func)

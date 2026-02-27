@@ -157,6 +157,7 @@ class GPUBufferManager:
         self.agent_ids_gpu = None       # CuPy array of all agent IDs (local + ghost)
         self.global_data_vector = None  # CuPy array
         self.hash_map = None            # GPUHashMap instance
+        self.barrier_counter = None     # CuPy uint32[1] for fused-kernel grid barrier
 
         # Capacity tracking
         self.agent_capacity = 0         # Max agents property tensors can hold
@@ -311,7 +312,7 @@ class GPUBufferManager:
         self.write_buffers = []
 
         for attr in ('neighbor_offsets', 'neighbor_values', 'neighbor_values_ids',
-                      'agent_ids_gpu', 'global_data_vector'):
+                      'agent_ids_gpu', 'global_data_vector', 'barrier_counter'):
             arr = getattr(self, attr, None)
             if arr is not None:
                 del arr
