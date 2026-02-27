@@ -551,6 +551,7 @@ class Model:
                         self._breed_idx_2_step_func_by_priority,
                         self._write_property_indices,
                         property_ndims,
+                        extra_kernel_config=self._get_extra_kernel_config(),
                     )
                 )
         comm.barrier()
@@ -591,6 +592,26 @@ class Model:
         # Initialize GPU buffer manager (buffers allocated lazily on first tick)
         self._gpu_buffers = GPUBufferManager()
         self._cpu_data_stale = False
+
+    # ------------------------------------------------------------------
+    # Overridable hooks for subclass-specific GPU kernel extensions
+    # ------------------------------------------------------------------
+
+    def _get_extra_kernel_config(self) -> dict:
+        """Override to inject extra GPU kernel params and post-step code.
+        Returns dict with optional keys:
+          'extra_kernel_params': list[str]         — names for kernel signature
+          'post_breed_step_code': list[tuple]      — [(code_lines, once_per_breed), ...]
+        """
+        return {}
+
+    def _prepare_kernel_extras(self, num_local_agents, sync_ticks) -> tuple:
+        """Override to allocate/reset extra GPU buffers. Returns extra kernel args tuple."""
+        return ()
+
+    def _process_kernel_extras(self) -> None:
+        """Override to download/process extra GPU data after kernel execution."""
+        pass
 
     def reset(self) -> None:
         # Generate global data tensor
@@ -1066,6 +1087,9 @@ class Model:
             range_args.append(cp.float32(p_start))
             range_args.append(cp.float32(p_count))
 
+        # Prepare subclass-specific extra kernel args (e.g. spike recording buffers)
+        extra_kernel_args = self._prepare_kernel_extras(num_local_agents, sync_workers_every_n_ticks)
+
         # Reset barrier counter and launch fused kernel
         buf.barrier_counter[0] = 0
         self._step_func[effective_blocks, threadsperblock](
@@ -1078,8 +1102,12 @@ class Model:
             buf.agent_ids_gpu,
             buf.barrier_counter,
             cp.int32(effective_blocks),
+            *extra_kernel_args,
         )
         cp.cuda.Stream.null.synchronize()
+
+        # Process subclass-specific extra data (e.g. download spike records)
+        self._process_kernel_extras()
 
         # Final write-back: kernel does inter-tick write-backs on GPU,
         # but ensure property_tensors match write_buffers for post-kernel reads
@@ -1427,6 +1455,7 @@ def generate_gpu_func(
     breed_idx_2_step_func_by_priority: List[List[Union[int, Callable]]],
     write_property_indices: Set[int],
     property_ndims: dict = None,
+    extra_kernel_config: dict = None,
 ) -> str:
     """
     Generate GPU function string with double buffering support for race condition prevention.
@@ -1670,6 +1699,7 @@ def generate_gpu_func(
     # All priorities and ticks execute in a single kernel launch.
     # ================================================================
     tick_body = []
+    _extra_seen_breeds = set()  # For once_per_breed dedup of extra post-step code
 
     for priority_idx, breed_idx_2_step_func in enumerate(breed_idx_2_step_func_by_priority):
         # Range-bounded persistent thread loop for this priority
@@ -1692,6 +1722,16 @@ def generate_gpu_func(
             tick_body.append("\t\t\t\t\tagent_ids,")
             tick_body.append(f"\t\t\t\t\t{','.join(args)},")
             tick_body.append("\t\t\t\t)")
+
+            # Inject extra post-step code from subclass config
+            if extra_kernel_config:
+                for code_lines, once_per_breed in extra_kernel_config.get('post_breed_step_code', []):
+                    if once_per_breed and breedidx in _extra_seen_breeds:
+                        continue
+                    for line in code_lines:
+                        tick_body.append(f"\t\t\t\t{line}")
+                    if once_per_breed:
+                        _extra_seen_breeds.add(breedidx)
 
         tick_body.append("\t\t\tagent_index = agent_index + total_threads")
 
@@ -1749,6 +1789,7 @@ def generate_gpu_func(
         "agent_ids,",
         "barrier_counter,",
         "num_blocks_param,",
+        *[f"{p}," for p in (extra_kernel_config or {}).get('extra_kernel_params', [])],
         "):",
         "\tthread_id = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x",
         "\ttotal_threads = jit.gridDim.x * jit.blockDim.x",
