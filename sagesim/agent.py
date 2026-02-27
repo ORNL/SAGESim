@@ -450,6 +450,43 @@ class AgentFactory:
                 matching_agents[agent_id] = agent_properties
         return matching_agents
 
+    def sort_by_breed(self):
+        """Sort local agents by breed_id for GPU kernel range optimization.
+
+        Reorders _property_name_2_agent_data_tensor and updates
+        _rank2agentid2agentidx to reflect sorted positions.
+        """
+        old_mapping = self._rank2agentid2agentidx.get(worker)
+        if not old_mapping:
+            return
+
+        agent_ids = list(old_mapping.keys())
+        n = len(agent_ids)
+        if n == 0:
+            return
+
+        # Get breed data (property index 0)
+        breed_data = self._property_name_2_agent_data_tensor["breed"]
+        old_indices = [old_mapping[aid] for aid in agent_ids]
+        breeds = [breed_data[idx] for idx in old_indices]
+
+        # Stable sort by breed
+        sorted_order = sorted(range(n), key=lambda i: breeds[i])
+        sort_perm = [old_indices[sorted_order[i]] for i in range(n)]
+
+        # Reorder all property data lists
+        for prop_name in self._property_name_2_agent_data_tensor:
+            old_list = self._property_name_2_agent_data_tensor[prop_name]
+            self._property_name_2_agent_data_tensor[prop_name] = [
+                old_list[sort_perm[i]] for i in range(n)
+            ]
+
+        # Rebuild _rank2agentid2agentidx with sorted positions
+        new_mapping = OrderedDict()
+        for new_idx, old_pos in enumerate(sorted_order):
+            new_mapping[agent_ids[old_pos]] = new_idx
+        self._rank2agentid2agentidx[worker] = new_mapping
+
     def _generate_agent_data_tensors(
         self,
     ) -> List[List[Any]]:

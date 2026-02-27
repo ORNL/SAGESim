@@ -523,6 +523,9 @@ class Model:
         # Sort write property indices for consistent ordering
         self._write_property_indices = sorted(self._write_property_indices)
 
+        # Sort agents by breed for range-bounded kernel loops
+        self._agent_factory.sort_by_breed()
+
         # Generate agent data tensors early so we can inspect property shapes
         self.__rank_local_agent_data_tensors = (
             self._agent_factory._generate_agent_data_tensors()
@@ -667,6 +670,30 @@ class Model:
         buf = self._gpu_buffers
         buf.num_local_agents = num_local_agents
         num_ghost = len(received_neighbor_ids)
+
+        # Compute per-priority breed ranges from sorted breed data
+        breed_data = self.__rank_local_agent_data_tensors[0]  # property 0 = breed
+        breed_ranges = {}  # breed_id -> (start, count)
+        if num_local_agents > 0:
+            breeds = np.array(breed_data, dtype=np.int32)
+            unique, counts = np.unique(breeds, return_counts=True)
+            start = 0
+            for bid, cnt in zip(unique, counts):
+                breed_ranges[int(bid)] = (start, int(cnt))
+                start += int(cnt)
+
+        buf.priority_ranges = {}
+        for p_idx, breed_step_dict in enumerate(self._breed_idx_2_step_func_by_priority):
+            min_start, max_end = num_local_agents, 0
+            for bid in breed_step_dict.keys():
+                if bid in breed_ranges:
+                    s, c = breed_ranges[bid]
+                    min_start = min(min_start, s)
+                    max_end = max(max_end, s + c)
+            if max_end > min_start:
+                buf.priority_ranges[p_idx] = (min_start, max_end - min_start)
+            else:
+                buf.priority_ranges[p_idx] = (0, 0)
 
         # 1. Build agent ID list and CPU hash map
         all_agent_ids_list = self.__rank_local_agent_ids + received_neighbor_ids
@@ -1032,6 +1059,13 @@ class Model:
 
         t_gpu_kernel_start = time.time()
 
+        # Build range args for per-priority breed ranges
+        range_args = []
+        for p_idx in range(len(self._breed_idx_2_step_func_by_priority)):
+            p_start, p_count = buf.priority_ranges.get(p_idx, (0, 0))
+            range_args.append(cp.float32(p_start))
+            range_args.append(cp.float32(p_count))
+
         # Reset barrier counter and launch fused kernel
         buf.barrier_counter[0] = 0
         self._step_func[effective_blocks, threadsperblock](
@@ -1040,6 +1074,7 @@ class Model:
             *all_args,
             sync_workers_every_n_ticks,
             cp.float32(num_local_agents),
+            *range_args,
             buf.agent_ids_gpu,
             buf.barrier_counter,
             cp.int32(effective_blocks),
@@ -1637,10 +1672,12 @@ def generate_gpu_func(
     tick_body = []
 
     for priority_idx, breed_idx_2_step_func in enumerate(breed_idx_2_step_func_by_priority):
-        # Persistent thread loop for this priority
-        tick_body.append("\t\tagent_index = thread_id")
-        tick_body.append("\t\twhile agent_index < num_rank_local_agents:")
-        tick_body.append("\t\t\tbreed_id = a0[agent_index]")
+        # Range-bounded persistent thread loop for this priority
+        p = priority_idx
+        tick_body.append(f"\t\tagent_index = thread_id")
+        tick_body.append(f"\t\twhile agent_index < priority_{p}_count:")
+        tick_body.append(f"\t\t\t_real_idx = int(agent_index) + int(priority_{p}_start)")
+        tick_body.append(f"\t\t\tbreed_id = a0[_real_idx]")
 
         for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
             breed_step_func_impl, module_fpath = breed_step_func_info
@@ -1650,7 +1687,7 @@ def generate_gpu_func(
             tick_body.append(f"\t\t\tif breed_id == {breedidx}:")
             tick_body.append(f"\t\t\t\t{modified_step_func_name}(")
             tick_body.append("\t\t\t\t\tthread_local_tick,")
-            tick_body.append("\t\t\t\t\tagent_index,")
+            tick_body.append("\t\t\t\t\t_real_idx,")
             tick_body.append("\t\t\t\t\tdevice_global_data_vector,")
             tick_body.append("\t\t\t\t\tagent_ids,")
             tick_body.append(f"\t\t\t\t\t{','.join(args)},")
@@ -1685,6 +1722,13 @@ def generate_gpu_func(
 
     joined_tick_body = "\n".join(tick_body)
 
+    # Build range parameter names for kernel signature
+    num_priorities = len(breed_idx_2_step_func_by_priority)
+    range_params = []
+    for p in range(num_priorities):
+        range_params.extend([f"priority_{p}_start", f"priority_{p}_count"])
+    joined_range_params = ",".join(range_params)
+
     func = [
         "# Auto-generated fused GPU kernel with grid barriers",
         "# All priorities and ticks in a single kernel launch",
@@ -1701,6 +1745,7 @@ def generate_gpu_func(
         joined_args + ",",
         "sync_workers_every_n_ticks,",
         "num_rank_local_agents,",
+        joined_range_params + "," if joined_range_params else "",
         "agent_ids,",
         "barrier_counter,",
         "num_blocks_param,",
