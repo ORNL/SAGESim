@@ -6,6 +6,7 @@ SuperNeuroABM basic Model class
 from typing import Dict, List, Callable, Set, Any, Union
 import os
 import re
+import sys
 from pathlib import Path
 import importlib
 import pickle
@@ -562,9 +563,13 @@ class Model:
             warnings.filterwarnings("ignore", category=DeprecationWarning)
             warnings.filterwarnings("ignore", category=FutureWarning)
             warnings.filterwarnings("ignore", message=".*numba.*", category=Warning)
-            step_func_module = importlib.import_module(
-                os.path.splitext(self._step_function_file_path)[0]
-            )
+            importlib.invalidate_caches()
+            abs_path = os.path.abspath(self._step_function_file_path)
+            module_name = os.path.splitext(os.path.basename(abs_path))[0]
+            spec = importlib.util.spec_from_file_location(module_name, abs_path)
+            step_func_module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = step_func_module
+            spec.loader.exec_module(step_func_module)
         self._step_func = step_func_module.stepfunc
         ###
 
