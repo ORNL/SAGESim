@@ -171,6 +171,7 @@ class GPUBufferManager:
         self.prev_ghost_ids_set = set()
         self.sorted_write_indices = []
         self.priority_ranges = {}  # priority_idx -> (start, count)
+        self.breed_ranges = {}     # breed_id -> (start, count)
 
     def allocate_property_tensors(self, num_properties, combined_lists, agent_capacity,
                                   convert_to_equal_side_tensor_func):
@@ -333,6 +334,7 @@ class GPUBufferManager:
         self.prev_ghost_ids_set = set()
         self.sorted_write_indices = []
         self.priority_ranges = {}
+        self.breed_ranges = {}
 
 
 class CommunicationManager:

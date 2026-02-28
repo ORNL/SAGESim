@@ -372,12 +372,28 @@ class Model:
         return agent_id
 
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
+        if self._is_setup and hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
+            # Fast path: read single agent directly from GPU
+            buf = self._gpu_buffers
+            prop_idx = self._agent_factory._property_name_2_index[property_name]
+            agent_rank = self._agent_factory._agent2rank[id]
+
+            if agent_rank == MPI.COMM_WORLD.Get_rank():
+                buf_idx = buf.agent_id_to_index[id]
+                if prop_idx == 1:
+                    # CSR/locations: read one agent's neighbor slice
+                    start = int(buf.neighbor_offsets[buf_idx].get())
+                    end = int(buf.neighbor_offsets[buf_idx + 1].get())
+                    result = buf.neighbor_values_ids[start:end].get().tolist()
+                else:
+                    result = buf.property_tensors[prop_idx][buf_idx].get().tolist()
+            else:
+                result = None
+
+            return MPI.COMM_WORLD.bcast(result, root=agent_rank)
+
+        # Pre-setup path: use CPU-side data
         if self._is_setup:
-            # Ensure CPU-side data is in sync with GPU buffers
-            if hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
-                if getattr(self, '_cpu_data_stale', False):
-                    self._sync_gpu_to_cpu_if_needed()
-                    self._cpu_data_stale = False
             self._agent_factory._update_agent_property(
                 self.__rank_local_agent_data_tensors, id, property_name
             )
@@ -393,27 +409,55 @@ class Model:
         if hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
             self._gpu_buffers.is_initialized = False
 
-    def _sync_gpu_to_cpu_if_needed(self):
-        """Download local agent data from GPU to CPU if GPU buffers are the source of truth."""
-        buf = self._gpu_buffers
-        num_local = buf.num_local_agents
-        for i in range(self._agent_factory.num_properties):
-            if i == 1:
-                # Property 1 (locations/CSR): reconstruct ragged lists from dual CSR
-                cpu_offsets = buf.neighbor_offsets[:num_local + 1].get()
-                cpu_values_ids = buf.neighbor_values_ids.get()
-                data = []
-                for agent_idx in range(num_local):
-                    start = int(cpu_offsets[agent_idx])
-                    end = int(cpu_offsets[agent_idx + 1])
-                    neighbor_ids = cpu_values_ids[start:end].tolist()
-                    data.append(neighbor_ids)
-            else:
-                data = buf.property_tensors[i][:num_local].get().tolist()
-            self.__rank_local_agent_data_tensors[i] = data
-
     def get_space(self) -> Space:
         return self._agent_factory._space
+
+    def get_breed_data(self, breed_name, property_name):
+        """Download property data for all agents of a breed, gathered across MPI ranks.
+
+        Uses bulk GPU download (no per-agent Python calls). For multi-worker,
+        each rank downloads its local agents, then MPI Allgather combines them.
+
+        :param breed_name: Name of the breed (e.g., "Tree", "Site")
+        :param property_name: Property to download (e.g., "params", "states_db")
+        :return: numpy array, shape (total_count, property_width)
+        """
+        breed = self._agent_factory._breeds[breed_name]
+        buf = self._gpu_buffers
+        start, count = buf.breed_ranges.get(breed._breedidx, (0, 0))
+
+        prop_idx = self._agent_factory._property_name_2_index[property_name]
+        if count > 0:
+            local_data = buf.property_tensors[prop_idx][start:start + count].get()
+        else:
+            local_data = np.empty((0,), dtype=np.float32)
+
+        comm = MPI.COMM_WORLD
+        if comm.Get_size() == 1:
+            return local_data
+        all_data = comm.allgather(local_data)
+        return np.concatenate(all_data, axis=0)
+
+    def get_breed_agent_ids(self, breed_name):
+        """Download agent IDs for all agents of a breed, gathered across MPI ranks.
+
+        :param breed_name: Name of the breed
+        :return: numpy array of agent IDs (float32)
+        """
+        breed = self._agent_factory._breeds[breed_name]
+        buf = self._gpu_buffers
+        start, count = buf.breed_ranges.get(breed._breedidx, (0, 0))
+
+        if count > 0:
+            local_ids = buf.agent_ids_gpu[start:start + count].get()
+        else:
+            local_ids = np.empty((0,), dtype=np.float32)
+
+        comm = MPI.COMM_WORLD
+        if comm.Get_size() == 1:
+            return local_ids
+        all_ids = comm.allgather(local_ids)
+        return np.concatenate(all_ids)
 
     def get_agents_with(self, query: Callable) -> Set[List[Any]]:
         return self._agent_factory.get_agents_with(query=query)
@@ -458,6 +502,9 @@ class Model:
         :param scheduler_fpath: specify if using external dask cluster. Else
             distributed.LocalCluster is set up.
         """
+        import time
+        t_setup_total_start = time.time()
+
         self._use_gpu = use_gpu
         # Generate global data tensor
         self._global_data_vector = list(self.globals.values())
@@ -524,13 +571,19 @@ class Model:
         # Sort write property indices for consistent ordering
         self._write_property_indices = sorted(self._write_property_indices)
 
+        t_analysis_end = time.time()
+
         # Sort agents by breed for range-bounded kernel loops
         self._agent_factory.sort_by_breed()
+
+        t_sort_end = time.time()
 
         # Generate agent data tensors early so we can inspect property shapes
         self.__rank_local_agent_data_tensors = (
             self._agent_factory._generate_agent_data_tensors()
         )
+
+        t_tensors_end = time.time()
 
         # Compute property column counts for write-back code generation
         # 0 = scalar (1D array), >1 = number of columns (2D array)
@@ -544,6 +597,7 @@ class Model:
             else:
                 property_ndims[prop_idx] = 0  # scalar
 
+        t_codegen_start = time.time()
         if worker == 0:
             with open(self._step_function_file_path, "w", encoding="utf-8") as f:
                 f.write(
@@ -556,9 +610,11 @@ class Model:
                     )
                 )
         comm.barrier()
+        t_codegen_end = time.time()
 
         # Import and cache the step function once during setup
         # Suppress expected CuPy/Numba JIT compilation warnings
+        t_jit_start = time.time()
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=DeprecationWarning)
             warnings.filterwarnings("ignore", category=FutureWarning)
@@ -571,6 +627,7 @@ class Model:
             sys.modules[module_name] = step_func_module
             spec.loader.exec_module(step_func_module)
         self._step_func = step_func_module.stepfunc
+        t_jit_end = time.time()
         ###
 
         # Print agent distribution summary
@@ -596,7 +653,16 @@ class Model:
 
         # Initialize GPU buffer manager (buffers allocated lazily on first tick)
         self._gpu_buffers = GPUBufferManager()
-        self._cpu_data_stale = False
+
+        t_setup_total_end = time.time()
+        if worker == 0:
+            print(f"\n  [SAGESim] setup() timing breakdown:")
+            print(f"    analysis (priority heap + write detection): {t_analysis_end - t_setup_total_start:.3f}s")
+            print(f"    sort agents by breed:                       {t_sort_end - t_analysis_end:.3f}s")
+            print(f"    generate data tensors:                      {t_tensors_end - t_sort_end:.3f}s")
+            print(f"    GPU code generation:                        {t_codegen_end - t_codegen_start:.3f}s")
+            print(f"    JIT compilation (import kernel):            {t_jit_end - t_jit_start:.3f}s")
+            print(f"    setup() total:                              {t_setup_total_end - t_setup_total_start:.3f}s")
 
     # ------------------------------------------------------------------
     # Overridable hooks for subclass-specific GPU kernel extensions
@@ -707,6 +773,8 @@ class Model:
             for bid, cnt in zip(unique, counts):
                 breed_ranges[int(bid)] = (start, int(cnt))
                 start += int(cnt)
+
+        buf.breed_ranges = breed_ranges
 
         buf.priority_ranges = {}
         for p_idx, breed_step_dict in enumerate(self._breed_idx_2_step_func_by_priority):
@@ -1071,32 +1139,53 @@ class Model:
                 all_args.append(buf.property_tensors[i])
         all_args = all_args + buf.write_buffers
 
-        # Compute max co-resident blocks for grid barrier safety
+        # Compute max co-resident blocks for grid barrier safety.
+        # Grid barriers require ALL launched blocks to be co-resident on the GPU.
+        # The hardware limit (MaxBlocksPerMultiprocessor) is the theoretical max,
+        # but actual occupancy depends on per-kernel register and shared memory
+        # pressure. Complex kernels (many step functions, large variable sets)
+        # use more registers, reducing actual blocks per SM well below the
+        # hardware limit. Launching more blocks than can be co-resident causes
+        # deadlock: active blocks wait at barrier for non-resident blocks that
+        # can't start until active blocks finish.
+        # We use a conservative default (2 blocks/SM) that works reliably for
+        # complex kernels. Can be tuned up for simpler kernels.
         dev = cp.cuda.Device()
         attrs = dev.attributes
-        max_threads_per_sm = attrs.get('MaxThreadsPerMultiProcessor', 2048)
-        max_blocks_per_sm = min(
-            attrs.get('MaxBlocksPerMultiprocessor', 16),
-            max_threads_per_sm // threadsperblock,
-        )
         num_sms = attrs['MultiProcessorCount']
+        # Conservative: 2 blocks/SM ensures co-residency even with high register pressure
+        max_blocks_per_sm = getattr(self, '_max_blocks_per_sm', 2)
         max_grid_blocks = max_blocks_per_sm * num_sms
         effective_blocks = min(blockspergrid, max_grid_blocks)
+
+        _is_first_kernel = (self.tick == 0)
+        if _is_first_kernel:
+            print(f"  [SAGESim] kernel launch config: {effective_blocks} blocks x {threadsperblock} threads "
+                  f"({num_local_agents} agents, {num_sms} SMs, max_blocks_per_sm={max_blocks_per_sm})", flush=True)
 
         t_gpu_kernel_start = time.time()
 
         # Build range args for per-priority breed ranges
         range_args = []
+        range_summary = []
         for p_idx in range(len(self._breed_idx_2_step_func_by_priority)):
             p_start, p_count = buf.priority_ranges.get(p_idx, (0, 0))
             range_args.append(cp.float32(p_start))
             range_args.append(cp.float32(p_count))
+            range_summary.append(f"P{p_idx}:{p_count}")
+        if _is_first_kernel:
+            print(f"  [SAGESim] priority ranges: {', '.join(range_summary)}", flush=True)
 
         # Prepare subclass-specific extra kernel args (e.g. spike recording buffers)
         extra_kernel_args = self._prepare_kernel_extras(num_local_agents, sync_workers_every_n_ticks)
 
         # Reset barrier counter and launch fused kernel
         buf.barrier_counter[0] = 0
+        if _is_first_kernel:
+            print(f"  [SAGESim] launching kernel ({sync_workers_every_n_ticks} ticks, "
+                  f"{len(self._breed_idx_2_step_func_by_priority)} priorities, "
+                  f"first launch will JIT-compile CUDA)...", flush=True)
+        t_kernel_launch = time.time()
         self._step_func[effective_blocks, threadsperblock](
             self.tick,
             buf.global_data_vector,
@@ -1109,7 +1198,14 @@ class Model:
             cp.int32(effective_blocks),
             *extra_kernel_args,
         )
+        t_after_launch = time.time()
+        if _is_first_kernel:
+            print(f"  [SAGESim] kernel dispatched: {t_after_launch - t_kernel_launch:.3f}s, synchronizing...", flush=True)
         cp.cuda.Stream.null.synchronize()
+        t_after_sync = time.time()
+        if _is_first_kernel:
+            print(f"  [SAGESim] kernel sync done: {t_after_sync - t_after_launch:.3f}s "
+                  f"(total kernel: {t_after_sync - t_kernel_launch:.3f}s)", flush=True)
 
         # Process subclass-specific extra data (e.g. download spike records)
         self._process_kernel_extras()
@@ -1131,7 +1227,6 @@ class Model:
         # POST-KERNEL: download for MPI next tick and user queries
         # ============================================================
         t_post_start = time.time()
-        self._cpu_data_stale = True
         t_post_end = time.time()
 
         # Ensure all workers have finished before syncing neighbor data
