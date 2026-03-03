@@ -547,8 +547,7 @@ class Model:
                     self._agent_factory._property_name_2_index[prop_name]
                 )
             else:
-                if worker == 0:
-                    print(f"[SAGESim] Warning: no_double_buffer property '{prop_name}' not found")
+                pass
 
         # Determine and cache write property indices once during setup
         self._write_property_indices = set()
@@ -561,12 +560,6 @@ class Model:
         # Exclude no_double_buffer properties from write buffer creation
         self._write_property_indices = self._write_property_indices - no_double_buffer_indices
 
-        if self._verbose_timing and worker == 0 and no_double_buffer_indices:
-            excluded_props = [
-                name for name, idx in self._agent_factory._property_name_2_index.items()
-                if idx in no_double_buffer_indices
-            ]
-            print(f"[SAGESim] Double buffering disabled for properties: {excluded_props}")
 
         # Sort write property indices for consistent ordering
         self._write_property_indices = sorted(self._write_property_indices)
@@ -638,16 +631,6 @@ class Model:
                 rank = self._agent_factory._agent2rank.get(agent_id, -1)
                 agents_per_rank[rank] = agents_per_rank.get(rank, 0) + 1
 
-            if self._verbose_timing:
-                print(f"\n{'='*60}")
-                print(f"[SAGESim] Agent Distribution Across Workers")
-                print(f"{'='*60}")
-                print(f"Total agents: {total_agents}")
-                for rank in sorted(agents_per_rank.keys()):
-                    count = agents_per_rank[rank]
-                    percentage = (count / total_agents) * 100 if total_agents > 0 else 0
-                    print(f"Rank {rank}: {count:5d} agents ({percentage:5.2f}%)")
-                print(f"{'='*60}\n")
 
         self._is_setup = True
 
@@ -655,14 +638,6 @@ class Model:
         self._gpu_buffers = GPUBufferManager()
 
         t_setup_total_end = time.time()
-        if worker == 0:
-            print(f"\n  [SAGESim] setup() timing breakdown:")
-            print(f"    analysis (priority heap + write detection): {t_analysis_end - t_setup_total_start:.3f}s")
-            print(f"    sort agents by breed:                       {t_sort_end - t_analysis_end:.3f}s")
-            print(f"    generate data tensors:                      {t_tensors_end - t_sort_end:.3f}s")
-            print(f"    GPU code generation:                        {t_codegen_end - t_codegen_start:.3f}s")
-            print(f"    JIT compilation (import kernel):            {t_jit_end - t_jit_start:.3f}s")
-            print(f"    setup() total:                              {t_setup_total_end - t_setup_total_start:.3f}s")
 
     # ------------------------------------------------------------------
     # Overridable hooks for subclass-specific GPU kernel extensions
@@ -672,7 +647,7 @@ class Model:
         """Override to inject extra GPU kernel params and post-step code.
         Returns dict with optional keys:
           'extra_kernel_params': list[str]         — names for kernel signature
-          'post_breed_step_code': list[tuple]      — [(code_lines, once_per_breed), ...]
+          'post_breed_step_code': list[tuple]      — [(code_lines, once_per_breed[, only_priority]), ...]
         """
         return {}
 
@@ -684,17 +659,37 @@ class Model:
         """Override to download/process extra GPU data after kernel execution."""
         pass
 
-    def reset(self) -> None:
-        # Generate global data tensor
-        self._global_data_vector = list(self.globals.values())
-        self.tick = 0
+    def _sync_gpu_to_agent_factory(self):
+        """Download all GPU properties back to AgentFactory storage."""
+        buf = self._gpu_buffers
+        num_local = buf.num_local_agents
+        idx_to_name = {v: k for k, v in self._agent_factory._property_name_2_index.items()}
 
-        # Generate agent data tensors
+        for prop_idx in range(self._agent_factory.num_properties):
+            if prop_idx in (0, 1):  # breed (never changes), CSR/locations (skip)
+                continue
+            if buf.property_tensors[prop_idx] is None:
+                continue
+            prop_name = idx_to_name[prop_idx]
+            gpu_data = buf.property_tensors[prop_idx][:num_local].get().tolist()
+            self._agent_factory._property_name_2_agent_data_tensor[prop_name] = gpu_data
+
+    def _regenerate_data_tensors(self):
+        """Rebuild __rank_local_agent_data_tensors from AgentFactory."""
         self.__rank_local_agent_data_tensors = (
             self._agent_factory._generate_agent_data_tensors()
         )
 
-        # Invalidate GPU buffers so they are rebuilt on next tick
+    def reset(self) -> None:
+        self.tick = 0
+        self._global_data_vector = list(self.globals.values())
+
+        # Sync GPU state back to AgentFactory before freeing
+        if hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
+            self._sync_gpu_to_agent_factory()
+
+        self._regenerate_data_tensors()
+
         if hasattr(self, '_gpu_buffers'):
             self._gpu_buffers.free()
             self._gpu_buffers = GPUBufferManager()
@@ -1061,7 +1056,6 @@ class Model:
 
         if not buf.is_initialized:
             # --- FIRST TICK: full build ---
-            print(f"  [SAGESim] FIRST TICK (tick={self.tick}): building GPU buffers, padding tensors, converting IDs to indices")
             t_neighbor_start = time.time()
             rank_local_agents_neighbors = self.get_space()._neighbor_compute_func(
                 self.__rank_local_agent_data_tensors[1]
@@ -1094,9 +1088,6 @@ class Model:
             self._build_gpu_buffers(received_neighbor_ids, received_neighbor_adts, num_local_agents)
             t_build_end = time.time()
 
-            print(f"  [SAGESim]   neighbor_compute={t_neighbor_end - t_neighbor_start:.3f}s, "
-                  f"contextualize={t_after_context - t_before_context:.3f}s, "
-                  f"build_gpu_buffers={t_build_end - t_build_start:.3f}s")
 
             # Initialize CommunicationManager for GPU-direct MPI on subsequent ticks
             if num_workers > 1:
@@ -1158,11 +1149,6 @@ class Model:
         max_grid_blocks = max_blocks_per_sm * num_sms
         effective_blocks = min(blockspergrid, max_grid_blocks)
 
-        _is_first_kernel = (self.tick == 0)
-        if _is_first_kernel:
-            print(f"  [SAGESim] kernel launch config: {effective_blocks} blocks x {threadsperblock} threads "
-                  f"({num_local_agents} agents, {num_sms} SMs, max_blocks_per_sm={max_blocks_per_sm})", flush=True)
-
         t_gpu_kernel_start = time.time()
 
         # Build range args for per-priority breed ranges
@@ -1173,19 +1159,12 @@ class Model:
             range_args.append(cp.float32(p_start))
             range_args.append(cp.float32(p_count))
             range_summary.append(f"P{p_idx}:{p_count}")
-        if _is_first_kernel:
-            print(f"  [SAGESim] priority ranges: {', '.join(range_summary)}", flush=True)
 
         # Prepare subclass-specific extra kernel args (e.g. spike recording buffers)
         extra_kernel_args = self._prepare_kernel_extras(num_local_agents, sync_workers_every_n_ticks)
 
         # Reset barrier counter and launch fused kernel
         buf.barrier_counter[0] = 0
-        if _is_first_kernel:
-            print(f"  [SAGESim] launching kernel ({sync_workers_every_n_ticks} ticks, "
-                  f"{len(self._breed_idx_2_step_func_by_priority)} priorities, "
-                  f"first launch will JIT-compile CUDA)...", flush=True)
-        t_kernel_launch = time.time()
         self._step_func[effective_blocks, threadsperblock](
             self.tick,
             buf.global_data_vector,
@@ -1198,14 +1177,7 @@ class Model:
             cp.int32(effective_blocks),
             *extra_kernel_args,
         )
-        t_after_launch = time.time()
-        if _is_first_kernel:
-            print(f"  [SAGESim] kernel dispatched: {t_after_launch - t_kernel_launch:.3f}s, synchronizing...", flush=True)
         cp.cuda.Stream.null.synchronize()
-        t_after_sync = time.time()
-        if _is_first_kernel:
-            print(f"  [SAGESim] kernel sync done: {t_after_sync - t_after_launch:.3f}s "
-                  f"(total kernel: {t_after_sync - t_kernel_launch:.3f}s)", flush=True)
 
         # Process subclass-specific extra data (e.g. download spike records)
         self._process_kernel_extras()
@@ -1256,12 +1228,6 @@ class Model:
                   f"post={timing_data['post']:.3f}s, "
                   f"sync={timing_data['sync']:.3f}s", flush=True)
 
-        # Always print chunk-level timing summary
-        print(f"  [SAGESim] worker_coroutine done: {sync_workers_every_n_ticks} ticks, "
-              f"data_prep={t_data_prep_end - t_data_prep_start:.3f}s, "
-              f"gpu_kernel={t_gpu_kernel_end - t_gpu_kernel_start:.3f}s, "
-              f"post+sync={t_end - t_post_start:.3f}s, "
-              f"total={t_end - t_start:.3f}s", flush=True)
 
 
 def reduce_global_data_vector(A, B):
@@ -1825,7 +1791,11 @@ def generate_gpu_func(
 
             # Inject extra post-step code from subclass config
             if extra_kernel_config:
-                for code_lines, once_per_breed in extra_kernel_config.get('post_breed_step_code', []):
+                for entry in extra_kernel_config.get('post_breed_step_code', []):
+                    code_lines, once_per_breed = entry[0], entry[1]
+                    only_priority = entry[2] if len(entry) > 2 else None
+                    if only_priority is not None and priority_idx != only_priority:
+                        continue
                     if once_per_breed and breedidx in _extra_seen_breeds:
                         continue
                     for line in code_lines:
