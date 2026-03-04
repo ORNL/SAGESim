@@ -25,7 +25,7 @@ from mpi4py import MPI
 from sagesim.agent import AgentFactory, Breed
 from sagesim.space import Space
 from sagesim.internal_utils import convert_to_equal_side_tensor, build_csr_from_ragged
-from sagesim.gpu_kernels import GPUBufferManager, GPUHashMap, CommunicationManager
+from sagesim.gpu_kernels import GPUBufferManager, GPUHashMap, CommunicationManager, is_gpu_aware_mpi
 
 
 def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
@@ -636,6 +636,7 @@ class Model:
 
         # Initialize GPU buffer manager (buffers allocated lazily on first tick)
         self._gpu_buffers = GPUBufferManager()
+        self._gpu_aware_mpi = is_gpu_aware_mpi()
 
         t_setup_total_end = time.time()
 
@@ -1109,7 +1110,9 @@ class Model:
                 timing_data['contextualize'] = t_after_context - t_before_context
 
             # Update global_data_vector on GPU
-            buf.global_data_vector = cp.array(self._global_data_vector)
+            # GPU-aware path: already on GPU from last tick's in-place Allreduce
+            if not self._gpu_aware_mpi or num_workers <= 1:
+                buf.global_data_vector = cp.array(self._global_data_vector)
 
         t_data_prep_end = time.time()
 
@@ -1177,7 +1180,7 @@ class Model:
             cp.int32(effective_blocks),
             *extra_kernel_args,
         )
-        cp.cuda.Stream.null.synchronize()
+        cp.cuda.get_current_stream().synchronize()
 
         # Process subclass-specific extra data (e.g. download spike records)
         self._process_kernel_extras()
@@ -1187,7 +1190,7 @@ class Model:
         for i, prop_idx in enumerate(buf.sorted_write_indices):
             buf.property_tensors[prop_idx][:num_local_agents] = \
                 buf.write_buffers[i][:num_local_agents]
-        cp.cuda.Stream.null.synchronize()
+        cp.cuda.get_current_stream().synchronize()
 
         self.tick += sync_workers_every_n_ticks
         t_gpu_kernel_end = time.time()
@@ -1207,12 +1210,21 @@ class Model:
             comm.barrier()
         t_after_barrier = time.time()
 
-        # Global data vector: download from GPU, allreduce, store for next tick upload
+        # Global data vector: allreduce across ranks
         t_before_allreduce = time.time()
-        global_cpu = buf.global_data_vector.tolist()
-        self._global_data_vector = comm.allreduce(
-            global_cpu, op=reduce_global_data_vector
-        )
+        if num_workers > 1 and self._gpu_aware_mpi:
+            # GPU-aware path: in-place Allreduce directly on GPU buffer (no CPU staging)
+            gdv = buf.global_data_vector
+            mpi_type = MPI.DOUBLE if gdv.dtype == cp.float64 else MPI.FLOAT
+            comm.Allreduce(MPI.IN_PLACE, [gdv, mpi_type], op=MPI.MAX)
+            # Store CPU copy for fallback queries and single-worker path
+            self._global_data_vector = gdv.get().tolist()
+        else:
+            # CPU staging path: download, pickle-based allreduce, store for next tick upload
+            global_cpu = buf.global_data_vector.tolist()
+            self._global_data_vector = comm.allreduce(
+                global_cpu, op=reduce_global_data_vector
+            )
         t_after_allreduce = time.time()
 
         t_end = time.time()

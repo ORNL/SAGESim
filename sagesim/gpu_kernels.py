@@ -4,9 +4,28 @@ GPU-resident data structures for SAGESim Phase 1.
 Provides persistent GPU buffer management to eliminate per-tick CPU rebuild cycles.
 """
 
+import os
+
 import numpy as np
 import cupy as cp
 from mpi4py import MPI
+
+
+def is_gpu_aware_mpi():
+    """Detect if MPI library supports GPU-aware communication.
+
+    Checks environment variables set by GPU-aware MPI implementations:
+    - MPICH_GPU_SUPPORT_ENABLED=1 (Cray MPICH on Frontier / AMD MI250X)
+    - OMPI_MCA_opal_cuda_support=true (Open MPI with CUDA/ROCm support)
+    - SAGESIM_GPU_AWARE_MPI=1 (manual override for testing)
+    """
+    if os.environ.get('MPICH_GPU_SUPPORT_ENABLED', '0') == '1':
+        return True
+    if os.environ.get('OMPI_MCA_opal_cuda_support', '') == 'true':
+        return True
+    if os.environ.get('SAGESIM_GPU_AWARE_MPI', '0') == '1':
+        return True
+    return False
 
 
 class GPUHashMap:
@@ -370,7 +389,9 @@ class CommunicationManager:
         self.send_bufs_cpu = {}
         self.recv_bufs_cpu = {}
         self.send_bufs_gpu = {}
+        self.recv_bufs_gpu = {}  # GPU recv buffers for GPU-aware MPI path
 
+        self._gpu_aware_mpi = is_gpu_aware_mpi()
         self._is_initialized = False
 
     @property
@@ -513,15 +534,20 @@ class CommunicationManager:
         self.send_bufs_cpu = {}
         self.send_bufs_gpu = {}
         self.recv_bufs_cpu = {}
+        self.recv_bufs_gpu = {}
 
         for dest_rank, count in self.send_counts.items():
             size = count * self.total_stride
-            self.send_bufs_cpu[dest_rank] = np.empty(size, dtype=np.float32)
             self.send_bufs_gpu[dest_rank] = cp.empty(size, dtype=cp.float32)
+            if not self._gpu_aware_mpi:
+                self.send_bufs_cpu[dest_rank] = np.empty(size, dtype=np.float32)
 
         for src_rank, count in self.recv_counts.items():
             size = count * self.total_stride
-            self.recv_bufs_cpu[src_rank] = np.empty(size, dtype=np.float32)
+            if self._gpu_aware_mpi:
+                self.recv_bufs_gpu[src_rank] = cp.empty(size, dtype=cp.float32)
+            else:
+                self.recv_bufs_cpu[src_rank] = np.empty(size, dtype=np.float32)
 
         self._is_initialized = True
 
@@ -539,21 +565,46 @@ class CommunicationManager:
             else:
                 buf_gpu[offset:offset + n * width] = data.ravel()
             offset += n * width
-        # ONE GPU->CPU transfer
-        self.send_bufs_cpu[dest_rank][:] = buf_gpu.get()
+        if not self._gpu_aware_mpi:
+            # CPU staging path: one GPU->CPU transfer per peer
+            self.send_bufs_cpu[dest_rank][:] = buf_gpu.get()
 
     def mpi_exchange(self):
-        """Non-blocking buffer-protocol MPI send/recv (no pickle)."""
+        """Non-blocking buffer-protocol MPI send/recv (no pickle).
+
+        With GPU-aware MPI: passes CuPy device pointers directly to Isend/Irecv.
+        Data moves GPU->NIC->GPU via GPU-Direct RDMA without CPU staging.
+        Without GPU-aware MPI: falls back to CPU-staged numpy buffers.
+        """
         requests = []
-        for dest_rank, sbuf in self.send_bufs_cpu.items():
-            requests.append(self.comm.Isend([sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
-        for src_rank, rbuf in self.recv_bufs_cpu.items():
-            requests.append(self.comm.Irecv([rbuf, MPI.FLOAT], source=src_rank, tag=1))
+        if self._gpu_aware_mpi:
+            # GPU-aware path: MPI reads/writes GPU memory directly
+            for dest_rank, sbuf in self.send_bufs_gpu.items():
+                requests.append(self.comm.Isend(
+                    [sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
+            for src_rank, rbuf in self.recv_bufs_gpu.items():
+                requests.append(self.comm.Irecv(
+                    [rbuf, MPI.FLOAT], source=src_rank, tag=1))
+        else:
+            # CPU staging path
+            for dest_rank, sbuf in self.send_bufs_cpu.items():
+                requests.append(self.comm.Isend(
+                    [sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
+            for src_rank, rbuf in self.recv_bufs_cpu.items():
+                requests.append(self.comm.Irecv(
+                    [rbuf, MPI.FLOAT], source=src_rank, tag=1))
         MPI.Request.Waitall(requests)
 
     def gpu_unpack(self, src_rank):
-        """Unpack received CPU buffer into ghost region on GPU."""
-        recv_gpu = cp.array(self.recv_bufs_cpu[src_rank])  # ONE CPU->GPU
+        """Unpack received buffer into ghost region on GPU.
+
+        With GPU-aware MPI: data already in recv_bufs_gpu, scatter directly.
+        Without GPU-aware MPI: upload from CPU recv buffer, then scatter.
+        """
+        if self._gpu_aware_mpi:
+            recv_gpu = self.recv_bufs_gpu[src_rank]  # already on GPU
+        else:
+            recv_gpu = cp.array(self.recv_bufs_cpu[src_rank])  # one CPU->GPU transfer
         ghost_indices = self.recv_indices_gpu[src_rank]
         n = len(ghost_indices)
         offset = 0
@@ -575,8 +626,14 @@ class CommunicationManager:
         for dest_rank in self.send_counts:
             self.gpu_pack(dest_rank)
 
+        # GPU-aware path: ensure GPU packing is complete before MPI reads the buffers
+        if self._gpu_aware_mpi and self.send_counts:
+            cp.cuda.get_current_stream().synchronize()
+
         # MPI exchange
-        if self.send_bufs_cpu or self.recv_bufs_cpu:
+        has_peers = (self.send_bufs_gpu or self.recv_bufs_gpu) if self._gpu_aware_mpi \
+            else (self.send_bufs_cpu or self.recv_bufs_cpu)
+        if has_peers:
             self.mpi_exchange()
 
         # Unpack all sources
