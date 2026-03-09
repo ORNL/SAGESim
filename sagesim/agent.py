@@ -541,211 +541,110 @@ class AgentFactory:
             total_bytes_sent = 0
             total_bytes_recv = 0
 
-        neighborrank2agentidandadt = {}
-        neighborrankandagentidsvisited = set()
         num_agents_this_rank = len(agent_ids_chunk)
 
         # OPTIMIZATION: Convert all_neighbors to lists ONCE to avoid slow numpy scalar iteration
         if isinstance(all_neighbors, list) and len(all_neighbors) > 0 and isinstance(all_neighbors[0], np.ndarray):
-            # Convert numpy arrays to lists (much faster iteration)
             all_neighbors_list = [arr.tolist() for arr in all_neighbors]
         else:
             all_neighbors_list = all_neighbors
 
+        # ---- Phase 1: Build need_from_rank ----
+        # For each local agent, find cross-rank neighbors whose data we need.
+        need_from_rank = {}  # src_rank -> set of remote agent IDs
         for agent_idx in range(num_agents_this_rank):
-            agent_id = agent_ids_chunk[agent_idx]
-            # OPTIMIZATION: Only collect neighbor-visible properties for sending
-            # This reduces MPI message size significantly
-            agent_adts_visible = [
-                agent_data_tensors[idx][agent_idx]
-                for idx in self._neighbor_visible_indices
-            ] if self._neighbor_visible_indices else []
-            # Keep full adts for local cache comparison
-            agent_adts = [adt[agent_idx] for adt in agent_data_tensors]
             agent_neighbors = all_neighbors_list[agent_idx]
-
-            # Check if this agent has neighbors on other workers
-            has_cross_worker_neighbors = False
             for neighbor_id in agent_neighbors:
-                # Use math.isnan for Python floats (faster than np.isnan)
                 if math.isnan(neighbor_id):
                     break
-                if int(neighbor_id) < 0:  # Skip invalid/external agent IDs
+                if int(neighbor_id) < 0:
                     continue
                 neighbor_rank = self._agent2rank[int(neighbor_id)]
                 if neighbor_rank != worker:
-                    has_cross_worker_neighbors = True
-                    break
+                    need_from_rank.setdefault(neighbor_rank, set()).add(int(neighbor_id))
 
-            # Optimization: Skip sending if data hasn't changed AND agent has no cross-worker neighbors
-            # Agents with cross-worker neighbors must always be sent to maintain agent_id_to_index mapping
-            if not has_cross_worker_neighbors:
-                if agent_id not in self._prev_agent_data:
-                    self._prev_agent_data[agent_id] = agent_adts
-                else:
-                    # If the agent data has not changed, skip sending it
-                    agent_changed = False
-                    for prop_idx in range(self.num_properties):
-                        current_property_adt = agent_adts[prop_idx]
-                        previous_property_adt = self._prev_agent_data[agent_id][prop_idx]
+        # ---- Phase 2: Exchange request lists ----
+        # Tell each rank which of their agents we need; learn which of ours they need.
+        other_ranks = [(worker + i) % num_workers for i in range(1, num_workers)]
 
-                        # OPTIMIZATION: Skip expensive comparison for large arrays (property 1 = locations)
-                        # Property 1 contains neighbor connections which can be very large (1000+ elements)
-                        # np.array_equal on these is too slow (27M element comparisons!)
-                        # Instead, always mark as changed for property 1 if it's a numpy array
-                        if prop_idx == 1 and isinstance(current_property_adt, np.ndarray):
-                            # Always send property 1 if it's a large numpy array
-                            agent_changed = True
-                            break
-
-                        # Compare based on type to handle ordered (list) vs unordered (set) neighbors
-                        properties_equal = False
-                        if isinstance(current_property_adt, set):
-                            # For sets (unordered neighbors), order doesn't matter
-                            properties_equal = current_property_adt == previous_property_adt
-                        else:
-                            # For lists, tuples, arrays (ordered neighbors), order matters
-                            properties_equal = np.array_equal(
-                                current_property_adt,
-                                previous_property_adt,
-                                equal_nan=True,
-                            )
-
-                        if not properties_equal:
-                            agent_changed = True
-                            break
-                    if agent_changed:
-                        # Update the previous agent data
-                        self._prev_agent_data[agent_id] = agent_adts
-                    else:
-                        # Skip sending this agent if its data has not changed
-                        # and it has no neighbors on other workers
-                        continue
-
-            # Build list of ranks this agent should be sent to
-            for neighbor_id in agent_neighbors:
-                if math.isnan(neighbor_id):
-                    break
-                if int(neighbor_id) < 0:  # Skip invalid/external agent IDs
-                    continue
-                neighbor_rank = self._agent2rank[int(neighbor_id)]
-                if neighbor_rank == worker:
-                    # Don't send to self
-                    continue
-
-                if (neighbor_rank, agent_id) not in neighborrankandagentidsvisited:
-                    # Don't send the same agent to the same rank multiple times
-                    neighborrankandagentidsvisited.add((neighbor_rank, agent_id))
-                    if neighbor_rank not in neighborrank2agentidandadt.keys():
-                        neighborrank2agentidandadt[neighbor_rank] = []
-                    # OPTIMIZATION: Only send neighbor-visible properties
-                    neighborrank2agentidandadt[neighbor_rank].append(
-                        (agent_id, agent_adts_visible)
-                    )
-
-        received_neighbor_adts = []
-        received_neighbor_ids = []
-        # Send chunk nums
-        sends_num_chunks = []
-        torank2numchunks = {}
-        total_num_chunks = 0
-        other_ranks_to = [(worker + i) % num_workers for i in range(1, num_workers)]
-        other_ranks_from = [(worker + i) % num_workers for i in range(1, num_workers)]
-        # Calculate chunk_size to ensure each chunk is <= 128 bytes
-        # Estimate the size of a single value in neighborrank2agentidandadt
-        if neighborrank2agentidandadt:
-            sample_value = next(iter(neighborrank2agentidandadt.values()))[0]
-            estimated_value_size = sys.getsizeof(
-                sample_value
-            )  # Approximate size in bytes
-            chunk_size = max(
-                1, 128 // estimated_value_size
-            )  # Ensure at least one value per chunk
-        else:
-            chunk_size = 0  # Default to 1 if no data is present
-        for to_rank in other_ranks_to:
-            if to_rank in neighborrank2agentidandadt:
-                # Send the data for this rank
-                data_to_send_to_rank = neighborrank2agentidandadt[to_rank]
-                # Break the data into chunks
-
-                num_chunks = len(data_to_send_to_rank) // chunk_size + (
-                    1 if len(data_to_send_to_rank) % chunk_size > 0 else 0
-                )
-                total_num_chunks += num_chunks
-                torank2numchunks[to_rank] = num_chunks
-                sends_num_chunks.append(
-                    comm.isend(
-                        num_chunks,
-                        dest=to_rank,
-                        tag=0,
-                    )
-                )
-            else:
-                # No data to send to this rank
-                torank2numchunks[to_rank] = 0
-                sends_num_chunks.append(
-                    comm.isend(
-                        0,
-                        dest=to_rank,
-                        tag=0,
-                    )
-                )
-        # Receive num_chunks from all ranks
-        recvs_num_chunks_requests = []
-        for from_rank in other_ranks_from:
-            recvs_num_chunks_requests.append(comm.irecv(source=from_rank, tag=0))
+        # 2a. Exchange request counts
+        send_count_requests = []
+        for to_rank in other_ranks:
+            count = len(need_from_rank.get(to_rank, set()))
+            send_count_requests.append(comm.isend(count, dest=to_rank, tag=0))
+        recv_count_requests = []
+        for from_rank in other_ranks:
+            recv_count_requests.append(comm.irecv(source=from_rank, tag=0))
 
         t_before_wait1 = time.time()
-        MPI.Request.waitall(sends_num_chunks)
-        recvs_num_chunks = MPI.Request.waitall(recvs_num_chunks_requests)
+        MPI.Request.waitall(send_count_requests)
+        recv_counts = MPI.Request.waitall(recv_count_requests)
         t_after_wait1 = time.time()
 
-        # Send the chunks
-        send_chunk_requests = []
-        for to_rank in other_ranks_to:
-            if to_rank in neighborrank2agentidandadt:
-                # Send the data for this rank
-                data_to_send_to_rank = neighborrank2agentidandadt[to_rank]
-                num_chunks = torank2numchunks[to_rank]
-                for i in range(num_chunks):
-                    chunk = data_to_send_to_rank[i * chunk_size : (i + 1) * chunk_size]
-                    send_chunk_request = comm.isend(
-                        chunk,
-                        dest=to_rank,
-                        tag=i + 1,
-                    )
-                    if self._verbose_mpi_transfer:
-                        total_bytes_sent += len(pickle.dumps(chunk))
-                    if i >= len(send_chunk_requests):
-                        send_chunk_requests.append([])
-                    send_chunk_requests[i].append(send_chunk_request)
-        # Receive the chunks
-        recv_chunk_requests = []
-        for i, from_rank in enumerate(other_ranks_from):
-            num_chunks = recvs_num_chunks[i]
-            for j in range(num_chunks):
-                received_chunk_request = comm.irecv(source=from_rank, tag=j + 1)
-                if j >= len(recv_chunk_requests):
-                    recv_chunk_requests.append([])
-                recv_chunk_requests[j].append(received_chunk_request)
+        # 2b. Exchange request ID lists
+        send_id_requests = []
+        for to_rank in other_ranks:
+            ids = sorted(need_from_rank.get(to_rank, set()))
+            if ids:
+                send_id_requests.append(comm.isend(ids, dest=to_rank, tag=1))
+        recv_id_requests = []
+        requested_by_rank = {}
+        for i, from_rank in enumerate(other_ranks):
+            if recv_counts[i] > 0:
+                recv_id_requests.append(comm.irecv(source=from_rank, tag=1))
+                requested_by_rank[from_rank] = i  # index into recv_id_requests
 
-        received_data = []
-        num_send_chunk_requests = len(send_chunk_requests)
-        num_recv_chunk_requests = len(recv_chunk_requests)
+        MPI.Request.waitall(send_id_requests)
+        recv_id_results = MPI.Request.waitall(recv_id_requests)
+
+        # Map from_rank -> list of agent IDs they requested from us
+        rank_to_requested_ids = {}
+        result_idx = 0
+        for i, from_rank in enumerate(other_ranks):
+            if recv_counts[i] > 0:
+                rank_to_requested_ids[from_rank] = recv_id_results[result_idx]
+                result_idx += 1
+
+        # ---- Phase 3: Send requested agents' data back ----
+        # Build an index: agent_id -> agent_idx in our local arrays
+        agent_id_to_local_idx = {
+            agent_ids_chunk[idx]: idx for idx in range(num_agents_this_rank)
+        }
+
+        # Pack and send requested agents' visible properties
+        send_data_requests = []
+        for to_rank in other_ranks:
+            requested_ids = rank_to_requested_ids.get(to_rank, [])
+            if requested_ids:
+                data_to_send = []
+                for aid in requested_ids:
+                    local_idx = agent_id_to_local_idx[aid]
+                    adts_visible = [
+                        agent_data_tensors[idx][local_idx]
+                        for idx in self._neighbor_visible_indices
+                    ] if self._neighbor_visible_indices else []
+                    data_to_send.append((aid, adts_visible))
+                send_data_requests.append(comm.isend(data_to_send, dest=to_rank, tag=2))
+                if self._verbose_mpi_transfer:
+                    total_bytes_sent += len(pickle.dumps(data_to_send))
+
+        # Receive the data we requested
+        recv_data_requests = []
+        for from_rank in other_ranks:
+            if need_from_rank.get(from_rank):
+                recv_data_requests.append(comm.irecv(source=from_rank, tag=2))
 
         t_before_wait2 = time.time()
-        for i in range(max(num_send_chunk_requests, num_recv_chunk_requests)):
-            if i < num_send_chunk_requests:
-                MPI.Request.waitall(send_chunk_requests[i])
-            if i < num_recv_chunk_requests:
-                received_data_ranks_chunk = MPI.Request.waitall(recv_chunk_requests[i])
-                for received_data_rank_chunk in received_data_ranks_chunk:
-                    received_data.extend(received_data_rank_chunk)
+        MPI.Request.waitall(send_data_requests)
+        recv_data_results = MPI.Request.waitall(recv_data_requests)
         t_after_wait2 = time.time()
 
-        # Process received chunks
-        # OPTIMIZATION: Reconstruct full property list from neighbor-visible subset
+        # ---- Phase 4: Unpack received data ----
+        received_data = []
+        for chunk in recv_data_results:
+            if isinstance(chunk, list):
+                received_data.extend(chunk)
+
         received_neighbor_adts = [[] for _ in range(self.num_properties)]
         received_neighbor_ids = []
 
@@ -755,7 +654,7 @@ class AgentFactory:
             for visible_idx, prop_idx in enumerate(self._neighbor_visible_indices)
         }
 
-        for neighbor_idx, (neighbor_id, adts_visible) in enumerate(received_data):
+        for neighbor_id, adts_visible in received_data:
             received_neighbor_ids.append(neighbor_id)
             if self._verbose_mpi_transfer:
                 total_bytes_recv += len(pickle.dumps((neighbor_id, adts_visible)))
@@ -763,12 +662,10 @@ class AgentFactory:
             # Reconstruct full property list from neighbor-visible subset
             for prop_idx in range(self.num_properties):
                 if prop_idx in prop_idx_to_visible_idx:
-                    # This property was sent - get its value from adts_visible
                     visible_idx = prop_idx_to_visible_idx[prop_idx]
                     received_neighbor_adts[prop_idx].append(adts_visible[visible_idx])
                 else:
-                    # This property was not sent - use None as placeholder
-                    # (it won't be read by neighbors anyway)
+                    # Not sent — use None placeholder
                     received_neighbor_adts[prop_idx].append(None)
 
         t_ctx_end = time.time()

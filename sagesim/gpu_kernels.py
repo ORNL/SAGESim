@@ -403,6 +403,13 @@ class CommunicationManager:
 
         Runs once after _build_gpu_buffers() or when topology changes.
         Replaces the per-agent Python loop in contextualize_agent_data_tensors().
+
+        Communication direction: when local agent A has neighbor B on a remote
+        rank, A needs B's data.  We build a "need_from" map (which remote agent
+        IDs this rank needs from each other rank), exchange requests via
+        Alltoall + Isend/Irecv, then each rank builds send/recv index maps so
+        that gpu_pack sends the *requested* agents and gpu_unpack writes them
+        into the correct ghost slots.
         """
         buf = self.buf
         num_local = buf.num_local_agents
@@ -425,110 +432,127 @@ class CommunicationManager:
             self.property_widths[prop_idx] = width
             self.total_stride += width
 
+        # Use a flag instead of early returns so all ranks reach the
+        # collective Alltoall / Isend / Irecv calls below.
+        has_cross_rank_work = True
+
         if self.total_stride == 0 or num_local == 0:
-            self._is_initialized = True
-            return
+            has_cross_rank_work = False
 
-        # 2. Download CSR for local agents from GPU
-        cpu_offsets = buf.neighbor_offsets[:num_local + 1].get()
-        cpu_offsets = np.asarray(cpu_offsets, dtype=np.int32)
-        total_edges_local = int(cpu_offsets[num_local])
+        # ---- Identify which remote agents this rank needs ----
+        # need_from_rank[src_rank] = np.array of unique remote agent IDs
+        need_from_rank = {}
 
-        if total_edges_local == 0:
-            self._is_initialized = True
-            return
+        if has_cross_rank_work:
+            # 2. Download CSR for local agents from GPU
+            cpu_offsets = buf.neighbor_offsets[:num_local + 1].get()
+            cpu_offsets = np.asarray(cpu_offsets, dtype=np.int32)
+            total_edges_local = int(cpu_offsets[num_local])
 
-        cpu_values_ids = buf.neighbor_values_ids[:total_edges_local].get()
-        cpu_values_ids = np.asarray(cpu_values_ids, dtype=np.int32)
+            if total_edges_local == 0:
+                has_cross_rank_work = False
 
-        # 3. Vectorized: expand (local_agent_idx, neighbor_id) pairs from CSR
-        counts = np.diff(cpu_offsets)
-        local_agent_indices = np.repeat(np.arange(num_local, dtype=np.int32), counts)
+        if has_cross_rank_work:
+            cpu_values_ids = buf.neighbor_values_ids[:total_edges_local].get()
+            cpu_values_ids = np.asarray(cpu_values_ids, dtype=np.int32)
 
-        # Filter invalid neighbor IDs (padding: -1)
-        valid_mask = cpu_values_ids >= 0
-        local_agent_indices = local_agent_indices[valid_mask]
-        neighbor_ids = cpu_values_ids[valid_mask]
-
-        if len(neighbor_ids) == 0:
-            self._is_initialized = True
-            return
-
-        # Build dense rank lookup: rank_lookup[agent_id] = rank
-        agent2rank = self.agent_factory._agent2rank
-        max_agent_id = max(agent2rank.keys())
-        rank_lookup = np.full(max_agent_id + 1, -1, dtype=np.int32)
-        for aid, r in agent2rank.items():
-            rank_lookup[aid] = r
-
-        # Vectorized rank lookup for all neighbors
-        in_range = neighbor_ids <= max_agent_id
-        neighbor_ranks = np.full(len(neighbor_ids), -1, dtype=np.int32)
-        neighbor_ranks[in_range] = rank_lookup[neighbor_ids[in_range]]
-
-        # Filter cross-rank edges
-        cross_mask = (neighbor_ranks != self.my_rank) & (neighbor_ranks >= 0)
-        cross_local_indices = local_agent_indices[cross_mask]
-        cross_neighbor_ranks = neighbor_ranks[cross_mask]
-
-        if len(cross_local_indices) == 0:
-            self._is_initialized = True
-            return
-
-        # Group by dest rank, unique local agent indices per rank
-        dest_ranks_unique = np.unique(cross_neighbor_ranks)
-        send_agent_ids_per_rank = {}
-
-        self.send_indices_gpu = {}
-        self.send_counts = {}
-
-        for dest_rank in dest_ranks_unique:
-            dest_rank = int(dest_rank)
-            mask = cross_neighbor_ranks == dest_rank
-            unique_local_indices = np.unique(cross_local_indices[mask])
-            self.send_indices_gpu[dest_rank] = cp.array(unique_local_indices, dtype=cp.int32)
-            self.send_counts[dest_rank] = len(unique_local_indices)
-            send_agent_ids_per_rank[dest_rank] = np.array(
-                [int(buf.all_agent_ids_list[idx]) for idx in unique_local_indices],
-                dtype=np.int32,
+            # 3. Vectorized: expand (local_agent_idx, neighbor_id) pairs
+            counts = np.diff(cpu_offsets)
+            local_agent_indices = np.repeat(
+                np.arange(num_local, dtype=np.int32), counts
             )
 
-        # 4. Exchange counts via Alltoall
-        send_counts_array = np.zeros(self.num_workers, dtype=np.int32)
-        for rank, count in self.send_counts.items():
-            send_counts_array[rank] = count
-        recv_counts_array = np.zeros(self.num_workers, dtype=np.int32)
-        self.comm.Alltoall(send_counts_array, recv_counts_array)
+            # Filter invalid neighbor IDs (padding: -1)
+            valid_mask = cpu_values_ids >= 0
+            neighbor_ids = cpu_values_ids[valid_mask]
 
-        self.recv_counts = {}
-        for rank in range(self.num_workers):
-            if rank != self.my_rank and recv_counts_array[rank] > 0:
-                self.recv_counts[rank] = int(recv_counts_array[rank])
+            if len(neighbor_ids) == 0:
+                has_cross_rank_work = False
 
-        # 5. Exchange agent IDs so each rank knows which agents it will receive
-        send_id_requests = []
-        for dest_rank, agent_ids_np in send_agent_ids_per_rank.items():
-            req = self.comm.Isend([agent_ids_np, MPI.INT], dest=dest_rank, tag=100)
-            send_id_requests.append(req)
+        if has_cross_rank_work:
+            # Build dense rank lookup: rank_lookup[agent_id] = rank
+            agent2rank = self.agent_factory._agent2rank
+            max_agent_id = max(agent2rank.keys())
+            rank_lookup = np.full(max_agent_id + 1, -1, dtype=np.int32)
+            for aid, r in agent2rank.items():
+                rank_lookup[aid] = r
 
-        recv_agent_ids_per_rank = {}
-        recv_id_requests = []
-        for src_rank, count in self.recv_counts.items():
-            recv_buf = np.empty(count, dtype=np.int32)
-            recv_agent_ids_per_rank[src_rank] = recv_buf
-            req = self.comm.Irecv([recv_buf, MPI.INT], source=src_rank, tag=100)
-            recv_id_requests.append(req)
+            # Vectorized rank lookup for all neighbors
+            in_range = neighbor_ids <= max_agent_id
+            neighbor_ranks = np.full(len(neighbor_ids), -1, dtype=np.int32)
+            neighbor_ranks[in_range] = rank_lookup[neighbor_ids[in_range]]
 
-        MPI.Request.Waitall(send_id_requests + recv_id_requests)
+            # Filter to cross-rank neighbors
+            cross_mask = (neighbor_ranks != self.my_rank) & (neighbor_ranks >= 0)
+            cross_neighbor_ids = neighbor_ids[cross_mask]
+            cross_neighbor_ranks = neighbor_ranks[cross_mask]
 
-        # 6. Map received agent IDs to ghost buffer indices
+            if len(cross_neighbor_ids) == 0:
+                has_cross_rank_work = False
+
+        if has_cross_rank_work:
+            # Group by source rank: unique remote agent IDs needed from each
+            for src_rank in np.unique(cross_neighbor_ranks):
+                src_rank = int(src_rank)
+                mask = cross_neighbor_ranks == src_rank
+                unique_remote_ids = np.unique(cross_neighbor_ids[mask])
+                need_from_rank[src_rank] = unique_remote_ids
+
+        # ---- Phase 1: Exchange request counts (collective) ----
+        request_counts = np.zeros(self.num_workers, dtype=np.int32)
+        for src_rank, ids in need_from_rank.items():
+            request_counts[src_rank] = len(ids)
+        supply_counts = np.zeros(self.num_workers, dtype=np.int32)
+        self.comm.Alltoall(request_counts, supply_counts)
+
+        # ---- Phase 2: Exchange requested agent ID lists ----
+        send_req_requests = []
+        for src_rank, ids in need_from_rank.items():
+            ids_np = ids.astype(np.int32)
+            req = self.comm.Isend([ids_np, MPI.INT], dest=src_rank, tag=100)
+            send_req_requests.append(req)
+
+        # Receive: other ranks tell us which of our local agents they need
+        requested_by_rank = {}
+        recv_req_requests = []
+        for dest_rank in range(self.num_workers):
+            if dest_rank != self.my_rank and supply_counts[dest_rank] > 0:
+                recv_buf = np.empty(int(supply_counts[dest_rank]), dtype=np.int32)
+                requested_by_rank[dest_rank] = recv_buf
+                req = self.comm.Irecv(
+                    [recv_buf, MPI.INT], source=dest_rank, tag=100
+                )
+                recv_req_requests.append(req)
+
+        MPI.Request.Waitall(send_req_requests + recv_req_requests)
+
+        # ---- Phase 3: Build send / recv index maps ----
+        self.send_indices_gpu = {}
+        self.send_counts = {}
         self.recv_indices_gpu = {}
-        for src_rank, agent_ids_np in recv_agent_ids_per_rank.items():
-            ghost_indices = np.array(
+        self.recv_counts = {}
+
+        # send_indices: map requested agent IDs to our local buffer indices
+        for dest_rank, agent_ids_np in requested_by_rank.items():
+            local_indices = np.array(
                 [buf.agent_id_to_index[int(aid)] for aid in agent_ids_np],
                 dtype=np.int32,
             )
-            self.recv_indices_gpu[src_rank] = cp.array(ghost_indices, dtype=cp.int32)
+            self.send_indices_gpu[dest_rank] = cp.array(
+                local_indices, dtype=cp.int32
+            )
+            self.send_counts[dest_rank] = len(local_indices)
+
+        # recv_indices: map the remote agents we requested to ghost slots
+        for src_rank, remote_ids in need_from_rank.items():
+            ghost_indices = np.array(
+                [buf.agent_id_to_index[int(aid)] for aid in remote_ids],
+                dtype=np.int32,
+            )
+            self.recv_indices_gpu[src_rank] = cp.array(
+                ghost_indices, dtype=cp.int32
+            )
+            self.recv_counts[src_rank] = len(remote_ids)
 
         # 7. Pre-allocate send/recv CPU and GPU buffers
         self.send_bufs_cpu = {}
