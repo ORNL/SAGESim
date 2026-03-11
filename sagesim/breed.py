@@ -1,6 +1,8 @@
 from typing import Any, Callable, List, Dict, Optional, Union, Set
 from collections import OrderedDict
 from math import nan
+from pathlib import Path
+import inspect
 
 
 class Breed:
@@ -66,7 +68,7 @@ class Breed:
     def register_step_func(
         self,
         step_func: Callable,
-        module_fpath: str,
+        module_fpath: str = None,
         priority: int = 0,
         no_double_buffer: Optional[List[str]] = None,
     ):
@@ -74,7 +76,8 @@ class Breed:
         What the agent is supposed to do during a simulation step.
 
         :param step_func: The step function to execute
-        :param module_fpath: Path to the module containing the step function
+        :param module_fpath: Path to the module containing the step function.
+            If None, auto-detected via inspect.getfile(step_func).
         :param priority: Execution priority (lower values execute first)
         :param no_double_buffer: List of property names that should NOT use double
             buffering in this step function. These properties will write directly
@@ -87,7 +90,9 @@ class Breed:
             - Accessing different indices (e.g., temporal arrays with t vs t-1)
             - You explicitly want same-tick visibility between priorities
         """
-        self._step_funcs[priority] = (step_func, module_fpath)
+        if module_fpath is None:
+            module_fpath = inspect.getfile(step_func)
+        self._step_funcs[priority] = (step_func, str(Path(module_fpath).resolve()))
 
         # Accumulate no_double_buffer properties from all step functions
         if no_double_buffer:

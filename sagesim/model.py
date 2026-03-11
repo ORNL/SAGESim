@@ -330,7 +330,7 @@ class Model:
         verbose_mpi_transfer: bool = False,
     ) -> None:
         self._threads_per_block = threads_per_block
-        self._step_function_file_path = step_function_file_path
+        self._step_function_file_path = os.path.abspath(step_function_file_path)
         self._verbose_timing = verbose_timing
         self._verbose_mpi_transfer = verbose_mpi_transfer
         self._agent_factory = AgentFactory(space, verbose_timing=verbose_timing, verbose_mpi_transfer=verbose_mpi_transfer)
@@ -608,13 +608,24 @@ class Model:
         # Import and cache the step function once during setup
         # Suppress expected CuPy/Numba JIT compilation warnings
         t_jit_start = time.time()
+
+        # Add user module directories to sys.path so generated code can import them
+        added_paths = []
+        for breed_step_funcs in self._breed_idx_2_step_func_by_priority:
+            for breedidx, (func, module_fpath) in breed_step_funcs.items():
+                module_dir = str(Path(module_fpath).parent)  # Already absolute from register_step_func
+                if module_dir not in sys.path:
+                    sys.path.insert(0, module_dir)
+                    added_paths.append(module_dir)
+
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=DeprecationWarning)
             warnings.filterwarnings("ignore", category=FutureWarning)
             warnings.filterwarnings("ignore", message=".*numba.*", category=Warning)
             importlib.invalidate_caches()
-            abs_path = os.path.abspath(self._step_function_file_path)
+            abs_path = self._step_function_file_path  # Already absolute from __init__
             module_name = os.path.splitext(os.path.basename(abs_path))[0]
+            sys.modules.pop(module_name, None)  # Evict stale module for repeated setup() calls (#47)
             spec = importlib.util.spec_from_file_location(module_name, abs_path)
             step_func_module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = step_func_module
@@ -1564,12 +1575,14 @@ def generate_gpu_func(
                     len(agent_data_tensors),
                     breed_idx_2_step_func_by_priority,
                 )
-    This function can then be directly loaded using importlib or written to a
-    file and imported. For example, if you write the code to a file
+    This function can then be written to a file and imported using
+    spec_from_file_location. For example, if you write the code to a file
     called step_func_code.py, you can import it as below:
 
-        import importlib
-        step_func_module = importlib.import_module("step_func_code")
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("step_func_code", "/abs/path/step_func_code.py")
+        step_func_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(step_func_module)
         stepfunc = step_func_module.stepfunc
     Then you can run the stepfunc as a jit.rawkernel as below:
 
@@ -1722,7 +1735,6 @@ def generate_gpu_func(
     
     # Generate modified step functions
     step_sources = [
-        "import os", "import sys",
         "from sagesim.jit_extensions import install_jit_extensions",
         "install_jit_extensions()",
     ]
@@ -1757,12 +1769,7 @@ def generate_gpu_func(
             module_fpath = Path(module_fpath).absolute()
             module_name = module_fpath.stem
             if module_fpath not in imported_modules:
-                step_sources += [
-                    f"module_path = os.path.abspath('{module_fpath.parent}')",
-                    "if module_path not in sys.path:",
-                    "\tsys.path.append(module_path)",
-                    f"from {module_name} import *",
-                ]
+                step_sources.append(f"from {module_name} import *")
                 imported_modules.add(module_fpath)
 
     step_sources = "\n".join(step_sources)
