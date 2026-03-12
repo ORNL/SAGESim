@@ -1,5 +1,8 @@
 """SAGESim - Scalable Agent-based GPU-Enabled Simulator."""
 
+import cupy
+cupy.disable_experimental_feature_warning = True
+
 from sagesim.model import Model
 from sagesim.breed import Breed
 from sagesim.space import NetworkSpace
