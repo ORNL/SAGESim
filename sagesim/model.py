@@ -491,7 +491,7 @@ class Model:
         """
         self._agent_factory.load_partition(partition_file, format)
 
-    def setup(self, use_gpu: bool = True) -> None:
+    def setup(self, use_gpu: bool = True, skip_priority_barriers=False) -> None:
         """
         Must be called before first simulate call.
         Initializes model and resets ticks. Readies step functions
@@ -506,6 +506,7 @@ class Model:
         t_setup_total_start = time.time()
 
         self._use_gpu = use_gpu
+        self._skip_priority_barriers = skip_priority_barriers
         # Generate global data tensor
         self._global_data_vector = list(self.globals.values())
         self.tick = 0
@@ -513,6 +514,7 @@ class Model:
         ####
         # Create record of agent step functions by breed and priority
         self._breed_idx_2_step_func_by_priority: List[Dict[int, Callable]] = []
+        self._priority_values: List[int] = []  # actual priority value per slot index
         heap_priority_breedidx_func = []
         for breed in self._agent_factory.breeds:
             for priority, func in breed.step_funcs.items():
@@ -531,6 +533,7 @@ class Model:
                 self._breed_idx_2_step_func_by_priority.append(
                     {breed_idx_func[0]: breed_idx_func[1]}
                 )
+                self._priority_values.append(priority)
                 last_priority = priority
 
 
@@ -600,6 +603,8 @@ class Model:
                         self._write_property_indices,
                         property_ndims,
                         extra_kernel_config=self._get_extra_kernel_config(),
+                        skip_priority_barriers=self._skip_priority_barriers,
+                        priority_values=self._priority_values,
                     )
                 )
         comm.barrier()
@@ -1120,11 +1125,6 @@ class Model:
             if self._verbose_timing:
                 timing_data['contextualize'] = t_after_context - t_before_context
 
-            # Update global_data_vector on GPU
-            # GPU-aware path: already on GPU from last tick's in-place Allreduce
-            if not self._gpu_aware_mpi or num_workers <= 1:
-                buf.global_data_vector = cp.array(self._global_data_vector)
-
         t_data_prep_end = time.time()
 
         if self._verbose_timing:
@@ -1215,47 +1215,16 @@ class Model:
         t_post_start = time.time()
         t_post_end = time.time()
 
-        # Ensure all workers have finished before syncing neighbor data
-        t_before_barrier = time.time()
-        if num_workers > 1:
-            comm.barrier()
-        t_after_barrier = time.time()
-
-        # Global data vector: allreduce across ranks
-        t_before_allreduce = time.time()
-        if num_workers > 1 and self._gpu_aware_mpi:
-            # GPU-aware path: in-place Allreduce directly on GPU buffer (no CPU staging)
-            gdv = buf.global_data_vector
-            mpi_type = MPI.DOUBLE if gdv.dtype == cp.float64 else MPI.FLOAT
-            comm.Allreduce(MPI.IN_PLACE, [gdv, mpi_type], op=MPI.MAX)
-            # Store CPU copy for fallback queries and single-worker path
-            self._global_data_vector = gdv.get().tolist()
-        else:
-            # CPU staging path: download, pickle-based allreduce, store for next tick upload
-            global_cpu = buf.global_data_vector.tolist()
-            self._global_data_vector = comm.allreduce(
-                global_cpu, op=reduce_global_data_vector
-            )
-        t_after_allreduce = time.time()
-
         t_end = time.time()
         if self._verbose_timing:
             timing_data['post'] = t_post_end - t_post_start
-            timing_data['sync'] = (t_after_barrier - t_before_barrier) + (t_after_allreduce - t_before_allreduce)
             timing_data['total'] = t_end - t_start
 
             print(f"[Rank {worker}] Tick {self.tick}: "
                   f"total={timing_data['total']:.3f}s | "
                   f"prep={timing_data['data_prep']:.3f}s, "
                   f"gpu={timing_data['gpu_kernel']:.3f}s, "
-                  f"post={timing_data['post']:.3f}s, "
-                  f"sync={timing_data['sync']:.3f}s", flush=True)
-
-
-
-def reduce_global_data_vector(A, B):
-    values = np.stack([A, B], axis=1)
-    return np.max(values, axis=1)
+                  f"post={timing_data['post']:.3f}s", flush=True)
 
 
 class _CSRBodyTransformer(ast.NodeTransformer):
@@ -1545,6 +1514,8 @@ def generate_gpu_func(
     write_property_indices: Set[int],
     property_ndims: dict = None,
     extra_kernel_config: dict = None,
+    skip_priority_barriers=False,
+    priority_values: list = None,
 ) -> str:
     """
     Generate GPU function string with double buffering support for race condition prevention.
@@ -1825,8 +1796,17 @@ def generate_gpu_func(
         tick_body.append("\t\t\tagent_index = agent_index + total_threads")
 
         # Grid barrier after this priority
-        tick_body.append("")
-        tick_body += _gen_barrier_code("\t\t")
+        is_last_priority = (priority_idx == len(breed_idx_2_step_func_by_priority) - 1)
+        should_skip = False
+        if skip_priority_barriers is True and not is_last_priority:
+            should_skip = True
+        elif isinstance(skip_priority_barriers, set) and not is_last_priority:
+            if priority_values and priority_values[priority_idx] in skip_priority_barriers:
+                should_skip = True
+
+        if not should_skip:
+            tick_body.append("")
+            tick_body += _gen_barrier_code("\t\t")
 
     # Write-back: copy write buffers to read buffers (end of tick)
     writeback_props = sorted(i for i in write_property_indices if i != 1)

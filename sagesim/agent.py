@@ -591,7 +591,9 @@ class AgentFactory:
         requested_by_rank = {}
         for i, from_rank in enumerate(other_ranks):
             if recv_counts[i] > 0:
-                recv_id_requests.append(comm.irecv(source=from_rank, tag=1))
+                estimated_id_bytes = recv_counts[i] * 32  # ~32 bytes per pickled int
+                bufsiz_ids = max(1 << 16, estimated_id_bytes * 2)
+                recv_id_requests.append(comm.irecv(bufsiz_ids, source=from_rank, tag=1))
                 requested_by_rank[from_rank] = i  # index into recv_id_requests
 
         MPI.Request.waitall(send_id_requests)
@@ -632,7 +634,11 @@ class AgentFactory:
         recv_data_requests = []
         for from_rank in other_ranks:
             if need_from_rank.get(from_rank):
-                recv_data_requests.append(comm.irecv(source=from_rank, tag=2))
+                num_needed = len(need_from_rank.get(from_rank, set()))
+                num_vis = len(self._neighbor_visible_indices) if self._neighbor_visible_indices else 0
+                estimated_bytes = num_needed * (200 + 8 * num_vis)
+                bufsiz = max(1 << 16, estimated_bytes * 2)  # 2x safety margin, min 64KB
+                recv_data_requests.append(comm.irecv(bufsiz, source=from_rank, tag=2))
 
         t_before_wait2 = time.time()
         MPI.Request.waitall(send_data_requests)
