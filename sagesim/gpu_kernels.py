@@ -28,6 +28,58 @@ def is_gpu_aware_mpi():
     return False
 
 
+def discover_ghost_topology(all_neighbors, agent2rank, my_rank):
+    """Discover ghost agent IDs from local neighbor lists (CPU-only, no MPI).
+
+    Vectorized scan of neighbor arrays to identify agents belonging to other
+    ranks.  Returns the unique set of ghost IDs.  Actual data for these ghosts
+    is filled later by CommunicationManager.exchange_ghost_data().
+
+    :param all_neighbors: Ragged list of neighbor arrays (one per local agent)
+    :param agent2rank: Dict mapping agent_id -> rank
+    :param my_rank: This rank's ID
+    :return: Sorted list of unique ghost agent IDs
+    """
+    if not all_neighbors:
+        return []
+
+    # Flatten ragged neighbor lists into one array
+    if isinstance(all_neighbors[0], np.ndarray):
+        flat = np.concatenate(all_neighbors)
+    else:
+        flat = np.array(
+            [nid for sublist in all_neighbors for nid in sublist],
+            dtype=np.float64,
+        )
+
+    if len(flat) == 0:
+        return []
+
+    # Filter invalid entries (NaN padding, negative sentinels)
+    valid_mask = ~np.isnan(flat) & (flat >= 0)
+    neighbor_ids = flat[valid_mask].astype(np.int64)
+
+    if len(neighbor_ids) == 0:
+        return []
+
+    # Build dense rank lookup array for vectorized rank resolution
+    max_agent_id = max(agent2rank.keys())
+    rank_lookup = np.full(max_agent_id + 1, -1, dtype=np.int32)
+    for aid, r in agent2rank.items():
+        rank_lookup[aid] = r
+
+    # Vectorized rank lookup
+    in_range = neighbor_ids <= max_agent_id
+    neighbor_ranks = np.full(len(neighbor_ids), -1, dtype=np.int32)
+    neighbor_ranks[in_range] = rank_lookup[neighbor_ids[in_range]]
+
+    # Keep only cross-rank neighbors
+    cross_mask = (neighbor_ranks != my_rank) & (neighbor_ranks >= 0)
+    ghost_ids = np.unique(neighbor_ids[cross_mask])
+
+    return ghost_ids.tolist()
+
+
 class GPUHashMap:
     """Open-addressing hash map stored on GPU.
 
@@ -359,9 +411,8 @@ class GPUBufferManager:
 class CommunicationManager:
     """Buffer-protocol MPI communication with GPU pack/unpack.
 
-    Replaces the Python-loop-based contextualize_agent_data_tensors() for
-    subsequent ticks. Pre-computes communication topology once, then each
-    tick does: GPU pack -> buffer-protocol MPI Isend/Irecv -> GPU unpack.
+    Pre-computes communication topology once, then each tick does:
+    GPU pack -> buffer-protocol MPI Isend/Irecv -> GPU unpack.
     One contiguous message per peer rank, no pickle.
     """
 
@@ -402,7 +453,7 @@ class CommunicationManager:
         """Build pre-computed communication topology from CSR on GPU.
 
         Runs once after _build_gpu_buffers() or when topology changes.
-        Replaces the per-agent Python loop in contextualize_agent_data_tensors().
+        Scans CSR neighbor data to find cross-rank dependencies.
 
         Communication direction: when local agent A has neighbor B on a remote
         rank, A needs B's data.  We build a "need_from" map (which remote agent
@@ -584,10 +635,7 @@ class CommunicationManager:
         for prop_idx in self.visible_prop_indices:
             width = self.property_widths[prop_idx]
             data = self.buf.property_tensors[prop_idx][indices]  # GPU fancy indexing
-            if width == 1:
-                buf_gpu[offset:offset + n] = data
-            else:
-                buf_gpu[offset:offset + n * width] = data.ravel()
+            buf_gpu[offset:offset + n * width] = data.ravel()
             offset += n * width
         if not self._gpu_aware_mpi:
             # CPU staging path: one GPU->CPU transfer per peer
@@ -634,11 +682,13 @@ class CommunicationManager:
         offset = 0
         for prop_idx in self.visible_prop_indices:
             width = self.property_widths[prop_idx]
-            if width == 1:
-                data = recv_gpu[offset:offset + n]
+            tensor = self.buf.property_tensors[prop_idx]
+            chunk = recv_gpu[offset:offset + n * width]
+            if tensor.ndim == 1:
+                data = chunk
             else:
-                data = recv_gpu[offset:offset + n * width].reshape(n, width)
-            self.buf.property_tensors[prop_idx][ghost_indices] = data  # GPU scatter
+                data = chunk.reshape(n, width)
+            tensor[ghost_indices] = data  # GPU scatter
             offset += n * width
 
     def exchange_ghost_data(self):
