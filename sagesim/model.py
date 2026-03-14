@@ -396,6 +396,7 @@ class Model:
         # GPU buffers are now stale — force rebuild on next tick
         if hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
             self._gpu_buffers.is_initialized = False
+            self._cached_all_args = None
 
     def get_space(self) -> Space:
         return self._agent_factory._space
@@ -695,6 +696,7 @@ class Model:
         if hasattr(self, '_gpu_buffers'):
             self._gpu_buffers.free()
             self._gpu_buffers = GPUBufferManager()
+        self._cached_all_args = None
 
 
     def simulate(
@@ -987,6 +989,7 @@ class Model:
 
             t_build_start = time.time()
             self._build_gpu_buffers(ghost_ids, num_local_agents, comm)
+            self._cached_all_args = None  # buffers rebuilt, invalidate cache
             t_build_end = time.time()
 
             # Initialize CommunicationManager and fill ghost data from tick 1
@@ -1018,15 +1021,18 @@ class Model:
         # GPU KERNEL EXECUTION (fused: all ticks + priorities in one launch)
         # ============================================================
 
-        # Build all_args from persistent GPU buffers
-        all_args = []
-        for i in range(self._agent_factory.num_properties):
-            if i == 1:
-                all_args.append(buf.neighbor_offsets)
-                all_args.append(buf.neighbor_values)
-            else:
-                all_args.append(buf.property_tensors[i])
-        all_args = all_args + buf.write_buffers
+        # Build all_args from persistent GPU buffers (cached across ticks)
+        if not hasattr(self, '_cached_all_args') or self._cached_all_args is None:
+            all_args = []
+            for i in range(self._agent_factory.num_properties):
+                if i == 1:
+                    all_args.append(buf.neighbor_offsets)
+                    all_args.append(buf.neighbor_values)
+                else:
+                    all_args.append(buf.property_tensors[i])
+            all_args = all_args + buf.write_buffers
+            self._cached_all_args = all_args
+        all_args = self._cached_all_args
 
         # Compute max co-resident blocks for grid barrier safety.
         # Grid barriers require ALL launched blocks to be co-resident on the GPU.
@@ -1085,7 +1091,8 @@ class Model:
         for i, prop_idx in enumerate(buf.sorted_write_indices):
             buf.property_tensors[prop_idx][:num_local_agents] = \
                 buf.write_buffers[i][:num_local_agents]
-        cp.cuda.get_current_stream().synchronize()
+        # No sync needed here: these are GPU→GPU copies. Next tick's
+        # exchange_ghost_data() syncs before MPI reads the buffers.
 
         self.tick += sync_workers_every_n_ticks
         t_gpu_kernel_end = time.time()

@@ -442,6 +442,17 @@ class CommunicationManager:
         self.send_bufs_gpu = {}
         self.recv_bufs_gpu = {}  # GPU recv buffers for GPU-aware MPI path
 
+        # Batched index arrays (concatenated across all peers)
+        self._batched_send_indices_gpu = None  # CuPy int32, all send indices
+        self._batched_recv_indices_gpu = None  # CuPy int32, all recv indices
+        self._send_peer_order = []             # ordered list of dest ranks
+        self._recv_peer_order = []             # ordered list of src ranks
+        self._send_splits = []                 # cumulative split points for send
+        self._recv_splits = []                 # cumulative split points for recv
+
+        # Write-buffer ghost index (concatenated recv indices for write props)
+        self._write_prop_mask = []  # indices into buf.sorted_write_indices that are visible
+
         self._gpu_aware_mpi = is_gpu_aware_mpi()
         self._is_initialized = False
 
@@ -624,22 +635,86 @@ class CommunicationManager:
             else:
                 self.recv_bufs_cpu[src_rank] = np.empty(size, dtype=np.float32)
 
+        # ---- Build batched (concatenated) index arrays ----
+        # Send: concatenate all per-peer send indices into one array
+        self._send_peer_order = sorted(self.send_indices_gpu.keys())
+        send_parts = [self.send_indices_gpu[r] for r in self._send_peer_order]
+        if send_parts:
+            self._batched_send_indices_gpu = cp.concatenate(send_parts)
+            cumulative = 0
+            self._send_splits = []
+            for r in self._send_peer_order:
+                cumulative += self.send_counts[r]
+                self._send_splits.append(cumulative)
+        else:
+            self._batched_send_indices_gpu = cp.array([], dtype=cp.int32)
+            self._send_splits = []
+
+        # Recv: concatenate all per-peer recv indices into one array
+        self._recv_peer_order = sorted(self.recv_indices_gpu.keys())
+        recv_parts = [self.recv_indices_gpu[r] for r in self._recv_peer_order]
+        if recv_parts:
+            self._batched_recv_indices_gpu = cp.concatenate(recv_parts)
+            cumulative = 0
+            self._recv_splits = []
+            for r in self._recv_peer_order:
+                cumulative += self.recv_counts[r]
+                self._recv_splits.append(cumulative)
+        else:
+            self._batched_recv_indices_gpu = cp.array([], dtype=cp.int32)
+            self._recv_splits = []
+
+        # Pre-compute which write-buffer indices are also visible (for ghost sync)
+        visible_set = set(self.property_widths.keys())
+        self._write_prop_mask = [
+            i for i, prop_idx in enumerate(buf.sorted_write_indices)
+            if prop_idx in visible_set
+        ]
+
+        # Pre-compute cumulative width offsets per property (for unpack slicing)
+        self._prop_cum_widths = {}
+        cum = 0
+        for prop_idx in self.visible_prop_indices:
+            self._prop_cum_widths[prop_idx] = cum
+            cum += self.property_widths[prop_idx]
+
         self._is_initialized = True
 
-    def gpu_pack(self, dest_rank):
-        """Pack local agent data into contiguous send buffer on GPU."""
-        indices = self.send_indices_gpu[dest_rank]
-        n = len(indices)
-        buf_gpu = self.send_bufs_gpu[dest_rank]
-        offset = 0
+    def _batched_gpu_pack(self):
+        """Pack all peers' data with ONE gather per property, then split for MPI.
+
+        For each property, does ONE GPU fancy-index gather using concatenated
+        send indices, then splits the result per-peer and writes into the
+        correct offset within each peer's send buffer.  This keeps the per-peer
+        buffer layout (agent-grouped: [prop0(n), prop1(n), ...]) intact while
+        reducing GPU gathers from V*P to V.
+        """
+        all_indices = self._batched_send_indices_gpu
+        total_n = len(all_indices)
+        if total_n == 0:
+            return
+
+        # Track per-peer write offset into send buffers
+        peer_offsets = {r: 0 for r in self._send_peer_order}
+
         for prop_idx in self.visible_prop_indices:
             width = self.property_widths[prop_idx]
-            data = self.buf.property_tensors[prop_idx][indices]  # GPU fancy indexing
-            buf_gpu[offset:offset + n * width] = data.ravel()
-            offset += n * width
+            # ONE gather for all peers
+            gathered = self.buf.property_tensors[prop_idx][all_indices].ravel()
+            # Split per-peer and write into per-peer send buffers
+            agent_start = 0
+            for i, dest_rank in enumerate(self._send_peer_order):
+                n = self.send_counts[dest_rank]
+                chunk = gathered[agent_start * width:(agent_start + n) * width]
+                off = peer_offsets[dest_rank]
+                self.send_bufs_gpu[dest_rank][off:off + n * width] = chunk
+                peer_offsets[dest_rank] = off + n * width
+                agent_start += n
+
+        # CPU staging: one .get() per peer
         if not self._gpu_aware_mpi:
-            # CPU staging path: one GPU->CPU transfer per peer
-            self.send_bufs_cpu[dest_rank][:] = buf_gpu.get()
+            for dest_rank in self._send_peer_order:
+                self.send_bufs_cpu[dest_rank][:] = self.send_bufs_gpu[dest_rank].get()
 
     def mpi_exchange(self):
         """Non-blocking buffer-protocol MPI send/recv (no pickle).
@@ -651,73 +726,94 @@ class CommunicationManager:
         requests = []
         if self._gpu_aware_mpi:
             # GPU-aware path: MPI reads/writes GPU memory directly
-            for dest_rank, sbuf in self.send_bufs_gpu.items():
+            for dest_rank in self._send_peer_order:
+                sbuf = self.send_bufs_gpu[dest_rank]
                 requests.append(self.comm.Isend(
                     [sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
-            for src_rank, rbuf in self.recv_bufs_gpu.items():
+            for src_rank in self._recv_peer_order:
+                rbuf = self.recv_bufs_gpu[src_rank]
                 requests.append(self.comm.Irecv(
                     [rbuf, MPI.FLOAT], source=src_rank, tag=1))
         else:
             # CPU staging path
-            for dest_rank, sbuf in self.send_bufs_cpu.items():
+            for dest_rank in self._send_peer_order:
+                sbuf = self.send_bufs_cpu[dest_rank]
                 requests.append(self.comm.Isend(
                     [sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
-            for src_rank, rbuf in self.recv_bufs_cpu.items():
+            for src_rank in self._recv_peer_order:
+                rbuf = self.recv_bufs_cpu[src_rank]
                 requests.append(self.comm.Irecv(
                     [rbuf, MPI.FLOAT], source=src_rank, tag=1))
         MPI.Request.Waitall(requests)
 
-    def gpu_unpack(self, src_rank):
-        """Unpack received buffer into ghost region on GPU.
+    def _batched_gpu_unpack(self):
+        """Unpack all peers' data with ONE scatter per property.
 
-        With GPU-aware MPI: data already in recv_bufs_gpu, scatter directly.
-        Without GPU-aware MPI: upload from CPU recv buffer, then scatter.
+        Uploads received data to GPU (single transfer for CPU path), then for
+        each property extracts the correct slice from each peer's section,
+        concatenates on GPU, and does ONE scatter.  Per-peer buffers use
+        agent-grouped layout: [prop0(n), prop1(n), ...], so we use pre-computed
+        cumulative width offsets to find each property's data within each peer.
+        Also fuses write-buffer ghost sync into the same loop.
         """
+        all_ghost_indices = self._batched_recv_indices_gpu
+        total_n = len(all_ghost_indices)
+        if total_n == 0:
+            return
+
+        # Get per-peer recv data on GPU
         if self._gpu_aware_mpi:
-            recv_gpu = self.recv_bufs_gpu[src_rank]  # already on GPU
+            peer_recv_gpu = {r: self.recv_bufs_gpu[r] for r in self._recv_peer_order}
         else:
-            recv_gpu = cp.array(self.recv_bufs_cpu[src_rank])  # one CPU->GPU transfer
-        ghost_indices = self.recv_indices_gpu[src_rank]
-        n = len(ghost_indices)
-        offset = 0
+            # Single CPU→GPU upload for all peers
+            cpu_parts = [self.recv_bufs_cpu[r] for r in self._recv_peer_order]
+            combined = np.concatenate(cpu_parts) if len(cpu_parts) > 1 else cpu_parts[0]
+            all_recv_gpu = cp.array(combined)
+            # Split back into per-peer GPU views
+            peer_recv_gpu = {}
+            pos = 0
+            for r in self._recv_peer_order:
+                size = self.recv_counts[r] * self.total_stride
+                peer_recv_gpu[r] = all_recv_gpu[pos:pos + size]
+                pos += size
+
+        # One scatter per property into property_tensors
+        buf = self.buf
         for prop_idx in self.visible_prop_indices:
             width = self.property_widths[prop_idx]
-            tensor = self.buf.property_tensors[prop_idx]
-            chunk = recv_gpu[offset:offset + n * width]
-            if tensor.ndim == 1:
-                data = chunk
-            else:
-                data = chunk.reshape(n, width)
-            tensor[ghost_indices] = data  # GPU scatter
-            offset += n * width
+            cum_w = self._prop_cum_widths[prop_idx]
+            chunks = []
+            for r in self._recv_peer_order:
+                n = self.recv_counts[r]
+                prop_start = n * cum_w
+                chunks.append(peer_recv_gpu[r][prop_start:prop_start + n * width])
+            prop_data = cp.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+            tensor = buf.property_tensors[prop_idx]
+            if tensor.ndim > 1:
+                prop_data = prop_data.reshape(total_n, width)
+            tensor[all_ghost_indices] = prop_data  # ONE scatter
+
+        # Fused write-buffer ghost sync: one scatter per writable visible prop
+        for i in self._write_prop_mask:
+            prop_idx = buf.sorted_write_indices[i]
+            buf.write_buffers[i][all_ghost_indices] = \
+                buf.property_tensors[prop_idx][all_ghost_indices]
 
     def exchange_ghost_data(self):
-        """Full ghost exchange: GPU pack -> MPI -> GPU unpack -> sync write buffers."""
+        """Full ghost exchange: batched GPU pack -> MPI -> batched GPU unpack."""
         if not self._is_initialized:
             return
 
-        # Pack all destinations
-        for dest_rank in self.send_counts:
-            self.gpu_pack(dest_rank)
+        # Batched pack: one gather per property for all peers
+        self._batched_gpu_pack()
 
         # GPU-aware path: ensure GPU packing is complete before MPI reads the buffers
-        if self._gpu_aware_mpi and self.send_counts:
+        if self._gpu_aware_mpi and self._send_peer_order:
             cp.cuda.get_current_stream().synchronize()
 
         # MPI exchange
-        has_peers = (self.send_bufs_gpu or self.recv_bufs_gpu) if self._gpu_aware_mpi \
-            else (self.send_bufs_cpu or self.recv_bufs_cpu)
-        if has_peers:
+        if self._send_peer_order or self._recv_peer_order:
             self.mpi_exchange()
 
-        # Unpack all sources
-        for src_rank in self.recv_counts:
-            self.gpu_unpack(src_rank)
-
-        # Update write buffers for ghost region
-        for i, prop_idx in enumerate(self.buf.sorted_write_indices):
-            if prop_idx in self.property_widths:
-                for src_rank in self.recv_indices_gpu:
-                    ghost_indices = self.recv_indices_gpu[src_rank]
-                    self.buf.write_buffers[i][ghost_indices] = \
-                        self.buf.property_tensors[prop_idx][ghost_indices]
+        # Batched unpack + fused write-buffer ghost sync
+        self._batched_gpu_unpack()
