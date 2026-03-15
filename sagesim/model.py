@@ -704,7 +704,13 @@ class Model:
         ticks: int,
         sync_workers_every_n_ticks: int = 1,
     ) -> None:
+        if self._verbose_timing:
+            import time
+            t_barrier_start = time.perf_counter()
         comm.barrier()
+        if self._verbose_timing and worker == 0:
+            t_barrier_wait = time.perf_counter() - t_barrier_start
+            print(f"[TIMING] MPI barrier wait at simulate start: {t_barrier_wait*1000:.2f} ms", flush=True)
 
         # Step function is cached during setup() - no need to reimport
         # Optimization: Single worker doesn't need synchronization overhead
@@ -995,17 +1001,21 @@ class Model:
             # Initialize CommunicationManager and fill ghost data from tick 1
             if num_workers > 1:
                 self._comm_manager = CommunicationManager(
-                    buf, self._agent_factory, worker, num_workers, comm
+                    buf, self._agent_factory, worker, num_workers, comm, verbose_timing=self._verbose_timing
                 )
                 self._comm_manager.build_communication_maps()
-                self._comm_manager.exchange_ghost_data()
+                mpi_timing = self._comm_manager.exchange_ghost_data()
+                if self._verbose_timing and mpi_timing:
+                    timing_data.update(mpi_timing)
 
         else:
             # --- SUBSEQUENT TICK: reuse existing GPU buffers ---
             t_before_context = time.time()
 
             if num_workers > 1 and hasattr(self, '_comm_manager') and self._comm_manager.is_initialized:
-                self._comm_manager.exchange_ghost_data()
+                mpi_timing = self._comm_manager.exchange_ghost_data()
+                if self._verbose_timing and mpi_timing:
+                    timing_data.update(mpi_timing)
 
             t_after_context = time.time()
 
@@ -1053,8 +1063,6 @@ class Model:
         max_grid_blocks = max_blocks_per_sm * num_sms
         effective_blocks = min(blockspergrid, max_grid_blocks)
 
-        t_gpu_kernel_start = time.time()
-
         # Build range args for per-priority breed ranges
         range_args = []
         range_summary = []
@@ -1068,6 +1076,7 @@ class Model:
         extra_kernel_args = self._prepare_kernel_extras(num_local_agents, sync_workers_every_n_ticks)
 
         # Reset barrier counter and launch fused kernel
+        t_kernel_launch_start = time.time()
         buf.barrier_counter[0] = 0
         self._step_func[effective_blocks, threadsperblock](
             self.tick,
@@ -1081,7 +1090,28 @@ class Model:
             cp.int32(effective_blocks),
             *extra_kernel_args,
         )
+        if self._verbose_timing:
+            t_kernel_launch_end = time.time()
+            timing_data['kernel_launch_overhead'] = t_kernel_launch_end - t_kernel_launch_start
+
+        # GPU synchronization
+        t_gpu_sync_start = time.time()
         cp.cuda.get_current_stream().synchronize()
+        t_gpu_sync_end = time.time()
+
+        if self._verbose_timing:
+            timing_data['gpu_sync'] = t_gpu_sync_end - t_gpu_sync_start
+            timing_data['gpu_compute'] = (t_gpu_sync_end - t_kernel_launch_start) - timing_data['gpu_sync']
+
+            # Grid barrier metrics
+            num_barriers_hit = int(buf.barrier_counter[0].get())
+            expected_barriers = len(self._breed_idx_2_step_func_by_priority) * sync_workers_every_n_ticks
+            if not self._skip_priority_barriers:
+                expected_barriers += sync_workers_every_n_ticks
+            timing_data['grid_barriers_hit'] = num_barriers_hit
+            timing_data['grid_barriers_expected'] = expected_barriers
+
+        t_gpu_kernel_start = t_kernel_launch_start  # Keep for backward compat
 
         # Process subclass-specific extra data (e.g. download spike records)
         self._process_kernel_extras()
@@ -1111,11 +1141,79 @@ class Model:
             timing_data['post'] = t_post_end - t_post_start
             timing_data['total'] = t_end - t_start
 
-            print(f"[Rank {worker}] Tick {self.tick}: "
-                  f"total={timing_data['total']:.3f}s | "
-                  f"prep={timing_data['data_prep']:.3f}s, "
-                  f"gpu={timing_data['gpu_kernel']:.3f}s, "
-                  f"post={timing_data['post']:.3f}s", flush=True)
+            # Aggregate timing statistics across all ranks
+            if num_workers > 1:
+                import numpy as np
+                from mpi4py import MPI
+
+                # Collect key metrics for aggregation
+                local_summary = np.array([
+                    timing_data['total'],
+                    timing_data['data_prep'],
+                    timing_data.get('gpu_compute', 0.0),
+                    timing_data.get('gpu_sync', 0.0),
+                    timing_data.get('mpi_gpu_pack', 0.0),
+                    timing_data.get('mpi_exchange', 0.0),
+                    timing_data.get('mpi_wait_time', 0.0),
+                    timing_data.get('mpi_gpu_unpack', 0.0),
+                ], dtype=np.float64)
+
+                # MPI Allreduce for min/max/sum
+                global_min = np.zeros_like(local_summary)
+                global_max = np.zeros_like(local_summary)
+                global_sum = np.zeros_like(local_summary)
+
+                comm.Allreduce(local_summary, global_min, op=MPI.MIN)
+                comm.Allreduce(local_summary, global_max, op=MPI.MAX)
+                comm.Allreduce(local_summary, global_sum, op=MPI.SUM)
+
+                global_mean = global_sum / num_workers
+
+                # Identify straggler (rank with max total time)
+                all_totals = comm.allgather(timing_data['total'])
+                straggler_rank = np.argmax(all_totals)
+
+                # Communication volume
+                total_send_bytes = comm.allreduce(timing_data.get('mpi_send_bytes', 0), op=MPI.SUM)
+                total_recv_bytes = comm.allreduce(timing_data.get('mpi_recv_bytes', 0), op=MPI.SUM)
+
+                # Print aggregated statistics (rank 0 only)
+                if worker == 0:
+                    labels = ['total', 'data_prep', 'gpu_compute', 'gpu_sync', 'mpi_pack',
+                              'mpi_exchange', 'mpi_wait', 'mpi_unpack']
+                    print(f"\n{'='*90}")
+                    print(f"TICK {self.tick} TIMING BREAKDOWN (Aggregated Across {num_workers} Ranks)")
+                    print(f"{'='*90}")
+                    print(f"{'Metric':<20} {'Min':>10} {'Max':>10} {'Mean':>10} {'Imbal%':>8} {'Stdev':>10}")
+                    print(f"{'-'*90}")
+                    for i, label in enumerate(labels):
+                        if global_mean[i] > 0:
+                            imbalance = (global_max[i] - global_min[i]) / global_mean[i] * 100
+                            # Compute stdev from allgather
+                            all_vals = comm.allgather(local_summary[i])
+                            stdev = np.std(all_vals)
+                        else:
+                            imbalance = 0
+                            stdev = 0
+                        print(f"{label:<20} {global_min[i]:>10.4f} {global_max[i]:>10.4f} "
+                              f"{global_mean[i]:>10.4f} {imbalance:>7.1f}% {stdev:>10.4f}")
+                    print(f"{'-'*90}")
+                    print(f"Straggler: Rank {straggler_rank} (slowest total time)")
+                    if total_send_bytes > 0 or total_recv_bytes > 0:
+                        total_traffic_mb = (total_send_bytes + total_recv_bytes) / 1e6
+                        avg_per_rank_mb = total_traffic_mb / num_workers
+                        print(f"MPI Traffic: {total_traffic_mb:.2f} MB total, {avg_per_rank_mb:.2f} MB/rank avg")
+                    if 'grid_barriers_hit' in timing_data:
+                        print(f"Grid Barriers: {timing_data['grid_barriers_hit']} hit, "
+                              f"{timing_data['grid_barriers_expected']} expected")
+                    print(f"{'='*90}\n", flush=True)
+            else:
+                # Single rank: simple output
+                print(f"[Rank {worker}] Tick {self.tick}: "
+                      f"total={timing_data['total']:.3f}s | "
+                      f"prep={timing_data['data_prep']:.3f}s, "
+                      f"gpu_compute={timing_data.get('gpu_compute', 0):.3f}s, "
+                      f"gpu_sync={timing_data.get('gpu_sync', 0):.3f}s", flush=True)
 
 
 class _CSRBodyTransformer(ast.NodeTransformer):

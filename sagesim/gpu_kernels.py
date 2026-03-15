@@ -416,12 +416,13 @@ class CommunicationManager:
     One contiguous message per peer rank, no pickle.
     """
 
-    def __init__(self, buf, agent_factory, my_rank, num_workers, comm):
+    def __init__(self, buf, agent_factory, my_rank, num_workers, comm, verbose_timing=False):
         self.buf = buf
         self.agent_factory = agent_factory
         self.my_rank = my_rank
         self.num_workers = num_workers
         self.comm = comm
+        self._verbose_timing = verbose_timing
 
         # Per-dest-rank: CuPy int32 arrays of local buffer indices to pack
         self.send_indices_gpu = {}
@@ -723,28 +724,71 @@ class CommunicationManager:
         Data moves GPU->NIC->GPU via GPU-Direct RDMA without CPU staging.
         Without GPU-aware MPI: falls back to CPU-staged numpy buffers.
         """
-        requests = []
-        if self._gpu_aware_mpi:
-            # GPU-aware path: MPI reads/writes GPU memory directly
-            for dest_rank in self._send_peer_order:
-                sbuf = self.send_bufs_gpu[dest_rank]
-                requests.append(self.comm.Isend(
-                    [sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
-            for src_rank in self._recv_peer_order:
-                rbuf = self.recv_bufs_gpu[src_rank]
-                requests.append(self.comm.Irecv(
-                    [rbuf, MPI.FLOAT], source=src_rank, tag=1))
+        if not self._verbose_timing:
+            # Fast path: no timing overhead
+            requests = []
+            if self._gpu_aware_mpi:
+                # GPU-aware path: MPI reads/writes GPU memory directly
+                for dest_rank in self._send_peer_order:
+                    sbuf = self.send_bufs_gpu[dest_rank]
+                    requests.append(self.comm.Isend(
+                        [sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
+                for src_rank in self._recv_peer_order:
+                    rbuf = self.recv_bufs_gpu[src_rank]
+                    requests.append(self.comm.Irecv(
+                        [rbuf, MPI.FLOAT], source=src_rank, tag=1))
+            else:
+                # CPU staging path
+                for dest_rank in self._send_peer_order:
+                    sbuf = self.send_bufs_cpu[dest_rank]
+                    requests.append(self.comm.Isend(
+                        [sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
+                for src_rank in self._recv_peer_order:
+                    rbuf = self.recv_bufs_cpu[src_rank]
+                    requests.append(self.comm.Irecv(
+                        [rbuf, MPI.FLOAT], source=src_rank, tag=1))
+            MPI.Request.Waitall(requests)
         else:
-            # CPU staging path
-            for dest_rank in self._send_peer_order:
-                sbuf = self.send_bufs_cpu[dest_rank]
-                requests.append(self.comm.Isend(
-                    [sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
-            for src_rank in self._recv_peer_order:
-                rbuf = self.recv_bufs_cpu[src_rank]
-                requests.append(self.comm.Irecv(
-                    [rbuf, MPI.FLOAT], source=src_rank, tag=1))
-        MPI.Request.Waitall(requests)
+            # Verbose path: detailed timing
+            import time
+            t_isend_start = time.perf_counter()
+            send_requests = []
+            if self._gpu_aware_mpi:
+                for dest_rank in self._send_peer_order:
+                    sbuf = self.send_bufs_gpu[dest_rank]
+                    send_requests.append(self.comm.Isend(
+                        [sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
+            else:
+                for dest_rank in self._send_peer_order:
+                    sbuf = self.send_bufs_cpu[dest_rank]
+                    send_requests.append(self.comm.Isend(
+                        [sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
+            t_isend_end = time.perf_counter()
+
+            t_irecv_start = time.perf_counter()
+            recv_requests = []
+            if self._gpu_aware_mpi:
+                for src_rank in self._recv_peer_order:
+                    rbuf = self.recv_bufs_gpu[src_rank]
+                    recv_requests.append(self.comm.Irecv(
+                        [rbuf, MPI.FLOAT], source=src_rank, tag=1))
+            else:
+                for src_rank in self._recv_peer_order:
+                    rbuf = self.recv_bufs_cpu[src_rank]
+                    recv_requests.append(self.comm.Irecv(
+                        [rbuf, MPI.FLOAT], source=src_rank, tag=1))
+            t_irecv_end = time.perf_counter()
+
+            t_wait_start = time.perf_counter()
+            MPI.Request.Waitall(send_requests + recv_requests)
+            t_wait_end = time.perf_counter()
+
+            # Store detailed timing for retrieval by caller
+            self._last_mpi_timing = {
+                'mpi_isend_overhead': t_isend_end - t_isend_start,
+                'mpi_irecv_overhead': t_irecv_end - t_irecv_start,
+                'mpi_wait_time': t_wait_end - t_wait_start,
+            }
 
     def _batched_gpu_unpack(self):
         """Unpack all peers' data with ONE scatter per property.
@@ -804,16 +848,52 @@ class CommunicationManager:
         if not self._is_initialized:
             return
 
+        timing_data = {} if self._verbose_timing else None
+
         # Batched pack: one gather per property for all peers
+        if self._verbose_timing:
+            import time
+            t_pack_start = time.perf_counter()
         self._batched_gpu_pack()
+        if self._verbose_timing:
+            timing_data['mpi_gpu_pack'] = time.perf_counter() - t_pack_start
 
         # GPU-aware path: ensure GPU packing is complete before MPI reads the buffers
         if self._gpu_aware_mpi and self._send_peer_order:
+            if self._verbose_timing:
+                t_sync_start = time.perf_counter()
             cp.cuda.get_current_stream().synchronize()
+            if self._verbose_timing:
+                timing_data['mpi_gpu_sync_pack'] = time.perf_counter() - t_sync_start
 
         # MPI exchange
         if self._send_peer_order or self._recv_peer_order:
+            if self._verbose_timing:
+                t_mpi_start = time.perf_counter()
             self.mpi_exchange()
+            if self._verbose_timing:
+                timing_data['mpi_exchange'] = time.perf_counter() - t_mpi_start
+                # Get detailed breakdown from mpi_exchange
+                if hasattr(self, '_last_mpi_timing'):
+                    timing_data.update(self._last_mpi_timing)
 
         # Batched unpack + fused write-buffer ghost sync
+        if self._verbose_timing:
+            t_unpack_start = time.perf_counter()
         self._batched_gpu_unpack()
+        if self._verbose_timing:
+            timing_data['mpi_gpu_unpack'] = time.perf_counter() - t_unpack_start
+
+            # Communication volume metrics
+            timing_data['mpi_send_bytes'] = sum(
+                self.send_counts[r] * self.total_stride * 4  # 4 bytes per float32
+                for r in self._send_peer_order
+            )
+            timing_data['mpi_recv_bytes'] = sum(
+                self.recv_counts[r] * self.total_stride * 4
+                for r in self._recv_peer_order
+            )
+            timing_data['mpi_num_peers'] = len(self._send_peer_order)
+
+            return timing_data
+        return None
