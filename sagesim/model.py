@@ -704,6 +704,9 @@ class Model:
         ticks: int,
         sync_workers_every_n_ticks: int = 1,
     ) -> None:
+        # Store ticks for verbose_timing to know when simulation ends
+        self._last_simulate_ticks = ticks
+
         if self._verbose_timing:
             import time
             t_barrier_start = time.perf_counter()
@@ -1141,79 +1144,24 @@ class Model:
             timing_data['post'] = t_post_end - t_post_start
             timing_data['total'] = t_end - t_start
 
-            # Aggregate timing statistics across all ranks
-            if num_workers > 1:
-                import numpy as np
-                from mpi4py import MPI
-
-                # Collect key metrics for aggregation
-                local_summary = np.array([
-                    timing_data['total'],
-                    timing_data['data_prep'],
-                    timing_data.get('gpu_compute', 0.0),
-                    timing_data.get('gpu_sync', 0.0),
-                    timing_data.get('mpi_gpu_pack', 0.0),
-                    timing_data.get('mpi_exchange', 0.0),
-                    timing_data.get('mpi_wait_time', 0.0),
-                    timing_data.get('mpi_gpu_unpack', 0.0),
-                ], dtype=np.float64)
-
-                # MPI Allreduce for min/max/sum
-                global_min = np.zeros_like(local_summary)
-                global_max = np.zeros_like(local_summary)
-                global_sum = np.zeros_like(local_summary)
-
-                comm.Allreduce(local_summary, global_min, op=MPI.MIN)
-                comm.Allreduce(local_summary, global_max, op=MPI.MAX)
-                comm.Allreduce(local_summary, global_sum, op=MPI.SUM)
-
-                global_mean = global_sum / num_workers
-
-                # Identify straggler (rank with max total time)
-                all_totals = comm.allgather(timing_data['total'])
-                straggler_rank = np.argmax(all_totals)
-
-                # Communication volume
-                total_send_bytes = comm.allreduce(timing_data.get('mpi_send_bytes', 0), op=MPI.SUM)
-                total_recv_bytes = comm.allreduce(timing_data.get('mpi_recv_bytes', 0), op=MPI.SUM)
-
-                # Print aggregated statistics (rank 0 only)
-                if worker == 0:
-                    labels = ['total', 'data_prep', 'gpu_compute', 'gpu_sync', 'mpi_pack',
-                              'mpi_exchange', 'mpi_wait', 'mpi_unpack']
-                    print(f"\n{'='*90}")
-                    print(f"TICK {self.tick} TIMING BREAKDOWN (Aggregated Across {num_workers} Ranks)")
-                    print(f"{'='*90}")
-                    print(f"{'Metric':<20} {'Min':>10} {'Max':>10} {'Mean':>10} {'Imbal%':>8} {'Stdev':>10}")
-                    print(f"{'-'*90}")
-                    for i, label in enumerate(labels):
-                        if global_mean[i] > 0:
-                            imbalance = (global_max[i] - global_min[i]) / global_mean[i] * 100
-                            # Compute stdev from allgather
-                            all_vals = comm.allgather(local_summary[i])
-                            stdev = np.std(all_vals)
-                        else:
-                            imbalance = 0
-                            stdev = 0
-                        print(f"{label:<20} {global_min[i]:>10.4f} {global_max[i]:>10.4f} "
-                              f"{global_mean[i]:>10.4f} {imbalance:>7.1f}% {stdev:>10.4f}")
-                    print(f"{'-'*90}")
-                    print(f"Straggler: Rank {straggler_rank} (slowest total time)")
-                    if total_send_bytes > 0 or total_recv_bytes > 0:
-                        total_traffic_mb = (total_send_bytes + total_recv_bytes) / 1e6
-                        avg_per_rank_mb = total_traffic_mb / num_workers
-                        print(f"MPI Traffic: {total_traffic_mb:.2f} MB total, {avg_per_rank_mb:.2f} MB/rank avg")
-                    if 'grid_barriers_hit' in timing_data:
-                        print(f"Grid Barriers: {timing_data['grid_barriers_hit']} hit, "
-                              f"{timing_data['grid_barriers_expected']} expected")
-                    print(f"{'='*90}\n", flush=True)
-            else:
-                # Single rank: simple output
-                print(f"[Rank {worker}] Tick {self.tick}: "
-                      f"total={timing_data['total']:.3f}s | "
-                      f"prep={timing_data['data_prep']:.3f}s, "
-                      f"gpu_compute={timing_data.get('gpu_compute', 0):.3f}s, "
-                      f"gpu_sync={timing_data.get('gpu_sync', 0):.3f}s", flush=True)
+            # Print per-rank timing (NO MPI aggregation to avoid deadlocks)
+            # Only print first and last few ticks to reduce output volume
+            if self.tick <= 3 or self.tick >= (self._last_simulate_ticks - 2):
+                if num_workers > 1:
+                    print(f"[Rank {worker}] Tick {self.tick}: "
+                          f"total={timing_data['total']:.4f}s | "
+                          f"prep={timing_data['data_prep']:.4f}s, "
+                          f"gpu_compute={timing_data.get('gpu_compute', 0):.4f}s, "
+                          f"gpu_sync={timing_data.get('gpu_sync', 0):.4f}s, "
+                          f"mpi_pack={timing_data.get('mpi_gpu_pack', 0):.4f}s, "
+                          f"mpi_wait={timing_data.get('mpi_wait_time', 0):.4f}s, "
+                          f"mpi_unpack={timing_data.get('mpi_gpu_unpack', 0):.4f}s", flush=True)
+                else:
+                    print(f"[Rank {worker}] Tick {self.tick}: "
+                          f"total={timing_data['total']:.4f}s | "
+                          f"prep={timing_data['data_prep']:.4f}s, "
+                          f"gpu_compute={timing_data.get('gpu_compute', 0):.4f}s, "
+                          f"gpu_sync={timing_data.get('gpu_sync', 0):.4f}s", flush=True)
 
 
 class _CSRBodyTransformer(ast.NodeTransformer):
