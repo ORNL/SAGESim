@@ -24,7 +24,7 @@ from mpi4py import MPI
 
 from sagesim.agent import AgentFactory, Breed
 from sagesim.space import Space
-from sagesim.internal_utils import convert_to_equal_side_tensor, build_csr_from_ragged
+from sagesim.internal_utils import convert_to_equal_side_tensor, build_csr_from_ragged, build_csr_values_only, convert_to_padded_gpu_tensor
 from sagesim.gpu_kernels import GPUBufferManager, GPUHashMap, CommunicationManager, is_gpu_aware_mpi, discover_ghost_topology
 
 
@@ -768,11 +768,18 @@ class Model:
         values are populated by CommunicationManager.exchange_ghost_data()
         after build_communication_maps().
         """
+        import time
+        sub_timing = {}
+        do_time = self._verbose_timing
+
         buf = self._gpu_buffers
         buf.num_local_agents = num_local_agents
         num_ghost = len(ghost_ids)
 
+
         # Compute per-priority breed ranges from sorted breed data
+        if do_time:
+            _t0 = time.time()
         breed_data = self.__rank_local_agent_data_tensors[0]  # property 0 = breed
         breed_ranges = {}  # breed_id -> (start, count)
         if num_local_agents > 0:
@@ -798,32 +805,52 @@ class Model:
             else:
                 buf.priority_ranges[p_idx] = (0, 0)
 
+        if do_time:
+            sub_timing['breed_ranges'] = time.time() - _t0
+            _t0 = time.time()
+
         # 1. Build agent ID list and CPU hash map
-        all_agent_ids_list = self.__rank_local_agent_ids + ghost_ids
-        agent_id_to_index = {int(agent_id): idx for idx, agent_id in enumerate(all_agent_ids_list)}
-        buf.all_agent_ids_list = all_agent_ids_list
+        all_agent_ids_np = np.concatenate([self.__rank_local_agent_ids, ghost_ids])
+        agent_id_to_index = {int(aid): idx for idx, aid in enumerate(all_agent_ids_np)}
+        buf.all_agent_ids_list = all_agent_ids_np
         buf.agent_id_to_index = agent_id_to_index
-        buf.num_total_agents = len(all_agent_ids_list)
+        buf.num_total_agents = len(all_agent_ids_np)
         buf.prev_ghost_ids_set = set(ghost_ids)
+
+        if do_time:
+            sub_timing['id_cpu_dict'] = time.time() - _t0
+            _t1 = time.time()
 
         # 2. Pre-allocate capacity with slack
         agent_capacity = max(GPUBufferManager.MIN_CAPACITY,
                              int(buf.num_total_agents * GPUBufferManager.AGENT_SLACK_FACTOR))
 
-        # 3. Upload agent IDs to GPU with slack
+        # 3. Upload agent IDs to GPU with slack (pad on CPU, single memcpy)
         agent_ids_padded = np.full(agent_capacity, -1, dtype=np.float32)
-        agent_ids_padded[:buf.num_total_agents] = np.array(all_agent_ids_list, dtype=np.float32)
+        agent_ids_padded[:buf.num_total_agents] = all_agent_ids_np.astype(np.float32)
         buf.agent_ids_gpu = cp.array(agent_ids_padded)
+
+        if do_time:
+            sub_timing['id_gpu_upload'] = time.time() - _t1
+            _t1 = time.time()
 
         # 4. Upload global data vector
         buf.global_data_vector = cp.array(self._global_data_vector)
 
-        # 5. Build GPU hash map
-        agent_ids_np = np.array(all_agent_ids_list, dtype=np.int64)
-        buffer_indices_np = np.arange(len(all_agent_ids_list), dtype=np.int32)
-        hash_capacity = max(GPUBufferManager.MIN_CAPACITY, len(all_agent_ids_list) * 2)
+        if do_time:
+            sub_timing['id_global_data'] = time.time() - _t1
+            _t1 = time.time()
+
+        # 5. Build GPU hash map (reuse all_agent_ids_np instead of converting again)
+        buffer_indices_np = np.arange(len(all_agent_ids_np), dtype=np.int32)
+        hash_capacity = max(GPUBufferManager.MIN_CAPACITY, len(all_agent_ids_np) * 2)
         buf.hash_map = GPUHashMap(hash_capacity)
-        buf.hash_map.build_from_arrays(agent_ids_np, buffer_indices_np)
+        buf.hash_map.build_from_arrays(all_agent_ids_np, buffer_indices_np)
+
+        if do_time:
+            sub_timing['id_gpu_hashmap'] = time.time() - _t1
+            sub_timing['id_hashmap'] = time.time() - _t0
+            _t0 = time.time()
 
         # 6. Combine local + ghost placeholder data and build GPU arrays
         combined_lists = []
@@ -842,19 +869,22 @@ class Model:
                     placeholder = self._create_zero_placeholder(
                         self._agent_factory._property_name_2_defaults[prop_names[i]]
                     )
-                ghost_data = [placeholder for _ in range(num_ghost)]
+                ghost_data = [placeholder] * num_ghost
 
             combined = local_data + ghost_data
 
             if i == 1:
                 # Build dual CSR: values with agent IDs (for MPI) and local indices (for kernel)
-                combined_for_ids = list(combined)  # preserve original agent IDs
+                offsets_np, values_ids_np = build_csr_from_ragged(combined)
                 combined_indices = convert_agent_ids_to_indices(combined, agent_id_to_index)
-                offsets_np, values_np = build_csr_from_ragged(combined_indices)
-                _, values_ids_np = build_csr_from_ragged(combined_for_ids)
+                values_np = build_csr_values_only(combined_indices, offsets_np)
                 buf.allocate_csr(offsets_np, values_np, values_ids_np, buf.num_total_agents)
 
             combined_lists.append(combined)
+
+        if do_time:
+            sub_timing['combined_data'] = time.time() - _t0
+            _t0 = time.time()
 
         # 6b. Synchronize property widths across ranks (MPI_MAX) so all
         # ranks allocate tensors with identical shapes for ghost exchange.
@@ -887,14 +917,22 @@ class Model:
                         if len(row) < gw:
                             combined_lists[i][j] = list(row) + [0.0] * (gw - len(row))
 
+        if do_time:
+            sub_timing['mpi_sync'] = time.time() - _t0
+            _t0 = time.time()
+
         # 7. Allocate property tensors on GPU with slack
         buf.allocate_property_tensors(
             self._agent_factory.num_properties,
             combined_lists,
             agent_capacity,
-            convert_to_equal_side_tensor,
+            convert_to_padded_gpu_tensor,
         )
         buf.agent_capacity = agent_capacity
+
+        if do_time:
+            sub_timing['prop_tensors'] = time.time() - _t0
+            _t0 = time.time()
 
         # 8. Create write buffers
         sorted_write_indices = sorted(i for i in self._write_property_indices if i != 1)
@@ -904,7 +942,12 @@ class Model:
         # Must be int32 to match barrier arithmetic (int32 num_blocks_param, int literals)
         buf.barrier_counter = cp.zeros(1, dtype=cp.int32)
 
+        if do_time:
+            sub_timing['write_bufs'] = time.time() - _t0
+
         buf.is_initialized = True
+
+        return sub_timing if do_time else None
 
     def _download_local_data_to_cpu(self, num_local_agents):
         """Download only modified local agent data from GPU to CPU.
@@ -958,8 +1001,9 @@ class Model:
         import time
         t_start = time.time()
 
-        self.__rank_local_agent_ids = list(
-            self._agent_factory._rank2agentid2agentidx[worker].keys()
+        self.__rank_local_agent_ids = np.array(
+            list(self._agent_factory._rank2agentid2agentidx[worker].keys()),
+            dtype=np.int64,
         )
 
         timing_data = {} if self._verbose_timing else None
@@ -997,11 +1041,17 @@ class Model:
                 timing_data['num_neighbors'] = len(ghost_ids)
 
             t_build_start = time.time()
-            self._build_gpu_buffers(ghost_ids, num_local_agents, comm)
+            gpu_sub_timing = self._build_gpu_buffers(ghost_ids, num_local_agents, comm)
             self._cached_all_args = None  # buffers rebuilt, invalidate cache
             t_build_end = time.time()
 
+            if self._verbose_timing:
+                timing_data['gpu_buffer_build'] = t_build_end - t_build_start
+                if gpu_sub_timing:
+                    timing_data['gpu_build_sub'] = gpu_sub_timing
+
             # Initialize CommunicationManager and fill ghost data from tick 1
+            t_comm_init_start = time.time()
             if num_workers > 1:
                 self._comm_manager = CommunicationManager(
                     buf, self._agent_factory, worker, num_workers, comm, verbose_timing=self._verbose_timing
@@ -1010,6 +1060,10 @@ class Model:
                 mpi_timing = self._comm_manager.exchange_ghost_data()
                 if self._verbose_timing and mpi_timing:
                     timing_data.update(mpi_timing)
+            t_comm_init_end = time.time()
+
+            if self._verbose_timing:
+                timing_data['comm_init'] = t_comm_init_end - t_comm_init_start
 
         else:
             # --- SUBSEQUENT TICK: reuse existing GPU buffers ---
@@ -1147,10 +1201,34 @@ class Model:
             # Print per-rank timing (NO MPI aggregation to avoid deadlocks)
             # Only print first and last few ticks to reduce output volume
             if self.tick <= 3 or self.tick >= (self._last_simulate_ticks - 2):
+                # Build detailed first-tick breakdown if sub-timing is available
+                prep_detail = ""
+                if 'gpu_build_sub' in timing_data:
+                    sub = timing_data['gpu_build_sub']
+                    gpu_build_detail = (
+                        f"gpu_build={timing_data.get('gpu_buffer_build', 0):.4f}s ("
+                        f"breed_ranges={sub.get('breed_ranges', 0):.4f}s, "
+                        f"id_hashmap={sub.get('id_hashmap', 0):.4f}s "
+                        f"(cpu_dict={sub.get('id_cpu_dict', 0):.4f}s, "
+                        f"gpu_upload={sub.get('id_gpu_upload', 0):.4f}s, "
+                        f"global_data={sub.get('id_global_data', 0):.4f}s, "
+                        f"gpu_hashmap={sub.get('id_gpu_hashmap', 0):.4f}s), "
+                        f"combined_data={sub.get('combined_data', 0):.4f}s, "
+                        f"mpi_sync={sub.get('mpi_sync', 0):.4f}s, "
+                        f"prop_tensors={sub.get('prop_tensors', 0):.4f}s, "
+                        f"write_bufs={sub.get('write_bufs', 0):.4f}s)"
+                    )
+                    prep_detail = (
+                        f" [neighbor={timing_data.get('neighbor', 0):.4f}s, "
+                        f"ghost_topo={timing_data.get('contextualize', 0):.4f}s, "
+                        f"{gpu_build_detail}, "
+                        f"comm_init={timing_data.get('comm_init', 0):.4f}s]"
+                    )
+
                 if num_workers > 1:
                     print(f"[Rank {worker}] Tick {self.tick}: "
                           f"total={timing_data['total']:.4f}s | "
-                          f"prep={timing_data['data_prep']:.4f}s, "
+                          f"prep={timing_data['data_prep']:.4f}s{prep_detail}, "
                           f"gpu_compute={timing_data.get('gpu_compute', 0):.4f}s, "
                           f"gpu_sync={timing_data.get('gpu_sync', 0):.4f}s, "
                           f"mpi_pack={timing_data.get('mpi_gpu_pack', 0):.4f}s, "
@@ -1159,7 +1237,7 @@ class Model:
                 else:
                     print(f"[Rank {worker}] Tick {self.tick}: "
                           f"total={timing_data['total']:.4f}s | "
-                          f"prep={timing_data['data_prep']:.4f}s, "
+                          f"prep={timing_data['data_prep']:.4f}s{prep_detail}, "
                           f"gpu_compute={timing_data.get('gpu_compute', 0):.4f}s, "
                           f"gpu_sync={timing_data.get('gpu_sync', 0):.4f}s", flush=True)
 

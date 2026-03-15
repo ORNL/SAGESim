@@ -96,6 +96,18 @@ def _convert_awkward(awkward_array, depth: int) -> cp.array:
     return ak.to_cupy(awkward_array).astype(np.float32)
 
 
+def _detect_depth(sample):
+    """Detect nesting depth by probing first element."""
+    depth = 1
+    current = sample
+    while isinstance(current, (list, tuple, set)):
+        depth += 1
+        if len(current) == 0:
+            return depth
+        current = next(iter(current))
+    return depth
+
+
 def build_csr_from_ragged(ragged_list: List[Any]):
     """
     Convert ragged list of neighbor lists to CSR (Compressed Sparse Row) format.
@@ -150,6 +162,72 @@ def build_csr_from_ragged(ragged_list: List[Any]):
                 pos += 1
 
     return offsets, values
+
+
+def build_csr_values_only(ragged_list, offsets):
+    """Build CSR values reusing pre-computed offsets."""
+    total_entries = offsets[-1]
+    values = np.empty(total_entries, dtype=np.int32)
+    pos = 0
+    for row in ragged_list:
+        if isinstance(row, np.ndarray):
+            n = len(row)
+            if n > 0:
+                values[pos:pos + n] = row.astype(np.int32)
+            pos += n
+        elif isinstance(row, set):
+            for val in row:
+                values[pos] = int(val)
+                pos += 1
+        elif isinstance(row, (list, tuple)):
+            for val in row:
+                values[pos] = int(val)
+                pos += 1
+    return values
+
+
+def convert_to_padded_gpu_tensor(ragged_list, capacity):
+    """Convert ragged list directly to padded GPU tensor (single allocation)."""
+    if not ragged_list:
+        return cp.zeros(capacity, dtype=np.float32)
+
+    # Fast path: already-padded depth-2
+    if isinstance(ragged_list[0], (list, tuple)):
+        row_lengths = [len(r) if isinstance(r, (list, tuple)) else 1 for r in ragged_list]
+        if len(set(row_lengths)) == 1:
+            first_len = len(ragged_list[0])
+            if first_len > 0 and not isinstance(ragged_list[0][0], (list, tuple)):
+                result = np.full((capacity, first_len), np.nan, dtype=np.float32)
+                result[:len(ragged_list)] = ragged_list
+                return cp.array(result)
+
+    depth = _detect_depth(ragged_list[0])
+
+    if depth == 1:
+        result = np.zeros(capacity, dtype=np.float32)
+        result[:len(ragged_list)] = np.array(ragged_list, dtype=np.float32)
+        return cp.array(result)
+    elif depth == 2:
+        max_len = max((len(r) if isinstance(r, (list, tuple, set)) else 1
+                       for r in ragged_list), default=0)
+        if max_len == 0:
+            return cp.full((capacity, 0), np.nan, dtype=np.float32)
+        result = np.full((capacity, max_len), np.nan, dtype=np.float32)
+        for i, row in enumerate(ragged_list):
+            if isinstance(row, (list, tuple, set)) and len(row) > 0:
+                row_data = list(row) if isinstance(row, set) else row
+                result[i, :len(row_data)] = row_data
+            elif not isinstance(row, (list, tuple, set)):
+                result[i, 0] = row
+        return cp.array(result)
+    else:
+        # Depth 3+: fall back to awkward, pad on GPU
+        awkward_array = ak.from_iter(ragged_list)
+        tensor = _convert_awkward(awkward_array, depth)
+        padded_shape = (capacity,) + tensor.shape[1:]
+        padded = cp.full(padded_shape, cp.nan, dtype=tensor.dtype)
+        padded[:tensor.shape[0]] = tensor
+        return padded
 
 
 def compress_tensor(regular_tensor: cp.array, min_axis: int = 1) -> List[Any]:

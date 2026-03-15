@@ -41,7 +41,7 @@ def discover_ghost_topology(all_neighbors, agent2rank, my_rank):
     :return: Sorted list of unique ghost agent IDs
     """
     if not all_neighbors:
-        return []
+        return np.array([], dtype=np.int64)
 
     # Flatten ragged neighbor lists into one array
     if isinstance(all_neighbors[0], np.ndarray):
@@ -53,14 +53,14 @@ def discover_ghost_topology(all_neighbors, agent2rank, my_rank):
         )
 
     if len(flat) == 0:
-        return []
+        return np.array([], dtype=np.int64)
 
     # Filter invalid entries (NaN padding, negative sentinels)
     valid_mask = ~np.isnan(flat) & (flat >= 0)
     neighbor_ids = flat[valid_mask].astype(np.int64)
 
     if len(neighbor_ids) == 0:
-        return []
+        return np.array([], dtype=np.int64)
 
     # Build dense rank lookup array for vectorized rank resolution
     max_agent_id = max(agent2rank.keys())
@@ -77,7 +77,7 @@ def discover_ghost_topology(all_neighbors, agent2rank, my_rank):
     cross_mask = (neighbor_ranks != my_rank) & (neighbor_ranks >= 0)
     ghost_ids = np.unique(neighbor_ids[cross_mask])
 
-    return ghost_ids.tolist()
+    return ghost_ids
 
 
 class GPUHashMap:
@@ -89,15 +89,26 @@ class GPUHashMap:
 
     EMPTY_KEY = np.int64(-1)
     DELETED_KEY = np.int64(-2)
+    _HASH_PRIME = np.intp(2654435761)  # Knuth's multiplicative constant
 
     def __init__(self, capacity: int):
         self.capacity = capacity
-        self.keys = cp.full(capacity, self.EMPTY_KEY, dtype=cp.int64)
-        self.values = cp.full(capacity, -1, dtype=cp.int32)
+        self.keys = None    # Lazy: uploaded on first GPU access via _ensure_gpu()
+        self.values = None
         self.size = 0
         # CPU mirror for fast CPU-side lookups (avoids GPU→CPU transfers)
         self._cpu_keys = np.full(capacity, self.EMPTY_KEY, dtype=np.int64)
         self._cpu_values = np.full(capacity, -1, dtype=np.int32)
+
+    def _hash_slot(self, aid):
+        """Multiplicative hash for better slot distribution."""
+        return int(np.intp(aid) * self._HASH_PRIME % self.capacity)
+
+    def _ensure_gpu(self):
+        """Upload CPU mirror to GPU if not yet uploaded."""
+        if self.keys is None:
+            self.keys = cp.array(self._cpu_keys)
+            self.values = cp.array(self._cpu_values)
 
     def build_from_arrays(self, agent_ids: np.ndarray, buffer_indices: np.ndarray):
         """Bulk-insert from CPU arrays. Resets existing contents.
@@ -106,25 +117,56 @@ class GPUHashMap:
         :param buffer_indices: numpy int32 array of corresponding buffer indices
         """
         n = len(agent_ids)
-        self._cpu_keys[:] = self.EMPTY_KEY
+        capacity = self.capacity
+        EMPTY = self.EMPTY_KEY
+
+        self._cpu_keys[:] = EMPTY
         self._cpu_values[:] = -1
         self.size = n
 
-        for i in range(n):
-            aid = np.int64(agent_ids[i])
-            slot = int(aid % self.capacity)
-            while self._cpu_keys[slot] != self.EMPTY_KEY and self._cpu_keys[slot] != self.DELETED_KEY:
-                slot = (slot + 1) % self.capacity
-            self._cpu_keys[slot] = aid
-            self._cpu_values[slot] = np.int32(buffer_indices[i])
+        if n == 0:
+            self.keys = None
+            self.values = None
+            return
 
-        self.keys = cp.array(self._cpu_keys)
-        self.values = cp.array(self._cpu_values)
+        aids = agent_ids.astype(np.int64, copy=False)
+        bidx = buffer_indices.astype(np.int32, copy=False)
+
+        # Track remaining (unplaced) agent indices and their current probe slots
+        rem_idx = np.arange(n, dtype=np.intp)
+        rem_slots = ((aids.astype(np.intp) * GPUHashMap._HASH_PRIME) % capacity).astype(np.intp)
+
+        while len(rem_idx) > 0:
+            # Find first (lowest original index) agent per unique target slot
+            unique_slots, first_occ = np.unique(rem_slots, return_index=True)
+
+            # Which of those slots are empty?
+            empty_mask = self._cpu_keys[unique_slots] == EMPTY
+
+            # Place winners at empty slots
+            place_pos = first_occ[empty_mask]
+            place_slots = unique_slots[empty_mask]
+            self._cpu_keys[place_slots] = aids[rem_idx[place_pos]]
+            self._cpu_values[place_slots] = bidx[rem_idx[place_pos]]
+
+            # Remove placed agents from remaining
+            keep_mask = np.ones(len(rem_idx), dtype=np.bool_)
+            keep_mask[place_pos] = False
+            rem_idx = rem_idx[keep_mask]
+            rem_slots = rem_slots[keep_mask]
+
+            # Advance probe slot for all still-remaining agents
+            if len(rem_idx) > 0:
+                rem_slots = (rem_slots + 1) % capacity
+
+        self.keys = None
+        self.values = None
 
     def insert(self, agent_id: int, buffer_index: int):
         """Insert a single entry. Updates both CPU mirror and GPU arrays."""
+        self._ensure_gpu()
         aid = np.int64(agent_id)
-        slot = int(aid % self.capacity)
+        slot = self._hash_slot(aid)
         while (self._cpu_keys[slot] != self.EMPTY_KEY
                and self._cpu_keys[slot] != self.DELETED_KEY
                and self._cpu_keys[slot] != aid):
@@ -140,8 +182,9 @@ class GPUHashMap:
 
     def remove(self, agent_id: int):
         """Mark entry as deleted."""
+        self._ensure_gpu()
         aid = np.int64(agent_id)
-        slot = int(aid % self.capacity)
+        slot = self._hash_slot(aid)
         while self._cpu_keys[slot] != self.EMPTY_KEY:
             if self._cpu_keys[slot] == aid:
                 self._cpu_keys[slot] = self.DELETED_KEY
@@ -155,7 +198,7 @@ class GPUHashMap:
     def lookup_cpu(self, agent_id: int) -> int:
         """CPU-side lookup. Returns buffer_index or -1 if not found."""
         aid = np.int64(agent_id)
-        slot = int(aid % self.capacity)
+        slot = self._hash_slot(aid)
         while self._cpu_keys[slot] != self.EMPTY_KEY:
             if self._cpu_keys[slot] == aid:
                 return int(self._cpu_values[slot])
@@ -181,13 +224,13 @@ class GPUHashMap:
             if old_keys[i] != self.EMPTY_KEY and old_keys[i] != self.DELETED_KEY:
                 self._raw_insert(old_keys[i], old_values[i])
 
-        # Upload to GPU
-        self.keys = cp.array(self._cpu_keys)
-        self.values = cp.array(self._cpu_values)
+        # Mark GPU as stale (lazy upload on next access)
+        self.keys = None
+        self.values = None
 
     def _raw_insert(self, aid, buf_idx):
         """Insert into CPU mirror only (used during resize)."""
-        slot = int(np.int64(aid) % self.capacity)
+        slot = self._hash_slot(np.int64(aid))
         while (self._cpu_keys[slot] != self.EMPTY_KEY
                and self._cpu_keys[slot] != self.DELETED_KEY):
             slot = (slot + 1) % self.capacity
@@ -197,8 +240,10 @@ class GPUHashMap:
 
     def free(self):
         """Release GPU memory."""
-        del self.keys
-        del self.values
+        if self.keys is not None:
+            del self.keys
+        if self.values is not None:
+            del self.values
         self.keys = None
         self.values = None
         self._cpu_keys = None
@@ -245,13 +290,13 @@ class GPUBufferManager:
         self.breed_ranges = {}     # breed_id -> (start, count)
 
     def allocate_property_tensors(self, num_properties, combined_lists, agent_capacity,
-                                  convert_to_equal_side_tensor_func):
+                                  convert_to_padded_func):
         """Allocate property tensor GPU arrays with slack capacity.
 
         :param num_properties: Number of agent properties
         :param combined_lists: List of combined (local+ghost) property data
         :param agent_capacity: Pre-allocated capacity (>= num_total_agents)
-        :param convert_to_equal_side_tensor_func: Function to convert ragged lists to GPU tensors
+        :param convert_to_padded_func: Function to convert ragged lists directly to padded GPU tensors
         """
         self.agent_capacity = agent_capacity
         self.property_tensors = []
@@ -261,19 +306,7 @@ class GPUBufferManager:
                 # Property 1 uses CSR, not a rectangular tensor
                 self.property_tensors.append(None)
             else:
-                tensor = convert_to_equal_side_tensor_func(combined_lists[i])
-                # Pre-allocate with slack
-                if tensor.ndim == 1:
-                    padded = cp.zeros(agent_capacity, dtype=tensor.dtype)
-                    padded[:len(tensor)] = tensor
-                elif tensor.ndim == 2:
-                    padded = cp.full((agent_capacity, tensor.shape[1]), cp.nan, dtype=tensor.dtype)
-                    padded[:tensor.shape[0]] = tensor
-                else:
-                    # Higher dimensions: allocate with slack on first axis
-                    padded_shape = (agent_capacity,) + tensor.shape[1:]
-                    padded = cp.full(padded_shape, cp.nan, dtype=tensor.dtype)
-                    padded[:tensor.shape[0]] = tensor
+                padded = convert_to_padded_func(combined_lists[i], agent_capacity)
                 self.property_tensors.append(padded)
 
     def allocate_write_buffers(self, sorted_write_indices):
