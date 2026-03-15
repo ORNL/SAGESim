@@ -93,7 +93,7 @@ class GPUHashMap:
 
     def __init__(self, capacity: int):
         self.capacity = capacity
-        # Allocate GPU arrays immediately to establish device context
+        # Allocate GPU arrays immediately (prevents device context issues)
         self.keys = cp.full(capacity, self.EMPTY_KEY, dtype=cp.int64)
         self.values = cp.full(capacity, -1, dtype=cp.int32)
         self.size = 0
@@ -126,8 +126,8 @@ class GPUHashMap:
         self.size = n
 
         if n == 0:
-            self.keys = None
-            self.values = None
+            self.keys = cp.full(capacity, EMPTY, dtype=cp.int64)
+            self.values = cp.full(capacity, -1, dtype=np.int32)
             return
 
         aids = agent_ids.astype(np.int64, copy=False)
@@ -160,7 +160,7 @@ class GPUHashMap:
             if len(rem_idx) > 0:
                 rem_slots = (rem_slots + 1) % capacity
 
-        # Upload updated CPU mirror to GPU (always overwrite existing GPU arrays)
+        # Upload to GPU (create new arrays with correct size)
         self.keys = cp.array(self._cpu_keys)
         self.values = cp.array(self._cpu_values)
 
@@ -226,9 +226,9 @@ class GPUHashMap:
             if old_keys[i] != self.EMPTY_KEY and old_keys[i] != self.DELETED_KEY:
                 self._raw_insert(old_keys[i], old_values[i])
 
-        # Mark GPU as stale (lazy upload on next access)
-        self.keys = None
-        self.values = None
+        # Upload to GPU
+        self.keys = cp.array(self._cpu_keys)
+        self.values = cp.array(self._cpu_values)
 
     def _raw_insert(self, aid, buf_idx):
         """Insert into CPU mirror only (used during resize)."""
