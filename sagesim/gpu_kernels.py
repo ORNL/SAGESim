@@ -93,8 +93,9 @@ class GPUHashMap:
 
     def __init__(self, capacity: int):
         self.capacity = capacity
-        self.keys = None    # Lazy: uploaded on first GPU access via _ensure_gpu()
-        self.values = None
+        # Allocate GPU arrays immediately to establish device context
+        self.keys = cp.full(capacity, self.EMPTY_KEY, dtype=cp.int64)
+        self.values = cp.full(capacity, -1, dtype=cp.int32)
         self.size = 0
         # CPU mirror for fast CPU-side lookups (avoids GPU→CPU transfers)
         self._cpu_keys = np.full(capacity, self.EMPTY_KEY, dtype=np.int64)
@@ -159,8 +160,9 @@ class GPUHashMap:
             if len(rem_idx) > 0:
                 rem_slots = (rem_slots + 1) % capacity
 
-        self.keys = None
-        self.values = None
+        # Upload updated CPU mirror to GPU (always overwrite existing GPU arrays)
+        self.keys = cp.array(self._cpu_keys)
+        self.values = cp.array(self._cpu_values)
 
     def insert(self, agent_id: int, buffer_index: int):
         """Insert a single entry. Updates both CPU mirror and GPU arrays."""
