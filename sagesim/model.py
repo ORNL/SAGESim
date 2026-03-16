@@ -706,6 +706,7 @@ class Model:
     ) -> None:
         # Store ticks for verbose_timing to know when simulation ends
         self._last_simulate_ticks = ticks
+        self._tick_timings = []
 
         if self._verbose_timing:
             import time
@@ -1089,6 +1090,8 @@ class Model:
         # ============================================================
 
         # Build all_args from persistent GPU buffers (cached across ticks)
+        if self._verbose_timing:
+            t_kernel_args_start = time.time()
         if not hasattr(self, '_cached_all_args') or self._cached_all_args is None:
             all_args = []
             for i in range(self._agent_factory.num_properties):
@@ -1132,6 +1135,9 @@ class Model:
         # Prepare subclass-specific extra kernel args (e.g. spike recording buffers)
         extra_kernel_args = self._prepare_kernel_extras(num_local_agents, sync_workers_every_n_ticks)
 
+        if self._verbose_timing:
+            timing_data['kernel_args_build'] = time.time() - t_kernel_args_start
+
         # Reset barrier counter and launch fused kernel
         t_kernel_launch_start = time.time()
         buf.barrier_counter[0] = 0
@@ -1171,13 +1177,21 @@ class Model:
         t_gpu_kernel_start = t_kernel_launch_start  # Keep for backward compat
 
         # Process subclass-specific extra data (e.g. download spike records)
+        if self._verbose_timing:
+            t_extras_start = time.time()
         self._process_kernel_extras()
+        if self._verbose_timing:
+            timing_data['process_extras'] = time.time() - t_extras_start
 
         # Final write-back: kernel does inter-tick write-backs on GPU,
         # but ensure property_tensors match write_buffers for post-kernel reads
+        if self._verbose_timing:
+            t_writeback_start = time.time()
         for i, prop_idx in enumerate(buf.sorted_write_indices):
             buf.property_tensors[prop_idx][:num_local_agents] = \
                 buf.write_buffers[i][:num_local_agents]
+        if self._verbose_timing:
+            timing_data['write_back'] = time.time() - t_writeback_start
         # No sync needed here: these are GPU→GPU copies. Next tick's
         # exchange_ghost_data() syncs before MPI reads the buffers.
 
@@ -1199,47 +1213,53 @@ class Model:
             timing_data['total'] = t_end - t_start
 
             # Print per-rank timing (NO MPI aggregation to avoid deadlocks)
-            # Only print first and last few ticks to reduce output volume
-            if self.tick <= 3 or self.tick >= (self._last_simulate_ticks - 2):
-                # Build detailed first-tick breakdown if sub-timing is available
-                prep_detail = ""
-                if 'gpu_build_sub' in timing_data:
-                    sub = timing_data['gpu_build_sub']
-                    gpu_build_detail = (
-                        f"gpu_build={timing_data.get('gpu_buffer_build', 0):.4f}s ("
-                        f"breed_ranges={sub.get('breed_ranges', 0):.4f}s, "
-                        f"id_hashmap={sub.get('id_hashmap', 0):.4f}s "
-                        f"(cpu_dict={sub.get('id_cpu_dict', 0):.4f}s, "
-                        f"gpu_upload={sub.get('id_gpu_upload', 0):.4f}s, "
-                        f"global_data={sub.get('id_global_data', 0):.4f}s, "
-                        f"gpu_hashmap={sub.get('id_gpu_hashmap', 0):.4f}s), "
-                        f"combined_data={sub.get('combined_data', 0):.4f}s, "
-                        f"mpi_sync={sub.get('mpi_sync', 0):.4f}s, "
-                        f"prop_tensors={sub.get('prop_tensors', 0):.4f}s, "
-                        f"write_bufs={sub.get('write_bufs', 0):.4f}s)"
-                    )
-                    prep_detail = (
-                        f" [neighbor={timing_data.get('neighbor', 0):.4f}s, "
-                        f"ghost_topo={timing_data.get('contextualize', 0):.4f}s, "
-                        f"{gpu_build_detail}, "
-                        f"comm_init={timing_data.get('comm_init', 0):.4f}s]"
-                    )
+            # Build detailed first-tick breakdown if sub-timing is available
+            prep_detail = ""
+            if 'gpu_build_sub' in timing_data:
+                sub = timing_data['gpu_build_sub']
+                gpu_build_detail = (
+                    f"gpu_build={timing_data.get('gpu_buffer_build', 0):.4f}s ("
+                    f"breed_ranges={sub.get('breed_ranges', 0):.4f}s, "
+                    f"id_hashmap={sub.get('id_hashmap', 0):.4f}s "
+                    f"(cpu_dict={sub.get('id_cpu_dict', 0):.4f}s, "
+                    f"gpu_upload={sub.get('id_gpu_upload', 0):.4f}s, "
+                    f"global_data={sub.get('id_global_data', 0):.4f}s, "
+                    f"gpu_hashmap={sub.get('id_gpu_hashmap', 0):.4f}s), "
+                    f"combined_data={sub.get('combined_data', 0):.4f}s, "
+                    f"mpi_sync={sub.get('mpi_sync', 0):.4f}s, "
+                    f"prop_tensors={sub.get('prop_tensors', 0):.4f}s, "
+                    f"write_bufs={sub.get('write_bufs', 0):.4f}s)"
+                )
+                prep_detail = (
+                    f" [neighbor={timing_data.get('neighbor', 0):.4f}s, "
+                    f"ghost_topo={timing_data.get('contextualize', 0):.4f}s, "
+                    f"{gpu_build_detail}, "
+                    f"comm_init={timing_data.get('comm_init', 0):.4f}s]"
+                )
 
-                if num_workers > 1:
-                    print(f"[Rank {worker}] Tick {self.tick}: "
-                          f"total={timing_data['total']:.4f}s | "
-                          f"prep={timing_data['data_prep']:.4f}s{prep_detail}, "
-                          f"gpu_compute={timing_data.get('gpu_compute', 0):.4f}s, "
-                          f"gpu_sync={timing_data.get('gpu_sync', 0):.4f}s, "
-                          f"mpi_pack={timing_data.get('mpi_gpu_pack', 0):.4f}s, "
-                          f"mpi_wait={timing_data.get('mpi_wait_time', 0):.4f}s, "
-                          f"mpi_unpack={timing_data.get('mpi_gpu_unpack', 0):.4f}s", flush=True)
-                else:
-                    print(f"[Rank {worker}] Tick {self.tick}: "
-                          f"total={timing_data['total']:.4f}s | "
-                          f"prep={timing_data['data_prep']:.4f}s{prep_detail}, "
-                          f"gpu_compute={timing_data.get('gpu_compute', 0):.4f}s, "
-                          f"gpu_sync={timing_data.get('gpu_sync', 0):.4f}s", flush=True)
+            if num_workers > 1:
+                print(f"[Rank {worker}] Tick {self.tick}: "
+                      f"total={timing_data['total']:.4f}s | "
+                      f"prep={timing_data['data_prep']:.4f}s{prep_detail}, "
+                      f"kern_args={timing_data.get('kernel_args_build', 0):.4f}s, "
+                      f"gpu_compute={timing_data.get('gpu_compute', 0):.4f}s, "
+                      f"gpu_sync={timing_data.get('gpu_sync', 0):.4f}s, "
+                      f"extras={timing_data.get('process_extras', 0):.4f}s, "
+                      f"writeback={timing_data.get('write_back', 0):.4f}s, "
+                      f"mpi_pack={timing_data.get('mpi_gpu_pack', 0):.4f}s, "
+                      f"mpi_wait={timing_data.get('mpi_wait_time', 0):.4f}s, "
+                      f"mpi_unpack={timing_data.get('mpi_gpu_unpack', 0):.4f}s", flush=True)
+            else:
+                print(f"[Rank {worker}] Tick {self.tick}: "
+                      f"total={timing_data['total']:.4f}s | "
+                      f"prep={timing_data['data_prep']:.4f}s{prep_detail}, "
+                      f"kern_args={timing_data.get('kernel_args_build', 0):.4f}s, "
+                      f"gpu_compute={timing_data.get('gpu_compute', 0):.4f}s, "
+                      f"gpu_sync={timing_data.get('gpu_sync', 0):.4f}s, "
+                      f"extras={timing_data.get('process_extras', 0):.4f}s, "
+                      f"writeback={timing_data.get('write_back', 0):.4f}s", flush=True)
+
+            self._tick_timings.append(dict(timing_data))
 
 
 class _CSRBodyTransformer(ast.NodeTransformer):
