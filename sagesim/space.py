@@ -63,6 +63,9 @@ class NetworkSpace(Space):
         locations_max_dims = [0]
         locations_defaults = []
         self._ordered = ordered
+        # Parallel set for O(1) duplicate checks when ordered=True
+        if ordered:
+            self._locations_set = {}
         super().__init__(
             _network_space_compute_neighbors, locations_max_dims, locations_defaults
         )
@@ -71,6 +74,8 @@ class NetworkSpace(Space):
         # Use list for ordered neighbors, set for unordered
         neighbor_container = [] if self._ordered else set()
         self._locations.append(neighbor_container)
+        if self._ordered:
+            self._locations_set[agent] = set()
         self._agent_factory.set_agent_property_value(
             "locations",
             agent,
@@ -92,10 +97,12 @@ class NetworkSpace(Space):
         agent_1 = int(agent_1)
 
         if self._ordered:
-            # For ordered neighbors, append to list (check for duplicates to prevent multi-edges)
-            if agent_1 not in self._locations[agent_0]:
+            # For ordered neighbors, use parallel set for O(1) duplicate check
+            if agent_1 not in self._locations_set[agent_0]:
+                self._locations_set[agent_0].add(agent_1)
                 self._locations[agent_0].append(agent_1)
-            if not directed and agent_0 not in self._locations[agent_1]:
+            if not directed and agent_0 not in self._locations_set[agent_1]:
+                self._locations_set[agent_1].add(agent_0)
                 self._locations[agent_1].append(agent_0)
         else:
             # For unordered neighbors, add to set (automatically prevents duplicates)
@@ -110,10 +117,12 @@ class NetworkSpace(Space):
         agent_1 = int(agent_1)
 
         if self._ordered:
-            # For ordered neighbors (list), remove by value
-            if agent_1 in self._locations[agent_0]:
+            # For ordered neighbors (list), remove by value; keep set in sync
+            if agent_1 in self._locations_set[agent_0]:
+                self._locations_set[agent_0].discard(agent_1)
                 self._locations[agent_0].remove(agent_1)
-            if not directed and agent_0 in self._locations[agent_1]:
+            if not directed and agent_0 in self._locations_set[agent_1]:
+                self._locations_set[agent_1].discard(agent_0)
                 self._locations[agent_1].remove(agent_0)
         else:
             # For unordered neighbors (set), remove directly
