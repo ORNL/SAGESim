@@ -82,6 +82,20 @@ class NetworkSpace(Space):
             self._locations[agent],
         )
 
+    def bulk_add_agents(self, total_agents):
+        """Pre-populate location containers for all agents.
+
+        Replaces N individual add_agent() calls with a single bulk allocation.
+        Property tensor linking is handled separately by create_agent_at_index.
+
+        :param total_agents: Total number of agents across all ranks
+        """
+        if self._ordered:
+            self._locations = [[] for _ in range(total_agents)]
+            self._locations_set = {i: set() for i in range(total_agents)}
+        else:
+            self._locations = [set() for _ in range(total_agents)]
+
     def get_location(self, agent_id: int) -> Union[List[int], set]:
         """Returns agent's location (neighbors as list if ordered=True, set if ordered=False)"""
         return self._locations[agent_id]

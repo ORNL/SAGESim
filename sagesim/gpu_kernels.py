@@ -63,10 +63,14 @@ def discover_ghost_topology(all_neighbors, agent2rank, my_rank):
         return np.array([], dtype=np.int64)
 
     # Build dense rank lookup array for vectorized rank resolution
-    max_agent_id = max(agent2rank.keys())
-    rank_lookup = np.full(max_agent_id + 1, -1, dtype=np.int32)
-    for aid, r in agent2rank.items():
-        rank_lookup[aid] = r
+    if isinstance(agent2rank, np.ndarray):
+        rank_lookup = agent2rank.astype(np.int32, copy=False)
+        max_agent_id = len(rank_lookup) - 1
+    else:
+        max_agent_id = max(agent2rank.keys())
+        rank_lookup = np.full(max_agent_id + 1, -1, dtype=np.int32)
+        for aid, r in agent2rank.items():
+            rank_lookup[aid] = r
 
     # Vectorized rank lookup
     in_range = neighbor_ids <= max_agent_id
@@ -570,10 +574,14 @@ class CommunicationManager:
         if has_cross_rank_work:
             # Build dense rank lookup: rank_lookup[agent_id] = rank
             agent2rank = self.agent_factory._agent2rank
-            max_agent_id = max(agent2rank.keys())
-            rank_lookup = np.full(max_agent_id + 1, -1, dtype=np.int32)
-            for aid, r in agent2rank.items():
-                rank_lookup[aid] = r
+            if isinstance(agent2rank, np.ndarray):
+                rank_lookup = agent2rank.astype(np.int32, copy=False)
+                max_agent_id = len(rank_lookup) - 1
+            else:
+                max_agent_id = max(agent2rank.keys())
+                rank_lookup = np.full(max_agent_id + 1, -1, dtype=np.int32)
+                for aid, r in agent2rank.items():
+                    rank_lookup[aid] = r
 
             # Vectorized rank lookup for all neighbors
             in_range = neighbor_ids <= max_agent_id

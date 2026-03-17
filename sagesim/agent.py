@@ -468,6 +468,55 @@ class AgentFactory:
             new_mapping[agent_ids[old_pos]] = new_idx
         self._rank2agentid2agentidx[worker] = new_mapping
 
+    def bulk_register_agents(self, total_agents, agent_id_to_rank):
+        """Pre-compute global agent metadata without per-agent loops.
+
+        Sets _agent2rank as a numpy array and builds _rank2agentid2agentidx
+        only for the local rank. Pre-allocates property tensor lists for
+        local agents. Must be called AFTER all breeds are registered.
+
+        :param total_agents: Total number of agents across all ranks
+        :param agent_id_to_rank: numpy int32 array where index=agent_id, value=rank
+        """
+        self._num_agents = total_agents
+        self._agent2rank = agent_id_to_rank  # numpy array
+
+        # Build _rank2agentid2agentidx ONLY for local rank
+        local_ids = np.where(agent_id_to_rank == worker)[0]
+        local_mapping = OrderedDict()
+        for i, aid in enumerate(local_ids):
+            local_mapping[int(aid)] = i
+        self._rank2agentid2agentidx[worker] = local_mapping
+
+        # Pre-allocate property tensor lists for local agents
+        n_local = len(local_ids)
+        for prop in self._property_name_2_agent_data_tensor:
+            self._property_name_2_agent_data_tensor[prop] = [None] * n_local
+
+    def create_agent_at_index(self, agent_id, local_idx, breed, **kwargs):
+        """Populate property data for a local agent at a pre-allocated index.
+
+        Must only be called after bulk_register_agents(). Writes property
+        values at the given local_idx without any dict bookkeeping.
+
+        :param agent_id: Global agent ID
+        :param local_idx: Pre-allocated local index from _rank2agentid2agentidx
+        :param breed: Breed definition of agent
+        :param kwargs: Property values to set
+        """
+        if breed.name not in self._breeds:
+            raise ValueError(f"Fatal: unregistered breed {breed.name}")
+        for property_name in self._property_name_2_agent_data_tensor:
+            if property_name == "breed":
+                self._property_name_2_agent_data_tensor[property_name][local_idx] = (
+                    self._breeds[breed.name]._breedidx
+                )
+            else:
+                default_value = copy(self._property_name_2_defaults[property_name])
+                self._property_name_2_agent_data_tensor[property_name][local_idx] = (
+                    kwargs.get(property_name, default_value)
+                )
+
     def _generate_agent_data_tensors(
         self,
     ) -> List[List[Any]]:

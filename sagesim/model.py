@@ -629,9 +629,10 @@ class Model:
         if worker == 0:
             total_agents = self._agent_factory._num_agents
             agents_per_rank = {}
+            a2r = self._agent_factory._agent2rank
             for agent_id in range(total_agents):
-                rank = self._agent_factory._agent2rank.get(agent_id, -1)
-                agents_per_rank[rank] = agents_per_rank.get(rank, 0) + 1
+                r = int(a2r[agent_id]) if isinstance(a2r, np.ndarray) else a2r.get(agent_id, -1)
+                agents_per_rank[r] = agents_per_rank.get(r, 0) + 1
 
 
         self._is_setup = True
