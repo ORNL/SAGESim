@@ -4,14 +4,17 @@ SuperNeuroABM basic Model class
 """
 
 from typing import Dict, List, Callable, Set, Any, Union
+import hashlib
 import os
 import re
 import sys
 from pathlib import Path
 import importlib
+import importlib.util
 import pickle
 import math
 import heapq
+import tempfile
 import warnings
 import time
 
@@ -330,6 +333,8 @@ class Model:
     ) -> None:
         self._threads_per_block = threads_per_block
         self._step_function_file_path = os.path.abspath(step_function_file_path)
+        self._generated_step_function_file_path = None
+        self._generated_step_function_module_name = None
         self._verbose_timing = verbose_timing
         self._agent_factory = AgentFactory(space, verbose_timing=verbose_timing)
         self._is_setup = False
@@ -477,6 +482,52 @@ class Model:
         """
         self._agent_factory.load_partition(partition_file, format)
 
+    def _resolve_generated_step_function_artifacts(
+        self, generated_step_function_code: str
+    ) -> tuple[Path, str]:
+        """
+        Resolve the generated GPU module into the current working directory.
+
+        The configured ``step_function_file_path`` provides the base filename, but the
+        runtime directory is always derived from the process CWD so a pickled model can
+        be moved and set up safely from a different destination.
+        """
+        configured_path = Path(self._step_function_file_path)
+        module_stem = configured_path.stem or "step_func_code"
+        module_suffix = configured_path.suffix or ".py"
+        runtime_cwd = Path.cwd().resolve()
+
+        hash_input = "\n".join(
+            [
+                str(runtime_cwd),
+                str(configured_path),
+                generated_step_function_code,
+            ]
+        ).encode("utf-8")
+        module_hash = hashlib.sha256(hash_input).hexdigest()[:16]
+        runtime_stem = f"{module_stem}_{module_hash}"
+        runtime_module_name = re.sub(r"\W|^(?=\d)", "_", runtime_stem)
+        runtime_module_path = runtime_cwd / f"{runtime_stem}{module_suffix}"
+        return runtime_module_path, runtime_module_name
+
+    @staticmethod
+    def _load_generated_step_function_module(
+        module_name: str, module_path: Path
+    ):
+        """Import a generated step-function module directly from its file path."""
+        importlib.invalidate_caches()
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(
+                f"Could not create import spec for generated step module at {module_path}"
+            )
+
+        step_func_module = importlib.util.module_from_spec(spec)
+        sys.modules.pop(module_name, None)
+        sys.modules[module_name] = step_func_module
+        spec.loader.exec_module(step_func_module)
+        return step_func_module
+
     def setup(self, use_gpu: bool = True, skip_priority_barriers=False) -> None:
         """
         Must be called before first simulate call.
@@ -580,19 +631,36 @@ class Model:
                 property_ndims[prop_idx] = 0  # scalar
 
         t_codegen_start = time.time()
+        generated_step_function_code = generate_gpu_func(
+            self._agent_factory.num_properties,
+            self._breed_idx_2_step_func_by_priority,
+            self._write_property_indices,
+            property_ndims,
+            extra_kernel_config=self._get_extra_kernel_config(),
+            skip_priority_barriers=self._skip_priority_barriers,
+            priority_values=self._priority_values,
+        )
+        runtime_step_module_path, runtime_step_module_name = (
+            self._resolve_generated_step_function_artifacts(
+                generated_step_function_code
+            )
+        )
+        self._generated_step_function_file_path = str(runtime_step_module_path)
+        self._generated_step_function_module_name = runtime_step_module_name
+
         if worker == 0:
-            with open(self._step_function_file_path, "w", encoding="utf-8") as f:
-                f.write(
-                    generate_gpu_func(
-                        self._agent_factory.num_properties,
-                        self._breed_idx_2_step_func_by_priority,
-                        self._write_property_indices,
-                        property_ndims,
-                        extra_kernel_config=self._get_extra_kernel_config(),
-                        skip_priority_barriers=self._skip_priority_barriers,
-                        priority_values=self._priority_values,
-                    )
-                )
+            runtime_step_module_path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=runtime_step_module_path.parent,
+                prefix=f"{runtime_step_module_path.stem}_",
+                suffix=".tmp",
+                delete=False,
+            ) as temp_file:
+                temp_file.write(generated_step_function_code)
+                temp_path = Path(temp_file.name)
+            os.replace(temp_path, runtime_step_module_path)
         comm.barrier()
         t_codegen_end = time.time()
 
@@ -613,14 +681,10 @@ class Model:
             warnings.filterwarnings("ignore", category=DeprecationWarning)
             warnings.filterwarnings("ignore", category=FutureWarning)
             warnings.filterwarnings("ignore", message=".*numba.*", category=Warning)
-            importlib.invalidate_caches()
-            abs_path = self._step_function_file_path  # Already absolute from __init__
-            module_name = os.path.splitext(os.path.basename(abs_path))[0]
-            sys.modules.pop(module_name, None)  # Evict stale module for repeated setup() calls (#47)
-            spec = importlib.util.spec_from_file_location(module_name, abs_path)
-            step_func_module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = step_func_module
-            spec.loader.exec_module(step_func_module)
+            step_func_module = self._load_generated_step_function_module(
+                runtime_step_module_name,
+                runtime_step_module_path,
+            )
         self._step_func = step_func_module.stepfunc
         t_jit_end = time.time()
         ###
