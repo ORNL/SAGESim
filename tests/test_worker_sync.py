@@ -4,6 +4,7 @@ from random import random, seed as set_random_seed
 import csv
 from enum import Enum
 
+import numpy as np
 import networkx as nx
 from cupyx import jit
 from sagesim.breed import Breed
@@ -27,7 +28,8 @@ class SIRState(Enum):
 def step_func(
     tick,
     agent_index,
-    globals,
+    p_infection,
+    p_recovery,
     agent_ids,
     breeds,
     locations,
@@ -45,9 +47,8 @@ def step_func(
     # Draw a random float in [0, 1) for stochastic decision-making
     rand = random()
 
-    # Retrieve the global infection and recovery probabilities defined in the model
-    p_infection = globals[0]
-    p_recovery = globals[1]
+    # Retrieve the global infection and recovery probabilities from global tensors
+    # p_infection and p_recovery are scalars, auto-extracted by framework
 
     # Get the current state of the agent (e.g., susceptible, infected, recovered)
     agent_state = state_tensor[agent_index]
@@ -106,7 +107,7 @@ class SIRModel(Model):
         # Register the breed
         self.register_breed(breed=self._sir_breed)
 
-        # register user-defined global properties
+        # register global properties
         self.register_global_property("p_infection", p_infection)
         self.register_global_property("p_recovery", p_recovery)
 

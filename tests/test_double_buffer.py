@@ -2,6 +2,7 @@ import sys
 import unittest
 import networkx as nx
 import random
+import numpy as np
 import cupy as cp
 from cupyx import jit
 from pathlib import Path
@@ -20,7 +21,7 @@ from sagesim.utils import (
 def infection_step_func(
     tick,
     agent_index,
-    globals,
+    p_infection,
     agent_ids,
     breeds,
     locations,
@@ -32,8 +33,8 @@ def infection_step_func(
     # Get the list of neighboring indices (pre-converted from agent IDs by SAGESim)
     neighbor_indices = locations[agent_index]
 
-    # Get infection probability from globals (default p=1 for testing)
-    p_infection = globals[0]
+    # Get infection probability from global tensor
+    p_inf = p_infection  # scalar auto-extracted by framework
 
     # Get current agent state
     agent_state = int(get_this_agent_data_from_tensor(agent_index, state_tensor))
@@ -65,7 +66,8 @@ def infection_step_func(
 def infection_step_func_with_dummy(
     tick,
     agent_index,
-    globals,
+    p_infection,
+    p_recovery,
     agent_ids,
     breeds,
     locations,
@@ -78,8 +80,8 @@ def infection_step_func_with_dummy(
     # Get the list of neighboring indices (pre-converted from agent IDs by SAGESim)
     neighbor_indices = locations[agent_index]
 
-    # Get infection probability from globals (default p=1 for testing)
-    p_infection = globals[0]
+    # Get infection probability from global tensor
+    p_inf = p_infection  # scalar auto-extracted by framework
 
     # Get current agent state
     agent_state = int(get_this_agent_data_from_tensor(agent_index, state_tensor))
@@ -111,7 +113,8 @@ def infection_step_func_with_dummy(
 def recovery_step_func(
     tick,
     agent_index,
-    globals,
+    p_infection,
+    p_recovery,
     agent_ids,
     breeds,
     locations,
@@ -119,11 +122,11 @@ def recovery_step_func(
     dummy_tensor
 ):
     """
-    Step function for infection spread with probability p (default p=1 for testing)
+    Step function for recovery with probability p (default p=1 for testing)
     """
     dummy_tensor[agent_index] = dummy_tensor[agent_index] + 1  # test if write_dummy_tensor will be created
-    # Get infection probability from globals (default p=1 for testing)
-    p_recovery = globals[1]
+    # Get recovery probability from global tensor
+    p_rec = p_recovery  # scalar auto-extracted by framework
     
     # Get current agent state
     agent_state = int(get_this_agent_data_from_tensor(agent_index, state_tensor))
@@ -164,7 +167,7 @@ class SIModel(Model):
         
         # Register infection probability (default p=1 for testing)
         self.register_global_property("p_infection", p_infection)
-    
+
     def create_agent(self, state):
         agent_id = self.create_agent_of_breed(
             self._infection_breed, state=state
@@ -204,7 +207,6 @@ class SIRModel(Model):
         
         # Register infection probability (default p=1 for testing)
         self.register_global_property("p_infection", p_infection)
-        # Register recovery probability (default p=1 for testing)
         self.register_global_property("p_recovery", p_recovery)
     
     def create_agent(self, state):

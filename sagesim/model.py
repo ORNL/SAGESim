@@ -333,7 +333,12 @@ class Model:
         self._verbose_timing = verbose_timing
         self._agent_factory = AgentFactory(space, verbose_timing=verbose_timing)
         self._is_setup = False
-        self.globals = {}
+        # Globals — each registered global is a separate named tensor
+        self._global_tensors = []     # list of numpy arrays, registration order
+        self._global_names = {}       # name → index in _global_tensors
+        self._device_globals = []     # list of CuPy arrays (cached on GPU)
+        self._globals_dirty = True
+        self._seed = int(np.random.randint(0, 2**31))  # random by default
         self.tick = 0
         self._write_property_indices = set()  # Cache for write property indices
         # following may be set later in setup if distributed execution
@@ -451,18 +456,41 @@ class Model:
     def get_agents_with(self, query: Callable) -> Set[List[Any]]:
         return self._agent_factory.get_agents_with(query=query)
 
-    def register_global_property(
-        self, property_name: str, value: Union[float, int]
-    ) -> None:
-        self.globals[property_name] = value
+    def register_global_property(self, property_name: str, value) -> int:
+        """Register a global tensor. Value: scalar, list, or numpy array.
+        Shape is preserved on GPU. Returns index (position in kernel params).
+        """
+        idx = len(self._global_tensors)
+        arr = np.atleast_1d(np.asarray(value, dtype=np.float64))
+        self._global_tensors.append(arr)
+        self._global_names[property_name] = idx
+        self._globals_dirty = True
+        return idx
 
-    def set_global_property_value(
-        self, property_name: str, value: Union[float, int]
-    ) -> None:
-        self.globals[property_name] = value
+    def set_global_property_value(self, property_name: str, value) -> None:
+        """Update a registered global in-place. Must match original shape."""
+        idx = self._global_names[property_name]
+        arr = np.atleast_1d(np.asarray(value, dtype=np.float64))
+        self._global_tensors[idx][:] = arr
+        self._globals_dirty = True
 
-    def get_global_property_value(self, property_name: str) -> Union[float, int]:
-        return self.globals[property_name]
+    def get_global_property_value(self, property_name: str):
+        """Get the current value of a registered global."""
+        idx = self._global_names[property_name]
+        arr = self._global_tensors[idx]
+        if arr.size == 1:
+            return float(arr.flat[0])
+        return arr.copy()
+
+    @property
+    def globals(self):
+        """Dict view of registered globals: name → numpy array."""
+        return {name: self._global_tensors[idx]
+                for name, idx in self._global_names.items()}
+
+    def set_seed(self, seed: int) -> None:
+        """Set the random seed for reproducibility. If not called, a random seed is used."""
+        self._seed = int(seed)
 
     def load_partition(self, partition_file: str, format: str = "auto") -> None:
         """Load network partition from file to optimize multi-worker performance.
@@ -493,8 +521,7 @@ class Model:
 
         self._use_gpu = use_gpu
         self._skip_priority_barriers = skip_priority_barriers
-        # Generate global data tensor
-        self._global_data_vector = list(self.globals.values())
+        # Globals uploaded to GPU in _build_gpu_buffers()
         self.tick = 0
 
         ####
@@ -584,6 +611,7 @@ class Model:
             with open(self._step_function_file_path, "w", encoding="utf-8") as f:
                 f.write(
                     generate_gpu_func(
+                        len(self._global_tensors),
                         self._agent_factory.num_properties,
                         self._breed_idx_2_step_func_by_priority,
                         self._write_property_indices,
@@ -591,6 +619,7 @@ class Model:
                         extra_kernel_config=self._get_extra_kernel_config(),
                         skip_priority_barriers=self._skip_priority_barriers,
                         priority_values=self._priority_values,
+                        global_scalar_flags=[t.size == 1 for t in self._global_tensors],
                     )
                 )
         comm.barrier()
@@ -686,7 +715,7 @@ class Model:
 
     def reset(self) -> None:
         self.tick = 0
-        self._global_data_vector = list(self.globals.values())
+        self._globals_dirty = True  # re-upload on next _build_gpu_buffers
 
         # Sync GPU state back to AgentFactory before freeing
         if hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
@@ -836,8 +865,10 @@ class Model:
             sub_timing['id_gpu_upload'] = time.time() - _t1
             _t1 = time.time()
 
-        # 4. Upload global data vector
-        buf.global_data_vector = cp.array(self._global_data_vector)
+        # 4. Upload global tensors and seed to GPU
+        buf.device_globals = [cp.asarray(t) for t in self._global_tensors]
+        buf.seed_gpu = cp.int32(self._seed)
+        self._globals_dirty = False
 
         if do_time:
             sub_timing['id_global_data'] = time.time() - _t1
@@ -1142,9 +1173,15 @@ class Model:
         # Reset barrier counter and launch fused kernel
         t_kernel_launch_start = time.time()
         buf.barrier_counter[0] = 0
+        # Re-upload globals if dirty (changed since last upload)
+        if self._globals_dirty:
+            buf.device_globals = [cp.asarray(t) for t in self._global_tensors]
+            self._globals_dirty = False
+
         self._step_func[effective_blocks, threadsperblock](
             self.tick,
-            buf.global_data_vector,
+            buf.seed_gpu,
+            *buf.device_globals,
             *all_args,
             sync_workers_every_n_ticks,
             cp.float32(num_local_agents),
@@ -1465,7 +1502,7 @@ def _find_forwarded_location_funcs(step_func, num_properties):
     return result
 
 
-def _auto_transform_csr(source: str, num_properties: int) -> str:
+def _auto_transform_csr(source: str, num_properties: int, n_globals: int = 1) -> str:
     """
     Auto-transform a user's step function to use CSR format for property 1 (locations).
 
@@ -1489,17 +1526,17 @@ def _auto_transform_csr(source: str, num_properties: int) -> str:
 
     param_names = [arg.arg for arg in func_def.args.args]
 
-    # Standard params: tick, agent_index, globals, agent_ids (indices 0-3)
-    # Property params start at index 4
-    # Property 1 (locations) is at index 5 (4 standard + property 0)
-    if len(param_names) < 6:
+    # Standard params: tick, agent_index, [n_globals global params], agent_ids
+    # Property params start after standard params
+    # Property 0 (breeds) is first, property 1 (locations) is second
+    n_standard = 2 + n_globals + 1  # tick, agent_index, g0..gN, agent_ids
+    loc_idx = n_standard + 1  # property 0 (breeds) + 1
+
+    if len(param_names) <= loc_idx:
         return source
 
     agent_index_param = param_names[1]
-    locations_param = param_names[4 + 1]  # Property 1
-
-    # Step 1: Replace locations parameter with neighbor_offsets, neighbor_values
-    loc_idx = 5
+    locations_param = param_names[loc_idx]  # Property 1
     func_def.args.args[loc_idx] = ast.arg(arg='neighbor_offsets')
     func_def.args.args.insert(loc_idx + 1, ast.arg(arg='neighbor_values'))
 
@@ -1520,6 +1557,30 @@ def _auto_transform_csr(source: str, num_properties: int) -> str:
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
 
+    return ast.unparse(tree)
+
+
+def _inject_seed(source: str) -> str:
+    """Inject _seed param and prepend _seed to rand_* calls in a function source."""
+    tree = ast.parse(source)
+    func_def = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func_def = node
+            break
+    if func_def is None:
+        return source
+    # Insert _seed param at position 2 (after tick, agent_index) — skip if already present
+    existing_params = {arg.arg for arg in func_def.args.args}
+    if '_seed' not in existing_params:
+        func_def.args.args.insert(2, ast.arg(arg='_seed'))
+    # Prepend _seed to rand_* calls
+    _rand_funcs = {'rand_uniform_philox', 'rand_uniform_xorshift', 'rand_normal', 'rand_normal_bounded'}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in _rand_funcs:
+                node.args.insert(0, ast.Name(id='_seed', ctx=ast.Load()))
+    ast.fix_missing_locations(tree)
     return ast.unparse(tree)
 
 
@@ -1545,6 +1606,7 @@ def _gen_barrier_code(indent):
 
 
 def generate_gpu_func(
+    n_globals: int,
     n_properties: int,
     breed_idx_2_step_func_by_priority: List[List[Union[int, Callable]]],
     write_property_indices: Set[int],
@@ -1552,6 +1614,7 @@ def generate_gpu_func(
     extra_kernel_config: dict = None,
     skip_priority_barriers=False,
     priority_values: list = None,
+    global_scalar_flags: list = None,
 ) -> str:
     """
     Generate GPU function string with double buffering support for race condition prevention.
@@ -1625,7 +1688,10 @@ def generate_gpu_func(
         # Phase 1: CSR auto-transformation
         # Replaces locations param with neighbor_offsets, neighbor_values
         # and transforms body access patterns (loops, indexing, sentinel checks)
-        source = _auto_transform_csr(source, num_properties)
+        source = _auto_transform_csr(source, num_properties, n_globals)
+
+        # Phase 1b: Add _seed param and inject into rand_* calls
+        source = _inject_seed(source)
 
         # Phase 2: Double buffering
         # Parse the CSR-transformed source
@@ -1723,6 +1789,17 @@ def generate_gpu_func(
         return ast.unparse(tree)
 
     
+    # Generate global arguments (one per registered global tensor)
+    global_args = [f"g{i}" for i in range(n_globals)]
+
+    # For step function calls: auto-extract scalars with [0]
+    step_func_global_args = []
+    for i in range(n_globals):
+        if global_scalar_flags and i < len(global_scalar_flags) and global_scalar_flags[i]:
+            step_func_global_args.append(f"g{i}[0]")
+        else:
+            step_func_global_args.append(f"g{i}")
+
     # Generate read arguments (original properties)
     # Property 1 (locations) is replaced by two CSR arrays: neighbor_offsets, neighbor_values
     read_args = []
@@ -1769,7 +1846,8 @@ def generate_gpu_func(
             for helper_name, helper_obj in forwarded_funcs:
                 if helper_name not in transformed_helpers:
                     helper_source = inspect.getsource(helper_obj)
-                    transformed_helper = _auto_transform_csr(helper_source, n_properties)
+                    transformed_helper = _auto_transform_csr(helper_source, n_properties, n_globals)
+                    transformed_helper = _inject_seed(transformed_helper)
                     modified_step_functions.append(transformed_helper)
                     transformed_helpers.add(helper_name)
 
@@ -1810,7 +1888,9 @@ def generate_gpu_func(
             tick_body.append(f"\t\t\t\t{modified_step_func_name}(")
             tick_body.append("\t\t\t\t\tthread_local_tick,")
             tick_body.append("\t\t\t\t\t_real_idx,")
-            tick_body.append("\t\t\t\t\tdevice_global_data_vector,")
+            tick_body.append("\t\t\t\t\t_seed,")
+            if global_args:
+                tick_body.append(f"\t\t\t\t\t{','.join(step_func_global_args)},")
             tick_body.append("\t\t\t\t\tagent_ids,")
             tick_body.append(f"\t\t\t\t\t{','.join(args)},")
             tick_body.append("\t\t\t\t)")
@@ -1874,6 +1954,8 @@ def generate_gpu_func(
         range_params.extend([f"priority_{p}_start", f"priority_{p}_count"])
     joined_range_params = ",".join(range_params)
 
+    joined_global_args = ",".join(global_args) + "," if global_args else ""
+
     func = [
         "# Auto-generated fused GPU kernel with grid barriers",
         "# All priorities and ticks in a single kernel launch",
@@ -1886,7 +1968,8 @@ def generate_gpu_func(
         "@jit.rawkernel(device='cuda')",
         "def stepfunc(",
         "global_tick,",
-        "device_global_data_vector,",
+        "_seed,",
+        joined_global_args,
         joined_args + ",",
         "sync_workers_every_n_ticks,",
         "num_rank_local_agents,",

@@ -32,7 +32,6 @@ from sagesim.breed import Breed
 def write_counter_step_func(
     tick,
     agent_index,
-    globals,
     agent_ids,
     breeds,
     locations,
@@ -48,7 +47,6 @@ def write_counter_step_func(
 def read_and_multiply_step_func(
     tick,
     agent_index,
-    globals,
     agent_ids,
     breeds,
     locations,

@@ -29,7 +29,8 @@ class SIRState(Enum):
 def step_func(
     tick,
     agent_index,
-    globals,
+    p_infection,
+    p_recovery,
     agent_ids,
     breeds,
     locations,
@@ -47,10 +48,6 @@ def step_func(
 
     # Draw a random float in [0, 1) for stochastic decision-making
     rand = random()
-
-    # Retrieve the global infection and recovery probabilities defined in the model
-    p_infection = globals[0]
-    p_recovery = globals[1]
 
     # Get the current state of the agent (e.g., susceptible, infected, recovered)
     agent_state = state_tensor[agent_index]

@@ -277,7 +277,8 @@ class GPUBufferManager:
         self.neighbor_values = None     # CuPy int32 (CSR values, local indices for kernel)
         self.neighbor_values_ids = None # CuPy int32 (CSR values, agent IDs for MPI)
         self.agent_ids_gpu = None       # CuPy array of all agent IDs (local + ghost)
-        self.global_data_vector = None  # CuPy array
+        self.device_globals = []  # list of CuPy arrays, one per registered global
+        self.seed_gpu = None            # CuPy int32 scalar for framework-managed seed
         self.hash_map = None            # GPUHashMap instance
         self.barrier_counter = None     # CuPy uint32[1] for fused-kernel grid barrier
 
@@ -423,8 +424,12 @@ class GPUBufferManager:
             del buf
         self.write_buffers = []
 
+        for buf in self.device_globals:
+            del buf
+        self.device_globals = []
+
         for attr in ('neighbor_offsets', 'neighbor_values', 'neighbor_values_ids',
-                      'agent_ids_gpu', 'global_data_vector', 'barrier_counter'):
+                      'agent_ids_gpu', 'barrier_counter'):
             arr = getattr(self, attr, None)
             if arr is not None:
                 del arr
