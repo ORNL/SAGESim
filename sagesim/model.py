@@ -273,7 +273,8 @@ def _build_param_to_property_index_csr(param_names: list, num_properties: int) -
     return mapping
 
 
-def analyze_step_function_for_writes(step_func: Callable, num_properties: int) -> Set[int]:
+def analyze_step_function_for_writes(step_func: Callable, num_properties: int,
+                                      num_breed_local_params: int = 0) -> Set[int]:
     """Analyze step function to find which property indices need write buffers."""
     write_property_indices = set()
 
@@ -282,8 +283,14 @@ def analyze_step_function_for_writes(step_func: Callable, num_properties: int) -
     signature = inspect.signature(step_func)
     param_names = list(signature.parameters.keys())
 
+    # Strip breed-local params from end before property mapping
+    if num_breed_local_params > 0:
+        param_names_for_prop = param_names[:-num_breed_local_params]
+    else:
+        param_names_for_prop = param_names
+
     # Build param name → property index mapping (for ORIGINAL user step function)
-    param_to_prop = _build_param_to_property_index(param_names, num_properties)
+    param_to_prop = _build_param_to_property_index(param_names_for_prop, num_properties)
 
     # Get just the property param names for checking
     property_params = param_names[-num_properties:]
@@ -341,6 +348,8 @@ class Model:
         self._seed = int(np.random.randint(0, 2**31))  # random by default
         self.tick = 0
         self._write_property_indices = set()  # Cache for write property indices
+        # Breed-local arrays — separate per-breed GPU tensors (not padded across breeds)
+        self._breed_local_arrays = []  # list of dicts: {name, breed, shape_per_agent, ghost_exchange}
         # following may be set later in setup if distributed execution
 
     @property
@@ -488,6 +497,34 @@ class Model:
         return {name: self._global_tensors[idx]
                 for name, idx in self._global_names.items()}
 
+    def register_breed_local_array(self, name: str, breed: Breed, shape_per_agent: tuple,
+                                    ghost_exchange: bool = False) -> int:
+        """Register a named per-breed GPU array accessible from step functions.
+
+        Allocates one row per local agent of the given breed (+ ghost agents if
+        ghost_exchange=True). The framework builds an index map so step functions
+        can access the array via: array[idx_map[agent_index]].
+
+        Args:
+            name: Parameter name in step function signatures.
+            breed: The breed this array belongs to. Determines row count.
+            shape_per_agent: Column shape per agent (e.g. (50, 2) for 3D, (100,) for 2D).
+            ghost_exchange: If True, ghost agents get rows and data is exchanged via MPI.
+        """
+        idx = len(self._breed_local_arrays)
+        self._breed_local_arrays.append({
+            'name': name,
+            'breed': breed,
+            'shape_per_agent': shape_per_agent,
+            'ghost_exchange': ghost_exchange,
+        })
+        return idx
+
+    def get_breed_local_array(self, name: str) -> np.ndarray:
+        """Download a breed-local array from GPU to CPU."""
+        idx = next(i for i, b in enumerate(self._breed_local_arrays) if b['name'] == name)
+        return self._gpu_buffers.device_breed_locals[idx].get()
+
     def set_seed(self, seed: int) -> None:
         """Set the random seed for reproducibility. If not called, a random seed is used."""
         self._seed = int(seed)
@@ -570,7 +607,9 @@ class Model:
         for breed_idx_2_step_func in self._breed_idx_2_step_func_by_priority:
             for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
                 breed_step_func_impl, module_fpath = breed_step_func_info
-                write_indices = analyze_step_function_for_writes(breed_step_func_impl, self._agent_factory.num_properties)
+                write_indices = analyze_step_function_for_writes(
+                    breed_step_func_impl, self._agent_factory.num_properties,
+                    num_breed_local_params=len(self._breed_local_arrays) * 2)
                 self._write_property_indices.update(write_indices)
 
         # Exclude no_double_buffer properties from write buffer creation
@@ -620,6 +659,7 @@ class Model:
                         skip_priority_barriers=self._skip_priority_barriers,
                         priority_values=self._priority_values,
                         global_scalar_flags=[t.size == 1 for t in self._global_tensors],
+                        breed_local_names=[bla['name'] for bla in self._breed_local_arrays],
                     )
                 )
         comm.barrier()
@@ -978,6 +1018,30 @@ class Model:
         if do_time:
             sub_timing['write_bufs'] = time.time() - _t0
 
+        # 10. Allocate breed-local arrays and index maps
+        # Ghost agent rows are handled in _update_breed_local_ghost_maps() after
+        # exchange_ghost_data() populates ghost breed info.
+        buf.device_breed_locals = []
+        buf.device_breed_local_idxs = []
+
+        for bla in self._breed_local_arrays:
+            breed_id = bla['breed']._breedidx
+            # Count local agents of this breed
+            start, count = breed_ranges.get(breed_id, (0, 0))
+            total_rows = max(count, 1)  # at least 1 row to avoid empty tensor
+
+            # Allocate array (zeros)
+            shape = (total_rows, *bla['shape_per_agent'])
+            buf.device_breed_locals.append(cp.zeros(shape, dtype=cp.float64))
+
+            # Build index map: buffer_index → row in breed-local array
+            idx_map = np.full(agent_capacity, -1, dtype=np.int32)
+            row = 0
+            for i in range(start, start + count):
+                idx_map[i] = row
+                row += 1
+            buf.device_breed_local_idxs.append(cp.array(idx_map))
+
         buf.is_initialized = True
 
         return sub_timing if do_time else None
@@ -1190,6 +1254,8 @@ class Model:
             buf.barrier_counter,
             cp.int32(effective_blocks),
             *extra_kernel_args,
+            *buf.device_breed_locals,
+            *buf.device_breed_local_idxs,
         )
         if self._verbose_timing:
             t_kernel_launch_end = time.time()
@@ -1615,6 +1681,7 @@ def generate_gpu_func(
     skip_priority_barriers=False,
     priority_values: list = None,
     global_scalar_flags: list = None,
+    breed_local_names: list = None,
 ) -> str:
     """
     Generate GPU function string with double buffering support for race condition prevention.
@@ -1705,9 +1772,18 @@ def generate_gpu_func(
         param_names = [arg.arg for arg in func_def.args.args]
 
         # Build CSR-aware mapping (function now has num_properties + 1 property-like params)
-        param_to_prop = _build_param_to_property_index_csr(param_names, num_properties)
+        # Breed-local array params (array + idx_map each) are appended after properties,
+        # so we must strip them before the property-index mapping.
+        n_bla = len(breed_local_names or []) * 2  # 2 params per BLA: array + idx_map
+        if n_bla > 0:
+            # Strip breed-local params from end so _build_param_to_property_index_csr
+            # sees property params at the tail as expected
+            param_names_for_prop = param_names[:-n_bla]
+        else:
+            param_names_for_prop = param_names
+        param_to_prop = _build_param_to_property_index_csr(param_names_for_prop, num_properties)
         n_prop_params = num_properties + 1
-        property_params = param_names[-n_prop_params:]
+        property_params = param_names_for_prop[-n_prop_params:]
 
         # Create mapping from property parameter names to write parameter names
         param_to_write_param = {}
@@ -1892,7 +1968,12 @@ def generate_gpu_func(
             if global_args:
                 tick_body.append(f"\t\t\t\t\t{','.join(step_func_global_args)},")
             tick_body.append("\t\t\t\t\tagent_ids,")
+            # Property args (read + write buffers)
             tick_body.append(f"\t\t\t\t\t{','.join(args)},")
+            # Breed-local arrays and their index maps
+            if breed_local_names:
+                bla_args = breed_local_names + [n + '_idx' for n in breed_local_names]
+                tick_body.append(f"\t\t\t\t\t{','.join(bla_args)},")
             tick_body.append("\t\t\t\t)")
 
             # Inject extra post-step code from subclass config
@@ -1978,6 +2059,8 @@ def generate_gpu_func(
         "barrier_counter,",
         "num_blocks_param,",
         *[f"{p}," for p in (extra_kernel_config or {}).get('extra_kernel_params', [])],
+        *[f"{n}," for n in (breed_local_names or [])],
+        *[f"{n}_idx," for n in (breed_local_names or [])],
         "):",
         "\tthread_id = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x",
         "\ttotal_threads = jit.gridDim.x * jit.blockDim.x",

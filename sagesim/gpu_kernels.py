@@ -278,6 +278,8 @@ class GPUBufferManager:
         self.neighbor_values_ids = None # CuPy int32 (CSR values, agent IDs for MPI)
         self.agent_ids_gpu = None       # CuPy array of all agent IDs (local + ghost)
         self.device_globals = []  # list of CuPy arrays, one per registered global
+        self.device_breed_locals = []   # list of CuPy arrays, one per breed-local array
+        self.device_breed_local_idxs = []  # list of CuPy int32 index maps
         self.seed_gpu = None            # CuPy int32 scalar for framework-managed seed
         self.hash_map = None            # GPUHashMap instance
         self.barrier_counter = None     # CuPy uint32[1] for fused-kernel grid barrier
