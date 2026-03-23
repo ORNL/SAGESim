@@ -362,13 +362,26 @@ class Model:
         self._verbose_timing = value
         self._agent_factory._verbose_timing = value
 
+    def set_property_neighbor_visible(self, property_name: str, visible: bool) -> None:
+        """Override neighbor_visible flag for a built-in property (e.g. 'breed').
+
+        Must be called before setup().
+        """
+        if self._is_setup:
+            raise RuntimeError("Cannot change neighbor_visible after setup()")
+        af = self._agent_factory
+        if property_name not in af._property_name_2_neighbor_visible:
+            raise ValueError(f"Unknown property: {property_name}")
+        af._property_name_2_neighbor_visible[property_name] = visible
+        af._neighbor_visible_indices = []  # invalidate cache
+
     def register_breed(self, breed: Breed) -> None:
         if self._agent_factory.num_agents > 0:
             raise Exception(f"All breeds must be registered before agents are created!")
         self._agent_factory.register_breed(breed)
 
-    def create_agent_of_breed(self, breed: Breed, add_to_space=True, **kwargs) -> int:
-        agent_id = self._agent_factory.create_agent(breed, **kwargs)
+    def create_agent_of_breed(self, breed: Breed, add_to_space=True, rank: int = None, **kwargs) -> int:
+        agent_id = self._agent_factory.create_agent(breed, rank=rank, **kwargs)
         if add_to_space:
             self.get_space().add_agent(agent_id)
         return agent_id
@@ -416,51 +429,116 @@ class Model:
         return self._agent_factory._space
 
     def get_breed_data(self, breed_name, property_name):
-        """Download property data for all agents of a breed, gathered across MPI ranks.
+        """Download property data for all agents of a breed, gathered to rank 0.
 
-        Uses bulk GPU download (no per-agent Python calls). For multi-worker,
-        each rank downloads its local agents, then MPI Allgather combines them.
+        Uses GPU-Direct Gatherv when available (no GPU→CPU copy on non-root ranks).
+        Falls back to CPU-staged Gatherv otherwise.
 
         :param breed_name: Name of the breed (e.g., "Tree", "Site")
         :param property_name: Property to download (e.g., "params", "states_db")
-        :return: numpy array, shape (total_count, property_width)
+        :return: numpy array on rank 0, None on other ranks
         """
         breed = self._agent_factory._breeds[breed_name]
         buf = self._gpu_buffers
         start, count = buf.breed_ranges.get(breed._breedidx, (0, 0))
 
         prop_idx = self._agent_factory._property_name_2_index[property_name]
-        if count > 0:
-            local_data = buf.property_tensors[prop_idx][start:start + count].get()
-        else:
-            local_data = np.empty((0,), dtype=np.float32)
 
         comm = MPI.COMM_WORLD
         if comm.Get_size() == 1:
-            return local_data
-        all_data = comm.allgather(local_data)
-        return np.concatenate(all_data, axis=0)
+            if count > 0:
+                return buf.property_tensors[prop_idx][start:start + count].get()
+            return np.empty((0,), dtype=np.float32)
+
+        return self._gatherv_breed_gpu(
+            buf.property_tensors[prop_idx], start, count, comm)
 
     def get_breed_agent_ids(self, breed_name):
-        """Download agent IDs for all agents of a breed, gathered across MPI ranks.
+        """Download agent IDs for all agents of a breed, gathered to rank 0.
 
         :param breed_name: Name of the breed
-        :return: numpy array of agent IDs (float32)
+        :return: numpy array on rank 0, None on other ranks
         """
         breed = self._agent_factory._breeds[breed_name]
         buf = self._gpu_buffers
         start, count = buf.breed_ranges.get(breed._breedidx, (0, 0))
 
-        if count > 0:
-            local_ids = buf.agent_ids_gpu[start:start + count].get()
-        else:
-            local_ids = np.empty((0,), dtype=np.float32)
-
         comm = MPI.COMM_WORLD
         if comm.Get_size() == 1:
-            return local_ids
-        all_ids = comm.allgather(local_ids)
-        return np.concatenate(all_ids)
+            if count > 0:
+                return buf.agent_ids_gpu[start:start + count].get()
+            return np.empty((0,), dtype=np.float32)
+
+        return self._gatherv_breed_gpu(
+            buf.agent_ids_gpu, start, count, comm)
+
+    def _gatherv_breed_gpu(self, gpu_tensor, start, count, comm):
+        """Gatherv a slice of a GPU tensor to rank 0.
+
+        Uses GPU-Direct MPI when available, CPU staging otherwise.
+        Returns numpy array on rank 0, None on other ranks.
+        """
+        my_rank = comm.Get_rank()
+        num_workers = comm.Get_size()
+
+        # Width per agent (1D or 2D tensor)
+        if gpu_tensor.ndim > 1:
+            width = gpu_tensor.shape[1]
+        else:
+            width = 1
+        local_elems = count * width
+
+        # Gather counts from all ranks
+        all_counts = np.empty(num_workers, dtype=np.int32)
+        comm.Allgather(np.array([local_elems], dtype=np.int32), all_counts)
+        total_elems = int(all_counts.sum())
+
+        # Displacements for Gatherv
+        displs = np.zeros(num_workers, dtype=np.int32)
+        displs[1:] = np.cumsum(all_counts[:-1])
+
+        # Get local slice (stay on GPU if possible)
+        if count > 0:
+            local_gpu = gpu_tensor[start:start + count]
+            if local_gpu.ndim > 1:
+                local_gpu = local_gpu.ravel()
+        else:
+            local_gpu = None
+
+        gpu_aware = is_gpu_aware_mpi()
+
+        if gpu_aware and local_gpu is not None:
+            # GPU-Direct path: MPI reads GPU memory directly
+            send_buf = [local_gpu, local_elems, MPI.FLOAT]
+        else:
+            # CPU staging: download local slice
+            if local_gpu is not None:
+                local_cpu = local_gpu.get()
+            else:
+                local_cpu = np.empty(0, dtype=np.float32)
+            send_buf = [local_cpu, local_elems, MPI.FLOAT]
+
+        if my_rank == 0:
+            if gpu_aware:
+                recv_gpu = cp.empty(total_elems, dtype=cp.float32)
+                recv_buf = [recv_gpu, (all_counts, displs), MPI.FLOAT]
+            else:
+                recv_cpu = np.empty(total_elems, dtype=np.float32)
+                recv_buf = [recv_cpu, (all_counts, displs), MPI.FLOAT]
+        else:
+            recv_buf = None
+
+        comm.Gatherv(send_buf, recv_buf, root=0)
+
+        if my_rank == 0:
+            if gpu_aware:
+                result = recv_gpu.get()
+            else:
+                result = recv_cpu
+            if width > 1:
+                result = result.reshape(-1, width)
+            return result
+        return None
 
     def get_agents_with(self, query: Callable) -> Set[List[Any]]:
         return self._agent_factory.get_agents_with(query=query)
@@ -1018,29 +1096,53 @@ class Model:
         if do_time:
             sub_timing['write_bufs'] = time.time() - _t0
 
-        # 10. Allocate breed-local arrays and index maps
-        # Ghost agent rows are handled in _update_breed_local_ghost_maps() after
-        # exchange_ghost_data() populates ghost breed info.
+        # 10. Allocate breed-local arrays and index maps (with ghost rows)
         buf.device_breed_locals = []
         buf.device_breed_local_idxs = []
+        buf.breed_local_ghost_info = []  # per-BLA metadata for ghost exchange
+
+        num_ghost = len(ghost_ids)
+        agent2breed = self._agent_factory._agent2breed
 
         for bla in self._breed_local_arrays:
             breed_id = bla['breed']._breedidx
-            # Count local agents of this breed
             start, count = breed_ranges.get(breed_id, (0, 0))
-            total_rows = max(count, 1)  # at least 1 row to avoid empty tensor
 
-            # Allocate array (zeros)
+            ghost_rows = 0
+            ghost_breed_mask = None
+            if bla['ghost_exchange'] and num_ghost > 0:
+                ghost_breed_ids = np.array(
+                    [agent2breed.get(int(gid), -1) for gid in ghost_ids],
+                    dtype=np.int32)
+                ghost_breed_mask = (ghost_breed_ids == breed_id)
+                ghost_rows = int(ghost_breed_mask.sum())
+
+            total_rows = max(count + ghost_rows, 1)
             shape = (total_rows, *bla['shape_per_agent'])
-            buf.device_breed_locals.append(cp.zeros(shape, dtype=cp.float64))
+            buf.device_breed_locals.append(cp.zeros(shape, dtype=cp.float32))
 
-            # Build index map: buffer_index → row in breed-local array
+            # Vectorized index map: buffer_index → row in breed-local array
             idx_map = np.full(agent_capacity, -1, dtype=np.int32)
-            row = 0
-            for i in range(start, start + count):
-                idx_map[i] = row
-                row += 1
+            if count > 0:
+                idx_map[start:start + count] = np.arange(count, dtype=np.int32)
+
+            if ghost_breed_mask is not None and ghost_rows > 0:
+                ghost_offsets = np.where(ghost_breed_mask)[0]
+                idx_map[num_local_agents + ghost_offsets] = np.arange(
+                    count, count + ghost_rows, dtype=np.int32)
+
             buf.device_breed_local_idxs.append(cp.array(idx_map))
+
+            # Store ghost metadata for CommunicationManager
+            if bla['ghost_exchange']:
+                buf.breed_local_ghost_info.append({
+                    'breed_id': breed_id,
+                    'local_rows': count,
+                    'ghost_rows': ghost_rows,
+                    'shape_per_agent': bla['shape_per_agent'],
+                })
+            else:
+                buf.breed_local_ghost_info.append(None)
 
         buf.is_initialized = True
 
@@ -1627,7 +1729,11 @@ def _auto_transform_csr(source: str, num_properties: int, n_globals: int = 1) ->
 
 
 def _inject_seed(source: str) -> str:
-    """Inject _seed param and prepend _seed to rand_* calls in a function source."""
+    """Inject _seed param and prepend _seed to rand_* calls in a function source.
+
+    Also replaces `agent_index` with `agent_ids[agent_index]` in rand_* calls
+    so the PRNG keys on the global agent ID (rank-agnostic determinism).
+    """
     tree = ast.parse(source)
     func_def = None
     for node in ast.walk(tree):
@@ -1640,12 +1746,25 @@ def _inject_seed(source: str) -> str:
     existing_params = {arg.arg for arg in func_def.args.args}
     if '_seed' not in existing_params:
         func_def.args.args.insert(2, ast.arg(arg='_seed'))
-    # Prepend _seed to rand_* calls
+    # Prepend _seed and replace agent_index with agent_ids[agent_index] in rand_* calls
     _rand_funcs = {'rand_uniform_philox', 'rand_uniform_xorshift', 'rand_normal', 'rand_normal_bounded'}
+    # Build AST node for agent_ids[agent_index]
+    def _make_agent_id_lookup():
+        return ast.Subscript(
+            value=ast.Name(id='agent_ids', ctx=ast.Load()),
+            slice=ast.Name(id='agent_index', ctx=ast.Load()),
+            ctx=ast.Load(),
+        )
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in _rand_funcs:
                 node.args.insert(0, ast.Name(id='_seed', ctx=ast.Load()))
+                # After seed insertion, args are: [_seed, tick, agent_index, salt, ...]
+                # Replace arg at index 2 (agent_index) with agent_ids[agent_index]
+                if (len(node.args) > 2
+                        and isinstance(node.args[2], ast.Name)
+                        and node.args[2].id == 'agent_index'):
+                    node.args[2] = _make_agent_id_lookup()
     ast.fix_missing_locations(tree)
     return ast.unparse(tree)
 

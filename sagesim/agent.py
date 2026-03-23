@@ -43,12 +43,13 @@ class AgentFactory:
             "locations": 1,
         }
         # Track which properties need to be sent to neighbors during MPI sync
-        # Default: breed and locations are NOT neighbor-visible (never read by neighbors)
+        # Default: breed is neighbor-visible (safe default); locations uses CSR (not exchanged)
         self._property_name_2_neighbor_visible = OrderedDict(
-            {"breed": False, "locations": False}
+            {"breed": True, "locations": False}
         )
         self._neighbor_visible_indices: List[int] = []  # Cached list of neighbor-visible property indices
         self._agent2rank = {}  # global
+        self._agent2breed = {}  # global: agent_id -> breed_id (populated by all ranks)
         self._rank2agentid2agentidx = {}  # global
 
         self._current_rank = 0
@@ -307,12 +308,14 @@ class AgentFactory:
                 self._property_name_2_defaults[property_name] = default
                 self._property_name_2_neighbor_visible[property_name] = neighbor_visible
 
-    def create_agent(self, breed: Breed, **kwargs) -> int:
+    def create_agent(self, breed: Breed, rank: int = None, **kwargs) -> int:
         """
         Creates and agent of the given breed initialized with the properties given in
             **kwargs.
 
         :param breed: Breed definition of agent
+        :param rank: Target rank for this agent. If provided, overrides partition and
+            round-robin. If None, uses partition mapping or round-robin fallback.
         :param **kwargs: named arguments of agent properties. Names much match properties
             already registered in breed.
         :return: Agent ID
@@ -321,18 +324,19 @@ class AgentFactory:
 
         agent_id = self._num_agents
 
-        # Assign agent to rank: use partition if loaded, otherwise round-robin
-        if self._partition_loaded and agent_id in self._partition_mapping:
-            # Use pre-loaded partition
+        # Assign agent to rank: explicit > partition > round-robin
+        if rank is not None:
+            assigned_rank = rank
+        elif self._partition_loaded and agent_id in self._partition_mapping:
             assigned_rank = self._partition_mapping[agent_id]
         else:
-            # Fall back to round-robin assignment
             assigned_rank = self._current_rank
             self._current_rank += 1
             if self._current_rank >= num_workers:
                 self._current_rank = 0
 
         self._agent2rank[agent_id] = assigned_rank
+        self._agent2breed[agent_id] = self._breeds[breed.name]._breedidx
         agentid2agentidx_of_current_rank = self._rank2agentid2agentidx.get(
             assigned_rank, OrderedDict()
         )
@@ -506,6 +510,7 @@ class AgentFactory:
         """
         if breed.name not in self._breeds:
             raise ValueError(f"Fatal: unregistered breed {breed.name}")
+        self._agent2breed[agent_id] = self._breeds[breed.name]._breedidx
         for property_name in self._property_name_2_agent_data_tensor:
             if property_name == "breed":
                 self._property_name_2_agent_data_tensor[property_name][local_idx] = (

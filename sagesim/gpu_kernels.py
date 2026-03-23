@@ -500,6 +500,12 @@ class CommunicationManager:
         # Write-buffer ghost index (concatenated recv indices for write props)
         self._write_prop_mask = []  # indices into buf.sorted_write_indices that are visible
 
+        # Breed-local array ghost exchange (combined into same MPI message)
+        self._bla_configs = []       # per-BLA: {stride, send_counts, recv_counts, batched_send_rows, batched_recv_rows, send_splits, recv_splits} or None
+        self._bla_initialized = False
+        self._bla_extra_send_size = {}  # per-peer extra float32 elements for BLA data
+        self._bla_extra_recv_size = {}
+
         self._gpu_aware_mpi = is_gpu_aware_mpi()
         self._is_initialized = False
 
@@ -667,20 +673,86 @@ class CommunicationManager:
             )
             self.recv_counts[src_rank] = len(remote_ids)
 
-        # 7. Pre-allocate send/recv CPU and GPU buffers
+        # ---- Build breed-local array ghost exchange maps ----
+        bla_ghost_infos = getattr(buf, 'breed_local_ghost_info', [])
+        agent2breed = self.agent_factory._agent2breed
+        self._bla_configs = []
+        self._bla_extra_send_size = {}
+        self._bla_extra_recv_size = {}
+
+        if bla_ghost_infos and has_cross_rank_work:
+            # Buffer_index → breed_id lookup (CPU)
+            buf_breeds = np.array(
+                [agent2breed.get(int(aid), -1)
+                 for aid in buf.all_agent_ids_list[:buf.num_total_agents]],
+                dtype=np.int32)
+
+            for bla_i, info in enumerate(bla_ghost_infos):
+                if info is None:
+                    self._bla_configs.append(None)
+                    continue
+
+                breed_id = info['breed_id']
+                stride = 1
+                for s in info['shape_per_agent']:
+                    stride *= s
+
+                bla_idx_map = buf.device_breed_local_idxs[bla_i].get()
+
+                bla_send_counts = {}
+                bla_recv_counts = {}
+                bla_send_rows_per_peer = {}
+                bla_recv_rows_per_peer = {}
+
+                for dest_rank in self.send_indices_gpu:
+                    cpu_indices = self.send_indices_gpu[dest_rank].get().astype(np.int32)
+                    mask = buf_breeds[cpu_indices] == breed_id
+                    filtered = cpu_indices[mask]
+                    bla_rows = bla_idx_map[filtered]
+                    bla_send_counts[dest_rank] = len(bla_rows)
+                    bla_send_rows_per_peer[dest_rank] = bla_rows
+
+                for src_rank in self.recv_indices_gpu:
+                    cpu_indices = self.recv_indices_gpu[src_rank].get().astype(np.int32)
+                    mask = buf_breeds[cpu_indices] == breed_id
+                    filtered = cpu_indices[mask]
+                    bla_rows = bla_idx_map[filtered]
+                    bla_recv_counts[src_rank] = len(bla_rows)
+                    bla_recv_rows_per_peer[src_rank] = bla_rows
+
+                self._bla_configs.append({
+                    'stride': stride,
+                    'send_counts': bla_send_counts,
+                    'recv_counts': bla_recv_counts,
+                    'bla_send_rows_per_peer': bla_send_rows_per_peer,
+                    'bla_recv_rows_per_peer': bla_recv_rows_per_peer,
+                })
+
+                for r in self.send_counts:
+                    self._bla_extra_send_size[r] = (
+                        self._bla_extra_send_size.get(r, 0)
+                        + bla_send_counts.get(r, 0) * stride)
+                for r in self.recv_counts:
+                    self._bla_extra_recv_size[r] = (
+                        self._bla_extra_recv_size.get(r, 0)
+                        + bla_recv_counts.get(r, 0) * stride)
+
+        self._bla_initialized = any(c is not None for c in self._bla_configs)
+
+        # 7. Pre-allocate send/recv CPU and GPU buffers (includes BLA data)
         self.send_bufs_cpu = {}
         self.send_bufs_gpu = {}
         self.recv_bufs_cpu = {}
         self.recv_bufs_gpu = {}
 
         for dest_rank, count in self.send_counts.items():
-            size = count * self.total_stride
+            size = count * self.total_stride + self._bla_extra_send_size.get(dest_rank, 0)
             self.send_bufs_gpu[dest_rank] = cp.empty(size, dtype=cp.float32)
             if not self._gpu_aware_mpi:
                 self.send_bufs_cpu[dest_rank] = np.empty(size, dtype=np.float32)
 
         for src_rank, count in self.recv_counts.items():
-            size = count * self.total_stride
+            size = count * self.total_stride + self._bla_extra_recv_size.get(src_rank, 0)
             if self._gpu_aware_mpi:
                 self.recv_bufs_gpu[src_rank] = cp.empty(size, dtype=cp.float32)
             else:
@@ -729,6 +801,47 @@ class CommunicationManager:
             self._prop_cum_widths[prop_idx] = cum
             cum += self.property_widths[prop_idx]
 
+        # Build batched BLA index arrays (for ONE gather/scatter per BLA)
+        if self._bla_initialized:
+            for bla_i, cfg in enumerate(self._bla_configs):
+                if cfg is None:
+                    continue
+                # Batched send rows
+                send_parts = [cfg['bla_send_rows_per_peer'].get(r, np.array([], dtype=np.int32))
+                              for r in self._send_peer_order]
+                if any(len(p) > 0 for p in send_parts):
+                    cfg['batched_send_rows'] = cp.array(
+                        np.concatenate(send_parts), dtype=cp.int32)
+                    send_splits = []
+                    c = 0
+                    for r in self._send_peer_order:
+                        c += cfg['send_counts'].get(r, 0)
+                        send_splits.append(c)
+                    cfg['send_splits'] = send_splits
+                else:
+                    cfg['batched_send_rows'] = cp.array([], dtype=cp.int32)
+                    cfg['send_splits'] = []
+
+                # Batched recv rows
+                recv_parts = [cfg['bla_recv_rows_per_peer'].get(r, np.array([], dtype=np.int32))
+                              for r in self._recv_peer_order]
+                if any(len(p) > 0 for p in recv_parts):
+                    cfg['batched_recv_rows'] = cp.array(
+                        np.concatenate(recv_parts), dtype=cp.int32)
+                    recv_splits = []
+                    c = 0
+                    for r in self._recv_peer_order:
+                        c += cfg['recv_counts'].get(r, 0)
+                        recv_splits.append(c)
+                    cfg['recv_splits'] = recv_splits
+                else:
+                    cfg['batched_recv_rows'] = cp.array([], dtype=cp.int32)
+                    cfg['recv_splits'] = []
+
+                # Remove temporary per-peer dicts (no longer needed)
+                del cfg['bla_send_rows_per_peer']
+                del cfg['bla_recv_rows_per_peer']
+
         self._is_initialized = True
 
     def _batched_gpu_pack(self):
@@ -761,6 +874,29 @@ class CommunicationManager:
                 self.send_bufs_gpu[dest_rank][off:off + n * width] = chunk
                 peer_offsets[dest_rank] = off + n * width
                 agent_start += n
+
+        # Pack breed-local array data (appended after property data)
+        if self._bla_initialized:
+            for bla_i, cfg in enumerate(self._bla_configs):
+                if cfg is None:
+                    continue
+                batched_rows = cfg['batched_send_rows']
+                if len(batched_rows) == 0:
+                    continue
+                stride = cfg['stride']
+                # ONE gather from breed-local array
+                gathered = self.buf.device_breed_locals[bla_i][batched_rows].ravel()
+                # Split per-peer and append to send buffers
+                agent_start = 0
+                for j, dest_rank in enumerate(self._send_peer_order):
+                    m = cfg['send_counts'].get(dest_rank, 0)
+                    if m == 0:
+                        continue
+                    chunk = gathered[agent_start * stride:(agent_start + m) * stride]
+                    off = peer_offsets[dest_rank]
+                    self.send_bufs_gpu[dest_rank][off:off + m * stride] = chunk
+                    peer_offsets[dest_rank] = off + m * stride
+                    agent_start += m
 
         # CPU staging: one .get() per peer
         if not self._gpu_aware_mpi:
@@ -855,7 +991,7 @@ class CommunicationManager:
         if total_n == 0:
             return
 
-        # Get per-peer recv data on GPU
+        # Get per-peer recv data on GPU (full buffer including BLA data)
         if self._gpu_aware_mpi:
             peer_recv_gpu = {r: self.recv_bufs_gpu[r] for r in self._recv_peer_order}
         else:
@@ -863,11 +999,12 @@ class CommunicationManager:
             cpu_parts = [self.recv_bufs_cpu[r] for r in self._recv_peer_order]
             combined = np.concatenate(cpu_parts) if len(cpu_parts) > 1 else cpu_parts[0]
             all_recv_gpu = cp.array(combined)
-            # Split back into per-peer GPU views
+            # Split back into per-peer GPU views (full size including BLA)
             peer_recv_gpu = {}
             pos = 0
             for r in self._recv_peer_order:
-                size = self.recv_counts[r] * self.total_stride
+                size = (self.recv_counts[r] * self.total_stride
+                        + self._bla_extra_recv_size.get(r, 0))
                 peer_recv_gpu[r] = all_recv_gpu[pos:pos + size]
                 pos += size
 
@@ -892,6 +1029,36 @@ class CommunicationManager:
             prop_idx = buf.sorted_write_indices[i]
             buf.write_buffers[i][all_ghost_indices] = \
                 buf.property_tensors[prop_idx][all_ghost_indices]
+
+        # Unpack breed-local array ghost data (after property data in each peer's buffer)
+        if self._bla_initialized:
+            # Track per-peer read offset (BLA data starts after property data)
+            peer_bla_offsets = {r: self.recv_counts[r] * self.total_stride
+                                for r in self._recv_peer_order}
+
+            for bla_i, cfg in enumerate(self._bla_configs):
+                if cfg is None:
+                    continue
+                batched_rows = cfg['batched_recv_rows']
+                if len(batched_rows) == 0:
+                    continue
+                stride = cfg['stride']
+                shape_per_agent = buf.breed_local_ghost_info[bla_i]['shape_per_agent']
+
+                # Extract BLA data from each peer's buffer and concatenate
+                chunks = []
+                for r in self._recv_peer_order:
+                    m = cfg['recv_counts'].get(r, 0)
+                    if m == 0:
+                        continue
+                    off = peer_bla_offsets[r]
+                    chunks.append(peer_recv_gpu[r][off:off + m * stride])
+                    peer_bla_offsets[r] = off + m * stride
+
+                if chunks:
+                    bla_data = cp.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+                    bla_data = bla_data.reshape(len(batched_rows), *shape_per_agent)
+                    buf.device_breed_locals[bla_i][batched_rows] = bla_data
 
     def exchange_ghost_data(self):
         """Full ghost exchange: batched GPU pack -> MPI -> batched GPU unpack."""
@@ -934,13 +1101,15 @@ class CommunicationManager:
         if self._verbose_timing:
             timing_data['mpi_gpu_unpack'] = time.perf_counter() - t_unpack_start
 
-            # Communication volume metrics
+            # Communication volume metrics (property + BLA data)
             timing_data['mpi_send_bytes'] = sum(
-                self.send_counts[r] * self.total_stride * 4  # 4 bytes per float32
+                (self.send_counts[r] * self.total_stride
+                 + self._bla_extra_send_size.get(r, 0)) * 4
                 for r in self._send_peer_order
             )
             timing_data['mpi_recv_bytes'] = sum(
-                self.recv_counts[r] * self.total_stride * 4
+                (self.recv_counts[r] * self.total_stride
+                 + self._bla_extra_recv_size.get(r, 0)) * 4
                 for r in self._recv_peer_order
             )
             timing_data['mpi_num_peers'] = len(self._send_peer_order)
