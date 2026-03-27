@@ -9,8 +9,9 @@ dynamic = ["dependencies", "optional-dependencies"]
 
 requires-python = ">=3.11"
 authors = [
-  {name = "Chathika Gunaratne", email = "chathikagunaratne@gmail.com"},
-  {name = "Xi Zhang", email = "cc.zhang1992@gmail.com"}
+  {name = "Xi Zhang", email = "cc.zhang1992@gmail.com"},
+  {name = "Chathika Gunaratne", email = "chathikagunaratne@gmail.com"}
+
 ]
 maintainers = [
   {name = "Xi Zhang", email = "cc.zhang1992@gmail.com"}
