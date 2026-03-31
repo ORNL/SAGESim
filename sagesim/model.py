@@ -326,6 +326,32 @@ def analyze_step_function_for_writes(step_func: Callable, num_properties: int,
     return write_property_indices
 
 
+def analyze_step_function_for_bla_writes(step_func: Callable,
+                                          bla_names: List[str]) -> Set[str]:
+    """Analyze step function to find which breed-local array names are written to."""
+    written_bla_names = set()
+    source = inspect.getsource(step_func)
+    tree = ast.parse(source)
+
+    bla_name_set = set(bla_names)
+
+    def check_target(target_node):
+        if isinstance(target_node, ast.Name):
+            if target_node.id in bla_name_set:
+                written_bla_names.add(target_node.id)
+        elif isinstance(target_node, ast.Subscript):
+            check_target(target_node.value)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                check_target(target)
+        elif isinstance(node, ast.AugAssign):
+            check_target(node.target)
+
+    return written_bla_names
+
+
 class Model:
 
     def __init__(
@@ -346,10 +372,11 @@ class Model:
         self._device_globals = []     # list of CuPy arrays (cached on GPU)
         self._globals_dirty = True
         self._seed = int(np.random.randint(0, 2**31))  # random by default
+        self._logical_id_map = {}  # agent_id -> logical_id (for stable RNG)
         self.tick = 0
         self._write_property_indices = set()  # Cache for write property indices
         # Breed-local arrays — separate per-breed GPU tensors (not padded across breeds)
-        self._breed_local_arrays = []  # list of dicts: {name, breed, shape_per_agent, ghost_exchange}
+        self._breed_local_arrays = []  # list of dicts: {name, breed, shape_per_agent, neighbor_visible}
         # following may be set later in setup if distributed execution
 
     @property
@@ -576,25 +603,29 @@ class Model:
                 for name, idx in self._global_names.items()}
 
     def register_breed_local_array(self, name: str, breed: Breed, shape_per_agent: tuple,
-                                    ghost_exchange: bool = False) -> int:
+                                    neighbor_visible: bool = False) -> int:
         """Register a named per-breed GPU array accessible from step functions.
 
         Allocates one row per local agent of the given breed (+ ghost agents if
-        ghost_exchange=True). The framework builds an index map so step functions
+        neighbor_visible=True). The framework builds an index map so step functions
         can access the array via: array[idx_map[agent_index]].
+
+        Double-buffering follows the same rules as properties: SAGESim detects
+        writes and creates write buffers unless the array name is listed in
+        a step function's no_double_buffer parameter.
 
         Args:
             name: Parameter name in step function signatures.
             breed: The breed this array belongs to. Determines row count.
             shape_per_agent: Column shape per agent (e.g. (50, 2) for 3D, (100,) for 2D).
-            ghost_exchange: If True, ghost agents get rows and data is exchanged via MPI.
+            neighbor_visible: If True, ghost agents get rows and data is exchanged via MPI.
         """
         idx = len(self._breed_local_arrays)
         self._breed_local_arrays.append({
             'name': name,
             'breed': breed,
             'shape_per_agent': shape_per_agent,
-            'ghost_exchange': ghost_exchange,
+            'neighbor_visible': neighbor_visible,
         })
         return idx
 
@@ -606,6 +637,19 @@ class Model:
     def set_seed(self, seed: int) -> None:
         """Set the random seed for reproducibility. If not called, a random seed is used."""
         self._seed = int(seed)
+
+    def set_agent_logical_id(self, agent_id: int, logical_id: int) -> None:
+        """Set a stable logical ID used as the RNG key for this agent.
+
+        By default, the RNG uses the global agent_id (creation-order) as
+        the Philox counter key.  When logical IDs are set, the RNG uses
+        them instead, making random sequences independent of agent
+        creation order.  Call before setup().
+
+        :param agent_id: Global agent ID returned by create_agent_of_breed
+        :param logical_id: Stable identifier (e.g. site_slot, gap_index)
+        """
+        self._logical_id_map[int(agent_id)] = int(logical_id)
 
     def load_partition(self, partition_file: str, format: str = "auto") -> None:
         """Load network partition from file to optimize multi-worker performance.
@@ -688,10 +732,24 @@ class Model:
                 write_indices = analyze_step_function_for_writes(
                     breed_step_func_impl, self._agent_factory.num_properties,
                     num_breed_local_params=len(self._breed_local_arrays) * 2)
+                # Note: num_breed_local_params=N*2 is for the ORIGINAL step func (before DB transform).
+                # The write analysis runs on original source which has array+idx per BLA.
                 self._write_property_indices.update(write_indices)
 
         # Exclude no_double_buffer properties from write buffer creation
         self._write_property_indices = self._write_property_indices - no_double_buffer_indices
+
+        # Determine which breed-local arrays need write buffers
+        bla_names = [bla['name'] for bla in self._breed_local_arrays]
+        no_double_buffer_bla_names = no_double_buffer_prop_names & set(bla_names)
+        self._write_bla_names = set()
+        for breed_idx_2_step_func in self._breed_idx_2_step_func_by_priority:
+            for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
+                breed_step_func_impl, module_fpath = breed_step_func_info
+                written = analyze_step_function_for_bla_writes(
+                    breed_step_func_impl, bla_names)
+                self._write_bla_names.update(written)
+        self._write_bla_names = self._write_bla_names - no_double_buffer_bla_names
 
 
         # Sort write property indices for consistent ordering
@@ -738,6 +796,7 @@ class Model:
                         priority_values=self._priority_values,
                         global_scalar_flags=[t.size == 1 for t in self._global_tensors],
                         breed_local_names=[bla['name'] for bla in self._breed_local_arrays],
+                        write_bla_names=self._write_bla_names,
                     )
                 )
         comm.barrier()
@@ -801,6 +860,20 @@ class Model:
           'post_breed_step_code': list[tuple]      — [(code_lines, once_per_breed[, only_priority]), ...]
         """
         return {}
+
+    def _build_bla_launch_args(self, buf):
+        """Build kernel launch args for breed-local arrays.
+
+        For each BLA, emits: array, [write_array if double-buffered], idx_map.
+        """
+        args = []
+        for i, bla in enumerate(self._breed_local_arrays):
+            args.append(buf.device_breed_locals[i])
+            wb = buf.device_breed_local_write_bufs[i] if i < len(buf.device_breed_local_write_bufs) else None
+            if wb is not None:
+                args.append(wb)
+            args.append(buf.device_breed_local_idxs[i])
+        return args
 
     def _prepare_kernel_extras(self, num_local_agents, sync_ticks) -> tuple:
         """Override to allocate/reset extra GPU buffers. Returns extra kernel args tuple."""
@@ -979,6 +1052,15 @@ class Model:
         agent_ids_padded[:buf.num_total_agents] = all_agent_ids_np.astype(np.float32)
         buf.agent_ids_gpu = cp.array(agent_ids_padded)
 
+        # 3b. Build logical_ids for stable RNG (defaults to agent_ids if not set)
+        logical_ids_padded = agent_ids_padded.copy()
+        if self._logical_id_map:
+            for aid, lid in self._logical_id_map.items():
+                idx = agent_id_to_index.get(int(aid))
+                if idx is not None:
+                    logical_ids_padded[idx] = float(lid)
+        buf.logical_ids_gpu = cp.array(logical_ids_padded)
+
         if do_time:
             sub_timing['id_gpu_upload'] = time.time() - _t1
             _t1 = time.time()
@@ -1110,7 +1192,7 @@ class Model:
 
             ghost_rows = 0
             ghost_breed_mask = None
-            if bla['ghost_exchange'] and num_ghost > 0:
+            if bla['neighbor_visible'] and num_ghost > 0:
                 ghost_breed_ids = np.array(
                     [agent2breed.get(int(gid), -1) for gid in ghost_ids],
                     dtype=np.int32)
@@ -1134,7 +1216,7 @@ class Model:
             buf.device_breed_local_idxs.append(cp.array(idx_map))
 
             # Store ghost metadata for CommunicationManager
-            if bla['ghost_exchange']:
+            if bla['neighbor_visible']:
                 buf.breed_local_ghost_info.append({
                     'breed_id': breed_id,
                     'local_rows': count,
@@ -1143,6 +1225,15 @@ class Model:
                 })
             else:
                 buf.breed_local_ghost_info.append(None)
+
+        # 11. Allocate write buffers for double-buffered breed-local arrays
+        buf.device_breed_local_write_bufs = []
+        for i, bla in enumerate(self._breed_local_arrays):
+            if bla['name'] in self._write_bla_names:
+                buf.device_breed_local_write_bufs.append(
+                    buf.device_breed_locals[i].copy())
+            else:
+                buf.device_breed_local_write_bufs.append(None)
 
         buf.is_initialized = True
 
@@ -1353,11 +1444,11 @@ class Model:
             cp.float32(num_local_agents),
             *range_args,
             buf.agent_ids_gpu,
+            buf.logical_ids_gpu,
             buf.barrier_counter,
             cp.int32(effective_blocks),
             *extra_kernel_args,
-            *buf.device_breed_locals,
-            *buf.device_breed_local_idxs,
+            *self._build_bla_launch_args(buf),
         )
         if self._verbose_timing:
             t_kernel_launch_end = time.time()
@@ -1396,6 +1487,11 @@ class Model:
         for i, prop_idx in enumerate(buf.sorted_write_indices):
             buf.property_tensors[prop_idx][:num_local_agents] = \
                 buf.write_buffers[i][:num_local_agents]
+        # Write-back for double-buffered breed-local arrays
+        for i, wb in enumerate(buf.device_breed_local_write_bufs):
+            if wb is not None:
+                n = buf.device_breed_locals[i].shape[0]
+                buf.device_breed_locals[i][:n] = wb[:n]
         if self._verbose_timing:
             timing_data['write_back'] = time.time() - t_writeback_start
         # No sync needed here: these are GPU→GPU copies. Next tick's
@@ -1746,12 +1842,24 @@ def _inject_seed(source: str) -> str:
     existing_params = {arg.arg for arg in func_def.args.args}
     if '_seed' not in existing_params:
         func_def.args.args.insert(2, ast.arg(arg='_seed'))
-    # Prepend _seed and replace agent_index with agent_ids[agent_index] in rand_* calls
+    # Insert logical_ids param right after agent_ids — skip if already present
+    if 'logical_ids' not in existing_params:
+        # Find agent_ids position and insert logical_ids after it
+        agent_ids_pos = None
+        for i, arg in enumerate(func_def.args.args):
+            if arg.arg == 'agent_ids':
+                agent_ids_pos = i
+                break
+        if agent_ids_pos is not None:
+            func_def.args.args.insert(agent_ids_pos + 1, ast.arg(arg='logical_ids'))
+    # Prepend _seed and replace agent_index with logical_ids[agent_index] in rand_* calls
+    # logical_ids defaults to agent_ids if no logical IDs are set by the user,
+    # but allows stable RNG keys independent of agent creation order.
     _rand_funcs = {'rand_uniform_philox', 'rand_uniform_xorshift', 'rand_normal', 'rand_normal_bounded'}
-    # Build AST node for agent_ids[agent_index]
+    # Build AST node for logical_ids[agent_index]
     def _make_agent_id_lookup():
         return ast.Subscript(
-            value=ast.Name(id='agent_ids', ctx=ast.Load()),
+            value=ast.Name(id='logical_ids', ctx=ast.Load()),
             slice=ast.Name(id='agent_index', ctx=ast.Load()),
             ctx=ast.Load(),
         )
@@ -1790,6 +1898,37 @@ def _gen_barrier_code(indent):
     ]
 
 
+def _gen_bla_kernel_params(breed_local_names, write_bla_names):
+    """Generate kernel parameter list for breed-local arrays.
+
+    For each BLA: array, [write_array if double-buffered], idx_map.
+    """
+    params = []
+    write_bla = write_bla_names or set()
+    for n in (breed_local_names or []):
+        params.append(f"{n},")
+        if n in write_bla:
+            params.append(f"write_{n},")
+        params.append(f"{n}_idx,")
+    return params
+
+
+def _gen_bla_step_func_args(breed_local_names, write_bla_names):
+    """Generate step function call args for breed-local arrays.
+
+    For each BLA: array, [write_array if double-buffered], idx_map.
+    Matches the order in _gen_bla_kernel_params.
+    """
+    args = []
+    write_bla = write_bla_names or set()
+    for n in (breed_local_names or []):
+        args.append(n)
+        if n in write_bla:
+            args.append(f"write_{n}")
+        args.append(f"{n}_idx")
+    return args
+
+
 def generate_gpu_func(
     n_globals: int,
     n_properties: int,
@@ -1801,6 +1940,7 @@ def generate_gpu_func(
     priority_values: list = None,
     global_scalar_flags: list = None,
     breed_local_names: list = None,
+    write_bla_names: set = None,
 ) -> str:
     """
     Generate GPU function string with double buffering support for race condition prevention.
@@ -1863,7 +2003,8 @@ def generate_gpu_func(
 
     """
     
-    def generate_modified_step_func_code(step_func: Callable, write_indices: Set[int], num_properties: int) -> str:
+    def generate_modified_step_func_code(step_func: Callable, write_indices: Set[int], num_properties: int,
+                                         write_bla_names_set: set = None) -> str:
         """Generate modified step function code with CSR transformation and write buffer parameters.
 
         Phase 1: Auto-transform locations parameter to CSR (neighbor_offsets, neighbor_values)
@@ -1911,12 +2052,30 @@ def generate_gpu_func(
             if prop_idx >= 0 and prop_idx in write_indices:
                 param_to_write_param[param_name] = f"write_{param_name}"
 
+        # Also add BLA write names (breed-local arrays with double buffering)
+        bla_write_params = {}
+        if write_bla_names_set:
+            for param_name in param_names:
+                if param_name in write_bla_names_set:
+                    bla_write_params[param_name] = f"write_{param_name}"
+            param_to_write_param.update(bla_write_params)
+
         if not param_to_write_param:
             return source  # No double buffering needed
 
         # Add write parameters to function signature (AST-based)
-        for write_param_name in param_to_write_param.values():
-            func_def.args.args.append(ast.arg(arg=write_param_name))
+        # Property write params: append at end (existing behavior, kernel passes them after properties)
+        # BLA write params: insert after read name (kernel passes them interleaved)
+        for param_name, write_param_name in param_to_write_param.items():
+            if param_name in bla_write_params:
+                # BLA: insert write_name right after the read name
+                for i, arg in enumerate(func_def.args.args):
+                    if arg.arg == param_name:
+                        func_def.args.args.insert(i + 1, ast.arg(arg=write_param_name))
+                        break
+            else:
+                # Property: append at end
+                func_def.args.args.append(ast.arg(arg=write_param_name))
 
         # Replace parameter names with write parameter names in WRITE contexts only
         for node in ast.walk(tree):
@@ -2028,7 +2187,9 @@ def generate_gpu_func(
             modified_step_func_name = f"{step_func_name}_double_buffer"
 
             # Generate modified step function
-            modified_step_func_code = generate_modified_step_func_code(breed_step_func_impl, write_property_indices, n_properties)
+            modified_step_func_code = generate_modified_step_func_code(
+                breed_step_func_impl, write_property_indices, n_properties,
+                write_bla_names_set=write_bla_names)
             modified_step_func_code = modified_step_func_code.replace(
                 f"def {step_func_name}(",
                 f"def {modified_step_func_name}("
@@ -2087,11 +2248,12 @@ def generate_gpu_func(
             if global_args:
                 tick_body.append(f"\t\t\t\t\t{','.join(step_func_global_args)},")
             tick_body.append("\t\t\t\t\tagent_ids,")
+            tick_body.append("\t\t\t\t\tlogical_ids,")
             # Property args (read + write buffers)
             tick_body.append(f"\t\t\t\t\t{','.join(args)},")
-            # Breed-local arrays and their index maps
+            # Breed-local arrays and their index maps (with write buffers for double-buffered BLAs)
             if breed_local_names:
-                bla_args = breed_local_names + [n + '_idx' for n in breed_local_names]
+                bla_args = _gen_bla_step_func_args(breed_local_names, write_bla_names)
                 tick_body.append(f"\t\t\t\t\t{','.join(bla_args)},")
             tick_body.append("\t\t\t\t)")
 
@@ -2175,11 +2337,11 @@ def generate_gpu_func(
         "num_rank_local_agents,",
         joined_range_params + "," if joined_range_params else "",
         "agent_ids,",
+        "logical_ids,",
         "barrier_counter,",
         "num_blocks_param,",
         *[f"{p}," for p in (extra_kernel_config or {}).get('extra_kernel_params', [])],
-        *[f"{n}," for n in (breed_local_names or [])],
-        *[f"{n}_idx," for n in (breed_local_names or [])],
+        *_gen_bla_kernel_params(breed_local_names, write_bla_names),
         "):",
         "\tthread_id = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x",
         "\ttotal_threads = jit.gridDim.x * jit.blockDim.x",

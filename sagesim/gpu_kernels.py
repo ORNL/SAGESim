@@ -277,6 +277,8 @@ class GPUBufferManager:
         self.neighbor_values = None     # CuPy int32 (CSR values, local indices for kernel)
         self.neighbor_values_ids = None # CuPy int32 (CSR values, agent IDs for MPI)
         self.agent_ids_gpu = None       # CuPy array of all agent IDs (local + ghost)
+        self.logical_ids_gpu = None    # CuPy array of logical IDs for stable RNG
+        self.device_breed_local_write_bufs = []  # Write buffers for double-buffered BLAs
         self.device_globals = []  # list of CuPy arrays, one per registered global
         self.device_breed_locals = []   # list of CuPy arrays, one per breed-local array
         self.device_breed_local_idxs = []  # list of CuPy int32 index maps
