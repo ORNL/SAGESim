@@ -263,11 +263,10 @@ class GPUBufferManager:
     Pre-allocates with slack to accommodate growth without reallocation.
     """
 
-    AGENT_SLACK_FACTOR = 1.5
-    CSR_SLACK_FACTOR = 2.0
-    MIN_CAPACITY = 64
-
-    def __init__(self):
+    def __init__(self, agent_slack_factor=1.5, csr_slack_factor=2.0, min_capacity=64):
+        self.AGENT_SLACK_FACTOR = agent_slack_factor
+        self.CSR_SLACK_FACTOR = csr_slack_factor
+        self.MIN_CAPACITY = min_capacity
         self.is_initialized = False
 
         # Persistent GPU arrays

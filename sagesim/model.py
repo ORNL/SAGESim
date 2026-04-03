@@ -360,10 +360,16 @@ class Model:
         threads_per_block: int = 32,
         step_function_file_path: str = "step_func_code.py",
         verbose_timing: bool = False,
+        agent_slack_factor: float = 1.5,
+        csr_slack_factor: float = 2.0,
+        min_capacity: int = 64,
     ) -> None:
         self._threads_per_block = threads_per_block
         self._step_function_file_path = os.path.abspath(step_function_file_path)
         self._verbose_timing = verbose_timing
+        self._agent_slack_factor = agent_slack_factor
+        self._csr_slack_factor = csr_slack_factor
+        self._min_capacity = min_capacity
         self._agent_factory = AgentFactory(space, verbose_timing=verbose_timing)
         self._is_setup = False
         # Globals — each registered global is a separate named tensor
@@ -797,6 +803,11 @@ class Model:
                         global_scalar_flags=[t.size == 1 for t in self._global_tensors],
                         breed_local_names=[bla['name'] for bla in self._breed_local_arrays],
                         write_bla_names=self._write_bla_names,
+                        write_bla_shapes={
+                            bla['name']: bla['shape_per_agent']
+                            for bla in self._breed_local_arrays
+                            if bla['name'] in self._write_bla_names
+                        } if self._write_bla_names else None,
                     )
                 )
         comm.barrier()
@@ -819,10 +830,14 @@ class Model:
             warnings.filterwarnings("ignore", category=DeprecationWarning)
             warnings.filterwarnings("ignore", category=FutureWarning)
             warnings.filterwarnings("ignore", message=".*numba.*", category=Warning)
-            importlib.invalidate_caches()
             abs_path = self._step_function_file_path  # Already absolute from __init__
             module_name = os.path.splitext(os.path.basename(abs_path))[0]
-            sys.modules.pop(module_name, None)  # Evict stale module for repeated setup() calls (#47)
+            # Clear all caches so the freshly-generated .py is always loaded
+            sys.modules.pop(module_name, None)
+            pyc_path = importlib.util.cache_from_source(abs_path)
+            if os.path.exists(pyc_path):
+                os.remove(pyc_path)
+            importlib.invalidate_caches()
             spec = importlib.util.spec_from_file_location(module_name, abs_path)
             step_func_module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = step_func_module
@@ -844,7 +859,8 @@ class Model:
         self._is_setup = True
 
         # Initialize GPU buffer manager (buffers allocated lazily on first tick)
-        self._gpu_buffers = GPUBufferManager()
+        self._gpu_buffers = GPUBufferManager(
+            self._agent_slack_factor, self._csr_slack_factor, self._min_capacity)
         self._gpu_aware_mpi = is_gpu_aware_mpi()
 
         t_setup_total_end = time.time()
@@ -864,7 +880,7 @@ class Model:
     def _build_bla_launch_args(self, buf):
         """Build kernel launch args for breed-local arrays.
 
-        For each BLA, emits: array, [write_array if double-buffered], idx_map.
+        For each BLA, emits: array, [write_array + nrows if double-buffered], idx_map.
         """
         args = []
         for i, bla in enumerate(self._breed_local_arrays):
@@ -872,6 +888,7 @@ class Model:
             wb = buf.device_breed_local_write_bufs[i] if i < len(buf.device_breed_local_write_bufs) else None
             if wb is not None:
                 args.append(wb)
+                args.append(cp.float32(buf.device_breed_locals[i].shape[0]))
             args.append(buf.device_breed_local_idxs[i])
         return args
 
@@ -916,7 +933,8 @@ class Model:
 
         if hasattr(self, '_gpu_buffers'):
             self._gpu_buffers.free()
-            self._gpu_buffers = GPUBufferManager()
+            self._gpu_buffers = GPUBufferManager(
+                self._agent_slack_factor, self._csr_slack_factor, self._min_capacity)
         self._cached_all_args = None
 
 
@@ -937,31 +955,25 @@ class Model:
             t_barrier_wait = time.perf_counter() - t_barrier_start
             print(f"[TIMING] MPI barrier wait at simulate start: {t_barrier_wait*1000:.2f} ms", flush=True)
 
-        # Step function is cached during setup() - no need to reimport
-        # Optimization: Single worker doesn't need synchronization overhead
-        # Just run all ticks in one batch
-        if num_workers == 1:
-            # Single worker optimization: no MPI sync overhead
-            self.worker_coroutine(ticks)
-        else:
-            # Multi-worker: need periodic synchronization
-            # Repeatedly execute worker coroutine until simulation
-            # has run for the right amount of ticks
-            original_sync_workers_every_n_ticks = sync_workers_every_n_ticks
-            for time_chunk in range((ticks // original_sync_workers_every_n_ticks) + 1):
-                if time_chunk == (ticks // original_sync_workers_every_n_ticks):
-                    # Final chunk: handle remaining ticks
-                    remaining_ticks = ticks - (
-                        time_chunk * original_sync_workers_every_n_ticks
-                    )
-                    if remaining_ticks == 0:
-                        break
-                    sync_workers_every_n_ticks = remaining_ticks
-                else:
-                    # Regular chunk: use original batch size
-                    sync_workers_every_n_ticks = original_sync_workers_every_n_ticks
+        # Run simulation in chunks of sync_workers_every_n_ticks ticks.
+        # Each chunk launches one fused kernel; MPI sync happens between chunks.
+        # Single-worker also uses this loop (1 tick per chunk by default) to
+        # avoid CuPy JIT non-determinism in long multi-tick kernel launches.
+        original_sync_workers_every_n_ticks = sync_workers_every_n_ticks
+        for time_chunk in range((ticks // original_sync_workers_every_n_ticks) + 1):
+            if time_chunk == (ticks // original_sync_workers_every_n_ticks):
+                # Final chunk: handle remaining ticks
+                remaining_ticks = ticks - (
+                    time_chunk * original_sync_workers_every_n_ticks
+                )
+                if remaining_ticks == 0:
+                    break
+                sync_workers_every_n_ticks = remaining_ticks
+            else:
+                # Regular chunk: use original batch size
+                sync_workers_every_n_ticks = original_sync_workers_every_n_ticks
 
-                self.worker_coroutine(sync_workers_every_n_ticks)
+            self.worker_coroutine(sync_workers_every_n_ticks)
 
     # ----------------------------------------------------------------
     # GPU-resident buffer helpers
@@ -1044,8 +1056,8 @@ class Model:
             _t1 = time.time()
 
         # 2. Pre-allocate capacity with slack
-        agent_capacity = max(GPUBufferManager.MIN_CAPACITY,
-                             int(buf.num_total_agents * GPUBufferManager.AGENT_SLACK_FACTOR))
+        agent_capacity = max(buf.MIN_CAPACITY,
+                             int(buf.num_total_agents * buf.AGENT_SLACK_FACTOR))
 
         # 3. Upload agent IDs to GPU with slack (pad on CPU, single memcpy)
         agent_ids_padded = np.full(agent_capacity, -1, dtype=np.float32)
@@ -1076,7 +1088,7 @@ class Model:
 
         # 5. Build GPU hash map (reuse all_agent_ids_np instead of converting again)
         buffer_indices_np = np.arange(len(all_agent_ids_np), dtype=np.int32)
-        hash_capacity = max(GPUBufferManager.MIN_CAPACITY, len(all_agent_ids_np) * 2)
+        hash_capacity = max(buf.MIN_CAPACITY, len(all_agent_ids_np) * 2)
         buf.hash_map = GPUHashMap(hash_capacity)
         buf.hash_map.build_from_arrays(all_agent_ids_np, buffer_indices_np)
 
@@ -1901,7 +1913,8 @@ def _gen_barrier_code(indent):
 def _gen_bla_kernel_params(breed_local_names, write_bla_names):
     """Generate kernel parameter list for breed-local arrays.
 
-    For each BLA: array, [write_array if double-buffered], idx_map.
+    For each BLA: array, [write_array + nrows if double-buffered], idx_map.
+    The nrows param is used for in-kernel write-back (not passed to step funcs).
     """
     params = []
     write_bla = write_bla_names or set()
@@ -1909,6 +1922,7 @@ def _gen_bla_kernel_params(breed_local_names, write_bla_names):
         params.append(f"{n},")
         if n in write_bla:
             params.append(f"write_{n},")
+            params.append(f"{n}_nrows,")
         params.append(f"{n}_idx,")
     return params
 
@@ -1941,6 +1955,7 @@ def generate_gpu_func(
     global_scalar_flags: list = None,
     breed_local_names: list = None,
     write_bla_names: set = None,
+    write_bla_shapes: dict = None,
 ) -> str:
     """
     Generate GPU function string with double buffering support for race condition prevention.
@@ -2288,22 +2303,43 @@ def generate_gpu_func(
 
     # Write-back: copy write buffers to read buffers (end of tick)
     writeback_props = sorted(i for i in write_property_indices if i != 1)
-    if writeback_props:
-        tick_body.append("")
-        tick_body.append("\t\tagent_index = thread_id")
-        tick_body.append("\t\twhile agent_index < num_rank_local_agents:")
+    writeback_blas = [n for n in (breed_local_names or [])
+                      if write_bla_names and n in write_bla_names
+                      and write_bla_shapes and n in write_bla_shapes]
 
-        for prop_idx in writeback_props:
-            ncols = property_ndims.get(prop_idx, 0)
-            if ncols > 1:
-                tick_body.append(f"\t\t\tfor _wb_j in range({ncols}):")
-                tick_body.append(f"\t\t\t\ta{prop_idx}[agent_index][_wb_j] = write_a{prop_idx}[agent_index][_wb_j]")
-            else:
-                tick_body.append(f"\t\t\ta{prop_idx}[agent_index] = write_a{prop_idx}[agent_index]")
+    if writeback_props or writeback_blas:
+        # Property write-back
+        if writeback_props:
+            tick_body.append("")
+            tick_body.append("\t\tagent_index = thread_id")
+            tick_body.append("\t\twhile agent_index < num_rank_local_agents:")
 
-        tick_body.append("\t\t\tagent_index = agent_index + total_threads")
+            for prop_idx in writeback_props:
+                ncols = property_ndims.get(prop_idx, 0)
+                if ncols > 1:
+                    tick_body.append(f"\t\t\tfor _wb_j in range({ncols}):")
+                    tick_body.append(f"\t\t\t\ta{prop_idx}[agent_index][_wb_j] = write_a{prop_idx}[agent_index][_wb_j]")
+                else:
+                    tick_body.append(f"\t\t\ta{prop_idx}[agent_index] = write_a{prop_idx}[agent_index]")
 
-        # Final barrier (ensures write-back visible before next tick)
+            tick_body.append("\t\t\tagent_index = agent_index + total_threads")
+
+        # Breed-local array write-back
+        for bla_name in writeback_blas:
+            shape = write_bla_shapes[bla_name]
+            tick_body.append("")
+            tick_body.append(f"\t\t_bla_row = thread_id")
+            tick_body.append(f"\t\twhile _bla_row < {bla_name}_nrows:")
+            if len(shape) == 1:
+                tick_body.append(f"\t\t\tfor _bla_j in range({shape[0]}):")
+                tick_body.append(f"\t\t\t\t{bla_name}[_bla_row][_bla_j] = write_{bla_name}[_bla_row][_bla_j]")
+            elif len(shape) == 2:
+                tick_body.append(f"\t\t\tfor _bla_j in range({shape[0]}):")
+                tick_body.append(f"\t\t\t\tfor _bla_k in range({shape[1]}):")
+                tick_body.append(f"\t\t\t\t\t{bla_name}[_bla_row][_bla_j][_bla_k] = write_{bla_name}[_bla_row][_bla_j][_bla_k]")
+            tick_body.append(f"\t\t\t_bla_row = _bla_row + total_threads")
+
+        # Single barrier after all write-backs
         tick_body.append("")
         tick_body += _gen_barrier_code("\t\t")
 
