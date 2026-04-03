@@ -789,6 +789,11 @@ class Model:
 
         t_codegen_start = time.time()
         if worker == 0:
+            # Delete stale bytecode cache before writing new source — prevents
+            # a previous process's .pyc from being loaded instead of the fresh .py
+            _pyc = importlib.util.cache_from_source(self._step_function_file_path)
+            if os.path.exists(_pyc):
+                os.remove(_pyc)
             with open(self._step_function_file_path, "w", encoding="utf-8") as f:
                 f.write(
                     generate_gpu_func(
@@ -832,16 +837,25 @@ class Model:
             warnings.filterwarnings("ignore", message=".*numba.*", category=Warning)
             abs_path = self._step_function_file_path  # Already absolute from __init__
             module_name = os.path.splitext(os.path.basename(abs_path))[0]
-            # Clear all caches so the freshly-generated .py is always loaded
-            sys.modules.pop(module_name, None)
-            pyc_path = importlib.util.cache_from_source(abs_path)
-            if os.path.exists(pyc_path):
-                os.remove(pyc_path)
-            importlib.invalidate_caches()
-            spec = importlib.util.spec_from_file_location(module_name, abs_path)
-            step_func_module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = step_func_module
-            spec.loader.exec_module(step_func_module)
+            # Reuse existing module if source unchanged — avoids CuPy JIT
+            # recompilation which can produce non-deterministic CUDA binaries
+            # (NVRTC compiles by function object identity, not source content).
+            with open(abs_path, 'r') as f:
+                source_hash = hash(f.read())
+            existing = sys.modules.get(module_name)
+            if existing is not None and getattr(existing, '_source_hash', None) == source_hash:
+                step_func_module = existing
+            else:
+                sys.modules.pop(module_name, None)
+                pyc_path = importlib.util.cache_from_source(abs_path)
+                if os.path.exists(pyc_path):
+                    os.remove(pyc_path)
+                importlib.invalidate_caches()
+                spec = importlib.util.spec_from_file_location(module_name, abs_path)
+                step_func_module = importlib.util.module_from_spec(spec)
+                step_func_module._source_hash = source_hash
+                sys.modules[module_name] = step_func_module
+                spec.loader.exec_module(step_func_module)
         self._step_func = step_func_module.stepfunc
         t_jit_end = time.time()
         ###
@@ -955,25 +969,27 @@ class Model:
             t_barrier_wait = time.perf_counter() - t_barrier_start
             print(f"[TIMING] MPI barrier wait at simulate start: {t_barrier_wait*1000:.2f} ms", flush=True)
 
-        # Run simulation in chunks of sync_workers_every_n_ticks ticks.
-        # Each chunk launches one fused kernel; MPI sync happens between chunks.
-        # Single-worker also uses this loop (1 tick per chunk by default) to
-        # avoid CuPy JIT non-determinism in long multi-tick kernel launches.
-        original_sync_workers_every_n_ticks = sync_workers_every_n_ticks
-        for time_chunk in range((ticks // original_sync_workers_every_n_ticks) + 1):
-            if time_chunk == (ticks // original_sync_workers_every_n_ticks):
-                # Final chunk: handle remaining ticks
-                remaining_ticks = ticks - (
-                    time_chunk * original_sync_workers_every_n_ticks
-                )
-                if remaining_ticks == 0:
-                    break
-                sync_workers_every_n_ticks = remaining_ticks
-            else:
-                # Regular chunk: use original batch size
-                sync_workers_every_n_ticks = original_sync_workers_every_n_ticks
+        # Step function is cached during setup() - no need to reimport
+        # Single worker: fuse all ticks in one kernel launch (no MPI sync needed)
+        if num_workers == 1:
+            self.worker_coroutine(ticks)
+        else:
+            # Multi-worker: need periodic synchronization
+            original_sync_workers_every_n_ticks = sync_workers_every_n_ticks
+            for time_chunk in range((ticks // original_sync_workers_every_n_ticks) + 1):
+                if time_chunk == (ticks // original_sync_workers_every_n_ticks):
+                    # Final chunk: handle remaining ticks
+                    remaining_ticks = ticks - (
+                        time_chunk * original_sync_workers_every_n_ticks
+                    )
+                    if remaining_ticks == 0:
+                        break
+                    sync_workers_every_n_ticks = remaining_ticks
+                else:
+                    # Regular chunk: use original batch size
+                    sync_workers_every_n_ticks = original_sync_workers_every_n_ticks
 
-            self.worker_coroutine(sync_workers_every_n_ticks)
+                self.worker_coroutine(sync_workers_every_n_ticks)
 
     # ----------------------------------------------------------------
     # GPU-resident buffer helpers
