@@ -461,15 +461,15 @@ class Model:
     def get_space(self) -> Space:
         return self._agent_factory._space
 
-    def get_breed_data(self, breed_name, property_name):
-        """Download property data for all agents of a breed, gathered to rank 0.
-
-        Uses GPU-Direct Gatherv when available (no GPU→CPU copy on non-root ranks).
-        Falls back to CPU-staged Gatherv otherwise.
+    def get_breed_data(self, breed_name, property_name, local=False):
+        """Download property data for agents of a breed.
 
         :param breed_name: Name of the breed (e.g., "Tree", "Site")
         :param property_name: Property to download (e.g., "params", "states_db")
-        :return: numpy array on rank 0, None on other ranks
+        :param local: If True, return local data only (no MPI gather).
+                     If False (default), gather all data to rank 0.
+        :return: If local=True: numpy array of local agents' data on ALL ranks
+                 If local=False: numpy array of all agents' data on rank 0, None on other ranks
         """
         breed = self._agent_factory._breeds[breed_name]
         buf = self._gpu_buffers
@@ -478,30 +478,39 @@ class Model:
         prop_idx = self._agent_factory._property_name_2_index[property_name]
 
         comm = MPI.COMM_WORLD
-        if comm.Get_size() == 1:
+
+        # Return local data only if requested or if single-rank
+        if local or comm.Get_size() == 1:
             if count > 0:
                 return buf.property_tensors[prop_idx][start:start + count].get()
             return np.empty((0,), dtype=np.float32)
 
+        # Multi-rank gather to rank 0
         return self._gatherv_breed_gpu(
             buf.property_tensors[prop_idx], start, count, comm)
 
-    def get_breed_agent_ids(self, breed_name):
-        """Download agent IDs for all agents of a breed, gathered to rank 0.
+    def get_breed_agent_ids(self, breed_name, local=False):
+        """Download agent IDs for agents of a breed.
 
         :param breed_name: Name of the breed
-        :return: numpy array on rank 0, None on other ranks
+        :param local: If True, return local data only (no MPI gather).
+                     If False (default), gather all data to rank 0.
+        :return: If local=True: numpy array of local agents' IDs on ALL ranks
+                 If local=False: numpy array of all agents' IDs on rank 0, None on other ranks
         """
         breed = self._agent_factory._breeds[breed_name]
         buf = self._gpu_buffers
         start, count = buf.breed_ranges.get(breed._breedidx, (0, 0))
 
         comm = MPI.COMM_WORLD
-        if comm.Get_size() == 1:
+
+        # Return local data only if requested or if single-rank
+        if local or comm.Get_size() == 1:
             if count > 0:
                 return buf.agent_ids_gpu[start:start + count].get()
             return np.empty((0,), dtype=np.float32)
 
+        # Multi-rank gather to rank 0
         return self._gatherv_breed_gpu(
             buf.agent_ids_gpu, start, count, comm)
 
@@ -847,9 +856,6 @@ class Model:
                 step_func_module = existing
             else:
                 sys.modules.pop(module_name, None)
-                pyc_path = importlib.util.cache_from_source(abs_path)
-                if os.path.exists(pyc_path):
-                    os.remove(pyc_path)
                 importlib.invalidate_caches()
                 spec = importlib.util.spec_from_file_location(module_name, abs_path)
                 step_func_module = importlib.util.module_from_spec(spec)
@@ -1319,12 +1325,28 @@ class Model:
         import time
         t_start = time.time()
 
-        # TODO: these are constant when topology is static — could be cached
-        # after first call and skipped on subsequent ticks.
-        self.__rank_local_agent_ids = np.array(
-            list(self._agent_factory._rank2agentid2agentidx[worker].keys()),
-            dtype=np.int64,
-        )
+        # OPTIMIZATION: Cache agent IDs if topology hasn't changed (fused tick execution)
+        # For single-worker simulations with fused ticks, agent dict remains unchanged
+        current_dict_id = id(self._agent_factory._rank2agentid2agentidx[worker])
+        if not hasattr(self, '_cached_rank_local_agent_ids'):
+            # First call - build and cache
+            self.__rank_local_agent_ids = np.array(
+                list(self._agent_factory._rank2agentid2agentidx[worker].keys()),
+                dtype=np.int64,
+            )
+            self._cached_rank_local_agent_ids = self.__rank_local_agent_ids
+            self._cached_topology_dict_id = current_dict_id
+        elif current_dict_id != self._cached_topology_dict_id:
+            # Topology changed - rebuild cache
+            self.__rank_local_agent_ids = np.array(
+                list(self._agent_factory._rank2agentid2agentidx[worker].keys()),
+                dtype=np.int64,
+            )
+            self._cached_rank_local_agent_ids = self.__rank_local_agent_ids
+            self._cached_topology_dict_id = current_dict_id
+        else:
+            # Reuse cached array (common case for fused tick execution)
+            self.__rank_local_agent_ids = self._cached_rank_local_agent_ids
 
         timing_data = {} if self._verbose_timing else None
 
@@ -1434,9 +1456,33 @@ class Model:
         # can't start until active blocks finish.
         # We use a conservative default (2 blocks/SM) that works reliably for
         # complex kernels. Can be tuned up for simpler kernels.
-        dev = cp.cuda.Device()
-        attrs = dev.attributes
-        num_sms = attrs['MultiProcessorCount']
+
+        # OPTIMIZATION: Cache GPU configuration (SM count detection)
+        if not hasattr(self, '_cached_num_sms'):
+            import os
+            dev = cp.cuda.Device()
+            attrs = dev.attributes
+            num_sms = attrs['MultiProcessorCount']
+
+            # AMD GPU detection: CuPy's HIP backend doesn't correctly report CU count
+            # See CUPY_ISSUE.md for details
+            if 'SAGESIM_NUM_SMS' in os.environ:
+                num_sms = int(os.environ['SAGESIM_NUM_SMS'])
+                if getattr(self, '_verbose', False):
+                    print(f"[SAGESim] Using SAGESIM_NUM_SMS override: {num_sms} CUs")
+            elif num_sms == 1:
+                # Likely AMD GPU with incorrect CuPy detection
+                props = cp.cuda.runtime.getDeviceProperties(dev.id)
+                gpu_name = props['name'].decode('utf-8')
+                if 'gfx90a' in gpu_name.lower() or 'mi250x' in gpu_name.lower() or 'mi210' in gpu_name.lower():
+                    num_sms = 110
+                    if getattr(self, '_verbose', False):
+                        print(f"[SAGESim] Detected GPU: {gpu_name}")
+                        print(f"[SAGESim] AMD MI250X/MI210 detected, using 110 CUs")
+
+            self._cached_num_sms = num_sms
+
+        num_sms = self._cached_num_sms
         # Conservative: 2 blocks/SM ensures co-residency even with high register pressure
         max_blocks_per_sm = getattr(self, '_max_blocks_per_sm', 2)
         max_grid_blocks = max_blocks_per_sm * num_sms

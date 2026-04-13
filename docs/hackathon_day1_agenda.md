@@ -107,14 +107,14 @@ Detection code at `gpu_kernels.py:14-32` — also checks `OMPI_MCA_opal_cuda_sup
 
 ### 2.1 Current State (SAGESim Framework)
 
-**Save/Load:** `model.py:1283-1304` — Python pickle, single rank, not scalable
+**Save/Load:** `model.py:1289-1310` — Python pickle, single rank, not scalable
 ```python
 def save(self, app, fpath):
     with open(fpath, "wb") as fout:
         pickle.dump(app, fout)
 ```
 
-**Per-tick GPU→CPU download:** `model.py:1270-1282`
+**Per-tick GPU→CPU download:** `model.py:1276-1288`
 ```python
 def _download_local_data_to_cpu(self, num_local_agents):
     for prop_idx in buf.sorted_write_indices:
@@ -165,11 +165,11 @@ for year_batch in range(0, years, report_interval):
     writer.write_tree_data(tree_data)         # CSV output
 ```
 
-**Data collection path:** `get_breed_data()` → `_gatherv_breed_gpu()` (`model.py:464-574`)
+**Data collection path:** `get_breed_data()` → `_gatherv_breed_gpu()` (`model.py:464-583`)
 
 ```
-model.py:526   Allgather(local_count) → all_counts[]   ← each rank announces its agent count
-model.py:564   Gatherv(send_buf, recv_buf, root=0)     ← actual data goes to rank 0 only
+model.py:535   Allgather(local_count) → all_counts[]   ← each rank announces its agent count
+model.py:573   Gatherv(send_buf, recv_buf, root=0)     ← actual data goes to rank 0 only
 ```
 
 - Downloads every N years (default 10) via `--report_interval`
@@ -188,7 +188,7 @@ model.py:564   Gatherv(send_buf, recv_buf, root=0)     ← actual data goes to r
 
 **Spike recording** (`superneuroabm/model.py:1094-1150`):
 
-SuperNeuroABM extends SAGESim's kernel via subclass hooks (`sagesim/model.py:886-915`):
+SuperNeuroABM extends SAGESim's kernel via subclass hooks (`sagesim/model.py:892-921`):
 1. `_get_extra_kernel_config()` — injects `spike_record`, `spike_record_count`, and `spike_mask` into kernel signature; adds post-step code that checks `output_spikes_tensor[_real_idx][tick % 2]` and atomically appends `[agent_id, tick]` if the neuron fired
 2. `_prepare_kernel_extras()` — lazy-allocates the spike buffer on first call, resets atomic counter to 0, builds per-soma recording mask
 3. `_process_kernel_extras()` — downloads `spike_buf[:count * 2]` to CPU, appends to `_recorded_spikes` list
@@ -276,23 +276,23 @@ Each MPI rank owns one GPU and a subset of agents. Agents may have **neighbors o
 2. GPU kernel → execute all agent logic in parallel
 3. Write-back → copy results for next exchange
 
-**Orchestration code:** `model.py:1308-1542` (worker_coroutine)
+**Orchestration code:** `model.py:1314-1588` (worker_coroutine)
 
-### 3.2 First Tick: One-Time Setup (`model.py:1342-1386`)
+### 3.2 First Tick: One-Time Setup (`model.py:1364-1408`)
 
 The first call to `worker_coroutine` builds all persistent state. This only runs once — subsequent ticks skip to ghost exchange.
 
 ```
-model.py:1342  if not buf.is_initialized:
+model.py:1364  if not buf.is_initialized:
   │
-  ├─ model.py:1345-1347  Compute neighbor lists (CPU)
+  ├─ model.py:1367-1369  Compute neighbor lists (CPU)
   │   Space._neighbor_compute_func() → ragged list of neighbor IDs per local agent
   │
-  ├─ model.py:1351-1355  discover_ghost_topology() ──► gpu_kernels.py:35-88
+  ├─ model.py:1373-1377  discover_ghost_topology() ──► gpu_kernels.py:35-88
   │   Scan neighbor lists → find agent IDs owned by other ranks → ghost IDs
   │   (vectorized CPU scan, no MPI)
   │
-  ├─ model.py:1364        _build_gpu_buffers(ghost_ids, num_local_agents)
+  ├─ model.py:1386        _build_gpu_buffers(ghost_ids, num_local_agents)
   │   Allocate ALL persistent GPU memory:
   │   - property_tensors (local agents + ghost placeholders)
   │   - CSR arrays (neighbor_offsets, neighbor_values, neighbor_values_ids)
@@ -300,7 +300,7 @@ model.py:1342  if not buf.is_initialized:
   │   - GPUHashMap (agent_id → buffer_index)
   │   - agent_ids_gpu, logical_ids_gpu
   │
-  ├─ model.py:1376-1379  CommunicationManager.build_communication_maps()
+  ├─ model.py:1398-1401  CommunicationManager.build_communication_maps()
   │   ──► gpu_kernels.py:521-850
   │   The MPI handshake (detailed in Section 3.5):
   │   - Scan CSR for cross-rank neighbors
@@ -309,33 +309,33 @@ model.py:1342  if not buf.is_initialized:
   │   - Build send/recv GPU index maps
   │   - Pre-allocate MPI buffers
   │
-  └─ model.py:1380        First exchange_ghost_data()
+  └─ model.py:1402        First exchange_ghost_data()
       Fill ghost slots with actual data from remote ranks.
       Without this, ghost agent properties would be zeros.
 ```
 
-After this, `buf.is_initialized = True` (`gpu_kernels.py:850`) and all subsequent calls take the fast path (`model.py:1388-1395`).
+After this, `buf.is_initialized = True` (`gpu_kernels.py:850`) and all subsequent calls take the fast path (`model.py:1410-1417`).
 
 ### 3.3 Per-Tick Flow (Subsequent Ticks)
 
 ```
-model.py:955-992  simulate() loop
+model.py:961-998  simulate() loop
   │
-  ├─ model.py:967         comm.barrier()  — ensures all ranks finished setup
+  ├─ model.py:973         comm.barrier()  — ensures all ranks finished setup
   │                        before any rank starts the first tick
   │
-  ├─ model.py:1392-1395  exchange_ghost_data() ──► gpu_kernels.py:1068-1123
+  ├─ model.py:1414-1417  exchange_ghost_data() ──► gpu_kernels.py:1068-1123
   │   ├─ gpu_kernels.py:852-909   _batched_gpu_pack()
   │   ├─ gpu_kernels.py:1084-1087 stream.synchronize()
   │   ├─ gpu_kernels.py:911-982   mpi_exchange()
   │   └─ gpu_kernels.py:984-1066  _batched_gpu_unpack()
   │
-  ├─ model.py:1468-1482  GPU kernel launch (fused)
-  ├─ model.py:1489        stream.synchronize()
-  └─ model.py:1517-1524  write_buffers → property_tensors (GPU→GPU)
+  ├─ model.py:1514-1528  GPU kernel launch (fused)
+  ├─ model.py:1535        stream.synchronize()
+  └─ model.py:1563-1570  write_buffers → property_tensors (GPU→GPU)
 ```
 
-**Chunking:** `simulate(ticks=100, sync_workers_every_n_ticks=10)` runs the kernel for 10 fused ticks, then does MPI exchange, repeats 10 times. Within each chunk no MPI occurs — all ticks run on GPU with grid barriers only. (`model.py:976-992`)
+**Chunking:** `simulate(ticks=100, sync_workers_every_n_ticks=10)` runs the kernel for 10 fused ticks, then does MPI exchange, repeats 10 times. Within each chunk no MPI occurs — all ticks run on GPU with grid barriers only. (`model.py:982-998`)
 
 ### 3.4 GPU Memory Layout
 
@@ -345,10 +345,10 @@ Buffer index: [0 ... N_local-1]  [N_local ... N_total-1]  [N_total ... capacity-
 ```
 
 - `property_tensors[i]`: CuPy float32, shape `(capacity, width_i)` — `gpu_kernels.py:277`
-- `property_tensors[1]` = `None` (replaced by CSR) — `model.py:1418`
+- `property_tensors[1]` = `None` (replaced by CSR) — `model.py:1440`
 - Slack factor 1.5x — `gpu_kernels.py:270`
 
-**CSR neighbor structure (dual representation):** `model.py:1140-1144`
+**CSR neighbor structure (dual representation):** `model.py:1146-1150`
 
 ```
 neighbor_offsets    — CuPy int32, (N_total+1,)  — CSR row pointers
@@ -360,7 +360,7 @@ Why dual? Kernel needs O(1) array indexing. MPI needs globally unique IDs to ide
 
 ### 3.5 Communication Topology Setup (One-Time, Tick 1)
 
-**Entry:** `model.py:1375-1380`  
+**Entry:** `model.py:1397-1402`  
 **Full method:** `gpu_kernels.py:521-850` (`build_communication_maps`)
 
 #### Phase 1: Discover cross-rank dependencies (`gpu_kernels.py:562-623`)
@@ -560,30 +560,30 @@ for i in _write_prop_mask:
 
 ### 3.7 Fused GPU Kernel with Grid Barriers
 
-**Kernel generation:** `model.py:1964-2411` (`generate_gpu_func`)  
-**Kernel launch:** `model.py:1468-1482`
+**Kernel generation:** `model.py:2010-2457` (`generate_gpu_func`)
+**Kernel launch:** `model.py:1514-1528`
 
 ```python
-@jit.rawkernel(device='cuda')   # model.py:2384 — CuPy-ROCm maps transparently
+@jit.rawkernel(device='cuda')   # model.py:2430 — CuPy-ROCm maps transparently
 def stepfunc(global_tick, _seed, *globals, *properties, *write_buffers,
              sync_workers_every_n_ticks, num_local_agents,
              *priority_ranges, agent_ids, logical_ids,
              barrier_counter, num_blocks_param, *bla_args):
 
-    thread_id = blockIdx.x * blockDim.x + threadIdx.x    # model.py:2400
-    total_threads = gridDim.x * blockDim.x                # model.py:2401
+    thread_id = blockIdx.x * blockDim.x + threadIdx.x    # model.py:2446
+    total_threads = gridDim.x * blockDim.x                # model.py:2447
 
-    for tick in range(sync_workers_every_n_ticks):         # model.py:2404 — fused ticks
+    for tick in range(sync_workers_every_n_ticks):         # model.py:2450 — fused ticks
         # Persistent thread loop per priority
         agent_index = thread_id
-        while agent_index < priority_0_count:              # model.py:2267
+        while agent_index < priority_0_count:              # model.py:2313
             _real_idx = int(agent_index) + int(priority_0_start)
             breed_id = a0[_real_idx]
             if breed_id == 0:
                 step_func_0_double_buffer(tick, _real_idx, ...)
             agent_index += total_threads
 
-        # SOFTWARE GRID BARRIER                            # model.py:1910-1928
+        # SOFTWARE GRID BARRIER                            # model.py:1956-1974
         syncthreads()
         if threadIdx.x == 0:
             threadfence()                                  # jit_extensions.py:24
@@ -594,13 +594,13 @@ def stepfunc(global_tick, _seed, *globals, *properties, *write_buffers,
             threadfence()
         syncthreads()
 
-        # Write-back at end of each tick                   # model.py:2328-2363
+        # Write-back at end of each tick                   # model.py:2374-2409
         while agent_index < num_local_agents:
             a2[agent_index] = write_a2[agent_index]
             agent_index += total_threads
 ```
 
-**Occupancy constraint:** Must launch ≤ `max_blocks_per_sm × num_sms` blocks to avoid grid barrier deadlock. (`model.py:1426-1443`)
+**Occupancy constraint:** Must launch ≤ `max_blocks_per_sm × num_sms` blocks to avoid grid barrier deadlock. (`model.py:1448-1489`)
 
 **Question:** Does `__threadfence()` provide full device-scope memory ordering on MI250X?
 
@@ -654,10 +654,10 @@ Enable with `verbose_timing=True` on model constructor. Prints per-tick breakdow
 
 | Metric | What It Measures | Code |
 |---|---|---|
-| `data_prep` | Buffer init + ghost exchange | `model.py:1402-1405` |
-| `gpu_compute` | Kernel execution (minus sync) | `model.py:1494` |
-| `gpu_sync` | `hipStreamSynchronize` wait | `model.py:1488-1493` |
-| `write_back` | GPU→GPU write-buffer copy | `model.py:1516-1526` |
+| `data_prep` | Buffer init + ghost exchange | `model.py:1424-1427` |
+| `gpu_compute` | Kernel execution (minus sync) | `model.py:1540` |
+| `gpu_sync` | `hipStreamSynchronize` wait | `model.py:1534-1539` |
+| `write_back` | GPU→GPU write-buffer copy | `model.py:1562-1572` |
 | `mpi_gpu_pack` | Fancy-index gather time | `gpu_kernels.py:1076-1081` |
 | `mpi_gpu_sync_pack` | Stream sync before MPI | `gpu_kernels.py:1085-1089` |
 | `mpi_exchange` | Total MPI time | `gpu_kernels.py:1092-1097` |
