@@ -122,7 +122,7 @@ def _download_local_data_to_cpu(self, num_local_agents):
             buf.property_tensors[prop_idx][:num_local_agents].get().tolist()
 ```
 
-**Breed data collection:** `model.py:465-487` — `get_breed_data()` gathers to rank 0 via MPI `Gatherv`
+**Breed data collection:** `model.py:464-490` — `get_breed_data()` gathers to rank 0 via MPI `Gatherv`
 
 ### 2.2 Two Applications, Two I/O Patterns
 
@@ -276,7 +276,7 @@ Each MPI rank owns one GPU and a subset of agents. Agents may have **neighbors o
 2. GPU kernel → execute all agent logic in parallel
 3. Write-back → copy results for next exchange
 
-**Orchestration code:** `model.py:1314-1588` (worker_coroutine)
+**Orchestration code:** `model.py:1314-1641` (worker_coroutine)
 
 ### 3.2 First Tick: One-Time Setup (`model.py:1364-1408`)
 
@@ -314,7 +314,7 @@ model.py:1364  if not buf.is_initialized:
       Without this, ghost agent properties would be zeros.
 ```
 
-After this, `buf.is_initialized = True` (`gpu_kernels.py:850`) and all subsequent calls take the fast path (`model.py:1410-1417`).
+After this, `self._is_initialized = True` (`gpu_kernels.py:850`, on CommunicationManager) and all subsequent calls take the fast path (`model.py:1410-1417`).
 
 ### 3.3 Per-Tick Flow (Subsequent Ticks)
 
@@ -335,7 +335,7 @@ model.py:961-998  simulate() loop
   └─ model.py:1563-1570  write_buffers → property_tensors (GPU→GPU)
 ```
 
-**Chunking:** `simulate(ticks=100, sync_workers_every_n_ticks=10)` runs the kernel for 10 fused ticks, then does MPI exchange, repeats 10 times. Within each chunk no MPI occurs — all ticks run on GPU with grid barriers only. (`model.py:982-998`)
+**Chunking:** `simulate(ticks=100, sync_workers_every_n_ticks=10)` runs the kernel for 10 fused ticks, then does MPI exchange, repeats 10 times. Within each chunk no MPI occurs — all ticks run on GPU with grid barriers only. (`model.py:985-998`)
 
 ### 3.4 GPU Memory Layout
 
@@ -348,7 +348,7 @@ Buffer index: [0 ... N_local-1]  [N_local ... N_total-1]  [N_total ... capacity-
 - `property_tensors[1]` = `None` (replaced by CSR) — `model.py:1440`
 - Slack factor 1.5x — `gpu_kernels.py:270`
 
-**CSR neighbor structure (dual representation):** `model.py:1146-1150`
+**CSR neighbor structure (dual representation):** `model.py:1144-1148`
 
 ```
 neighbor_offsets    — CuPy int32, (N_total+1,)  — CSR row pointers
