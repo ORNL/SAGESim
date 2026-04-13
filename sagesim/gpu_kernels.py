@@ -19,10 +19,14 @@ def is_gpu_aware_mpi():
     - OMPI_MCA_opal_cuda_support=true (Open MPI with CUDA/ROCm support)
     - SAGESIM_GPU_AWARE_MPI=1 (manual override for testing)
     """
+    # Cray MPICH (Frontier / AMD MI250X): set by module or user
     if os.environ.get('MPICH_GPU_SUPPORT_ENABLED', '0') == '1':
         return True
+    # Open MPI with CUDA/ROCm support
     if os.environ.get('OMPI_MCA_opal_cuda_support', '') == 'true':
         return True
+    # Manual override for testing/debugging on systems without
+    # native GPU-aware MPI — forces GPU-aware code path
     if os.environ.get('SAGESIM_GPU_AWARE_MPI', '0') == '1':
         return True
     return False

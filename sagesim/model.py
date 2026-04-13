@@ -1319,6 +1319,8 @@ class Model:
         import time
         t_start = time.time()
 
+        # TODO: these are constant when topology is static — could be cached
+        # after first call and skipped on subsequent ticks.
         self.__rank_local_agent_ids = np.array(
             list(self._agent_factory._rank2agentid2agentidx[worker].keys()),
             dtype=np.int64,
