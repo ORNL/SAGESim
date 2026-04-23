@@ -55,6 +55,7 @@ class AgentFactory:
         self._current_rank = 0
         self._partition_loaded = False  # Flag to track if partition is loaded
         self._partition_mapping: Optional[Dict[int, int]] = None  # agent_id -> rank mapping
+        self._partition_preallocated = False  # True after _init_partition pre-allocates tensors
 
     def load_partition_from_dict(self, partition_dict: Dict[int, int]) -> None:
         """Load partition directly from a dictionary (no file I/O).
@@ -308,7 +309,7 @@ class AgentFactory:
                 self._property_name_2_defaults[property_name] = default
                 self._property_name_2_neighbor_visible[property_name] = neighbor_visible
 
-    def create_agent(self, breed: Breed, rank: int = None, **kwargs) -> int:
+    def create_agent(self, breed: Breed, rank: int = None, agent_id: int = None, **kwargs) -> int:
         """
         Creates and agent of the given breed initialized with the properties given in
             **kwargs.
@@ -316,13 +317,38 @@ class AgentFactory:
         :param breed: Breed definition of agent
         :param rank: Target rank for this agent. If provided, overrides partition and
             round-robin. If None, uses partition mapping or round-robin fallback.
+        :param agent_id: Explicit global agent ID. If provided, uses this ID instead of
+            auto-incrementing. Useful for partition-based loading where IDs are pre-assigned.
+            If None (default), auto-assigns the next sequential ID.
         :param **kwargs: named arguments of agent properties. Names much match properties
             already registered in breed.
         :return: Agent ID
 
         """
 
-        agent_id = self._num_agents
+        # Fast path: partition mode with pre-allocated tensors
+        if agent_id is not None and self._partition_preallocated:
+            local_idx = self._rank2agentid2agentidx.get(worker, {}).get(agent_id)
+            if local_idx is not None:
+                self._agent2breed[agent_id] = self._breeds[breed.name]._breedidx
+                for prop_name in self._property_name_2_agent_data_tensor:
+                    if prop_name == "breed":
+                        self._property_name_2_agent_data_tensor[prop_name][local_idx] = (
+                            self._breeds[breed.name]._breedidx
+                        )
+                    else:
+                        default_value = copy(self._property_name_2_defaults[prop_name])
+                        self._property_name_2_agent_data_tensor[prop_name][local_idx] = (
+                            kwargs.get(prop_name, default_value)
+                        )
+            return agent_id
+
+        # Standard path
+        if agent_id is None:
+            agent_id = self._num_agents
+            self._num_agents += 1
+        else:
+            self._num_agents = max(self._num_agents, agent_id + 1)
 
         # Assign agent to rank: explicit > partition > round-robin
         if rank is not None:
@@ -347,9 +373,7 @@ class AgentFactory:
             agentid2agentidx_of_current_rank
         )
 
-        if worker == self._agent2rank[agent_id]:
-            # Only the worker that owns this agent will create and store the agent data.
-            # This is to avoid unnecessary data duplication across workers.
+        if worker == assigned_rank:
             if breed.name not in self._breeds:
                 raise ValueError(f"Fatal: unregistered breed {breed.name}")
             property_names = self._property_name_2_agent_data_tensor.keys()
@@ -364,8 +388,6 @@ class AgentFactory:
                     self._property_name_2_agent_data_tensor[property_name].append(
                         kwargs.get(property_name, default_value)
                     )
-
-        self._num_agents += 1
 
         return agent_id
 
@@ -472,55 +494,17 @@ class AgentFactory:
             new_mapping[agent_ids[old_pos]] = new_idx
         self._rank2agentid2agentidx[worker] = new_mapping
 
-    def bulk_register_agents(self, total_agents, agent_id_to_rank):
-        """Pre-compute global agent metadata without per-agent loops.
+    def register_remote_agents(self, remote_agent_ranks: dict) -> None:
+        """Register rank info for remote agents referenced by local agents.
 
-        Sets _agent2rank as a numpy array and builds _rank2agentid2agentidx
-        only for the local rank. Pre-allocates property tensor lists for
-        local agents. Must be called AFTER all breeds are registered.
+        Only records agent_id → rank mapping. No property data is allocated.
+        Used for partition-based loading where each rank only creates local
+        agents but needs to know the rank of remote neighbors for MPI exchange.
 
-        :param total_agents: Total number of agents across all ranks
-        :param agent_id_to_rank: numpy int32 array where index=agent_id, value=rank
+        :param remote_agent_ranks: Dict mapping remote agent_id → rank
         """
-        self._num_agents = total_agents
-        self._agent2rank = agent_id_to_rank  # numpy array
-
-        # Build _rank2agentid2agentidx ONLY for local rank
-        local_ids = np.where(agent_id_to_rank == worker)[0]
-        local_mapping = OrderedDict()
-        for i, aid in enumerate(local_ids):
-            local_mapping[int(aid)] = i
-        self._rank2agentid2agentidx[worker] = local_mapping
-
-        # Pre-allocate property tensor lists for local agents
-        n_local = len(local_ids)
-        for prop in self._property_name_2_agent_data_tensor:
-            self._property_name_2_agent_data_tensor[prop] = [None] * n_local
-
-    def create_agent_at_index(self, agent_id, local_idx, breed, **kwargs):
-        """Populate property data for a local agent at a pre-allocated index.
-
-        Must only be called after bulk_register_agents(). Writes property
-        values at the given local_idx without any dict bookkeeping.
-
-        :param agent_id: Global agent ID
-        :param local_idx: Pre-allocated local index from _rank2agentid2agentidx
-        :param breed: Breed definition of agent
-        :param kwargs: Property values to set
-        """
-        if breed.name not in self._breeds:
-            raise ValueError(f"Fatal: unregistered breed {breed.name}")
-        self._agent2breed[agent_id] = self._breeds[breed.name]._breedidx
-        for property_name in self._property_name_2_agent_data_tensor:
-            if property_name == "breed":
-                self._property_name_2_agent_data_tensor[property_name][local_idx] = (
-                    self._breeds[breed.name]._breedidx
-                )
-            else:
-                default_value = copy(self._property_name_2_defaults[property_name])
-                self._property_name_2_agent_data_tensor[property_name][local_idx] = (
-                    kwargs.get(property_name, default_value)
-                )
+        for agent_id, rank in remote_agent_ranks.items():
+            self._agent2rank[agent_id] = rank
 
     def _generate_agent_data_tensors(
         self,

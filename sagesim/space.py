@@ -63,6 +63,7 @@ class NetworkSpace(Space):
         locations_max_dims = [0]
         locations_defaults = []
         self._ordered = ordered
+        self._sparse = False
         # Parallel set for O(1) duplicate checks when ordered=True
         if ordered:
             self._locations_set = {}
@@ -70,31 +71,42 @@ class NetworkSpace(Space):
             _network_space_compute_neighbors, locations_max_dims, locations_defaults
         )
 
-    def add_agent(self, agent: int) -> None:
-        # Use list for ordered neighbors, set for unordered
-        neighbor_container = [] if self._ordered else set()
-        self._locations.append(neighbor_container)
-        if self._ordered:
-            self._locations_set[agent] = set()
-        self._agent_factory.set_agent_property_value(
-            "locations",
-            agent,
-            self._locations[agent],
-        )
+    def add_local_agents(self, agent_ids) -> None:
+        """Create location containers for specific local agents only.
 
-    def bulk_add_agents(self, total_agents):
-        """Pre-populate location containers for all agents.
+        In this mode, _locations is a dict {agent_id: [neighbors]} instead of a
+        list indexed by global agent ID. Only local agents get entries — remote
+        agents referenced in edges don't need their own neighbor lists.
 
-        Replaces N individual add_agent() calls with a single bulk allocation.
-        Property tensor linking is handled separately by create_agent_at_index.
-
-        :param total_agents: Total number of agents across all ranks
+        :param agent_ids: Iterable of local agent IDs to create containers for.
         """
+        self._sparse = True
         if self._ordered:
-            self._locations = [[] for _ in range(total_agents)]
-            self._locations_set = {i: set() for i in range(total_agents)}
+            self._locations = {int(aid): [] for aid in agent_ids}
+            self._locations_set = {int(aid): set() for aid in agent_ids}
         else:
-            self._locations = [set() for _ in range(total_agents)]
+            self._locations = {int(aid): set() for aid in agent_ids}
+
+    def add_agent(self, agent: int) -> None:
+        if self._sparse:
+            # In sparse mode, container already exists from add_local_agents().
+            # Just link the locations property to the agent's property tensor.
+            self._agent_factory.set_agent_property_value(
+                "locations",
+                agent,
+                self._locations[agent],
+            )
+        else:
+            # Original behavior
+            neighbor_container = [] if self._ordered else set()
+            self._locations.append(neighbor_container)
+            if self._ordered:
+                self._locations_set[agent] = set()
+            self._agent_factory.set_agent_property_value(
+                "locations",
+                agent,
+                self._locations[agent],
+            )
 
     def get_location(self, agent_id: int) -> Union[List[int], set]:
         """Returns agent's location (neighbors as list if ordered=True, set if ordered=False)"""

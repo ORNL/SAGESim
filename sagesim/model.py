@@ -413,11 +413,88 @@ class Model:
             raise Exception(f"All breeds must be registered before agents are created!")
         self._agent_factory.register_breed(breed)
 
-    def create_agent_of_breed(self, breed: Breed, add_to_space=True, rank: int = None, **kwargs) -> int:
-        agent_id = self._agent_factory.create_agent(breed, rank=rank, **kwargs)
+    def create_agent_of_breed(self, breed: Breed, add_to_space=True, rank: int = None, agent_id: int = None, **kwargs) -> int:
+        agent_id = self._agent_factory.create_agent(breed, rank=rank, agent_id=agent_id, **kwargs)
         if add_to_space:
             self.get_space().add_agent(agent_id)
         return agent_id
+
+    def _init_partition(self, local_agent_ids, remote_agent_ranks):
+        """Initialize space and agent factory for partition-based loading.
+
+        Pre-allocates property tensors and index mappings for local agents
+        in bulk, then registers remote agent ranks. Subsequent create_agent()
+        calls with agent_id use the fast path (index write instead of append).
+
+        :param local_agent_ids: Sorted list/array of local agent IDs
+        :param remote_agent_ranks: Dict mapping remote agent_id -> rank
+        """
+        from collections import OrderedDict
+
+        rank = MPI.COMM_WORLD.Get_rank()
+
+        # Sparse space: only local agents
+        self.get_space().add_local_agents(local_agent_ids)
+
+        # Pre-build index mapping and register local agent ranks
+        af = self._agent_factory
+        n_local = len(local_agent_ids)
+        local_mapping = OrderedDict()
+        for i, aid in enumerate(local_agent_ids):
+            aid = int(aid)
+            local_mapping[aid] = i
+            af._agent2rank[aid] = rank
+        af._rank2agentid2agentidx[rank] = local_mapping
+        af._num_agents = max(int(aid) + 1 for aid in local_agent_ids) if local_agent_ids else 0
+
+        # Pre-allocate property tensor slots
+        for prop in af._property_name_2_agent_data_tensor:
+            af._property_name_2_agent_data_tensor[prop] = [None] * n_local
+
+        # Flag so create_agent uses index writes instead of appends
+        af._partition_preallocated = True
+
+        # Register remote agent ranks
+        af.register_remote_agents(remote_agent_ranks)
+
+    def load_partition(self, partition_file: str) -> None:
+        """Load a preprocessed partition file and create local agents + edges.
+
+        Each rank loads only its own partition file. The file must contain:
+        - 'agents': list of agent dicts with 'id', 'breed', 'properties'
+        - 'edges': list of edge dicts with 'source', 'target'
+        - 'remote_agent_ranks': dict mapping remote agent_id -> rank
+
+        Subclasses can override this method for application-specific agent
+        creation logic (e.g., SuperNeuroABM overrides to create somas/synapses).
+
+        :param partition_file: Path to enriched partition_{rank}.pkl
+        """
+        import pickle
+
+        rank = MPI.COMM_WORLD.Get_rank()
+
+        with open(partition_file, 'rb') as f:
+            partition = pickle.load(f)
+
+        local_ids = sorted([a['id'] for a in partition['agents']])
+        self._init_partition(local_ids, partition.get('remote_agent_ranks', {}))
+
+        # Create agents using standard API
+        for agent in partition['agents']:
+            self.create_agent_of_breed(
+                breed=self._agent_factory._breeds[agent['breed']],
+                rank=rank,
+                agent_id=agent['id'],
+                **agent['properties'],
+            )
+
+        # Create edges (source is always local, directed=True)
+        space = self.get_space()
+        for edge in partition['edges']:
+            space.connect_agents(
+                edge['source'], edge['target'], directed=True
+            )
 
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
         if self._is_setup and hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
@@ -868,12 +945,15 @@ class Model:
 
         # Print agent distribution summary
         if worker == 0:
-            total_agents = self._agent_factory._num_agents
             agents_per_rank = {}
             a2r = self._agent_factory._agent2rank
-            for agent_id in range(total_agents):
-                r = int(a2r[agent_id]) if isinstance(a2r, np.ndarray) else a2r.get(agent_id, -1)
-                agents_per_rank[r] = agents_per_rank.get(r, 0) + 1
+            if isinstance(a2r, np.ndarray):
+                unique, counts = np.unique(a2r, return_counts=True)
+                for r, c in zip(unique, counts):
+                    agents_per_rank[int(r)] = int(c)
+            else:
+                for r in a2r.values():
+                    agents_per_rank[r] = agents_per_rank.get(r, 0) + 1
 
 
         self._is_setup = True
