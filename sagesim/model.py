@@ -419,82 +419,63 @@ class Model:
             self.get_space().add_agent(agent_id)
         return agent_id
 
-    def _init_partition(self, local_agent_ids, remote_agent_ranks):
-        """Initialize space and agent factory for partition-based loading.
+    def build_from_local_data(self, agents, connections, remote_agent_ranks=None):
+        """Build model from pre-prepared local agent data (bulk path).
 
-        Pre-allocates property tensors and index mappings for local agents
-        in bulk, then registers remote agent ranks. Subsequent create_agent()
-        calls with agent_id use the fast path (index write instead of append).
+        Application prepares all local agents with IDs, breeds, and property
+        values, then calls this once. SAGESim pre-allocates and populates
+        everything in bulk — no per-agent create_agent_of_breed() calls.
 
-        :param local_agent_ids: Sorted list/array of local agent IDs
-        :param remote_agent_ranks: Dict mapping remote agent_id -> rank
+        :param agents: list of dicts, each with:
+            - 'id': int (global agent ID)
+            - 'breed': Breed object (registered breed)
+            - 'properties': dict of property_name -> value
+        :param connections: list of (agent_a, agent_b) tuples.
+            Creates directed connections: connect_agents(a, b, directed=True).
+            agent_a must be local. agent_b can be local or remote.
+        :param remote_agent_ranks: dict {remote_agent_id: rank} for MPI ghost exchange
         """
         from collections import OrderedDict
+        from copy import copy
 
         rank = MPI.COMM_WORLD.Get_rank()
+        n_local = len(agents)
+        local_ids = [a['id'] for a in agents]
 
-        # Sparse space: only local agents
-        self.get_space().add_local_agents(local_agent_ids)
+        # 1. Sparse space — dict-based, local agents only
+        self.get_space().add_local_agents(local_ids)
 
-        # Pre-build index mapping and register local agent ranks
+        # 2. Bulk agent factory setup
         af = self._agent_factory
-        n_local = len(local_agent_ids)
-        local_mapping = OrderedDict()
-        for i, aid in enumerate(local_agent_ids):
-            aid = int(aid)
-            local_mapping[aid] = i
-            af._agent2rank[aid] = rank
+        local_mapping = OrderedDict((int(aid), i) for i, aid in enumerate(local_ids))
         af._rank2agentid2agentidx[rank] = local_mapping
-        af._num_agents = max(int(aid) + 1 for aid in local_agent_ids) if local_agent_ids else 0
+        af._num_agents = max(int(a) for a in local_ids) + 1 if local_ids else 0
+        for aid in local_ids:
+            af._agent2rank[int(aid)] = rank
+        for agent in agents:
+            af._agent2breed[agent['id']] = agent['breed']._breedidx
 
-        # Pre-allocate property tensor slots
-        for prop in af._property_name_2_agent_data_tensor:
-            af._property_name_2_agent_data_tensor[prop] = [None] * n_local
+        # 3. Fill property tensors in bulk
+        for prop_name in af._property_name_2_agent_data_tensor:
+            tensor = [None] * n_local
+            for i, agent in enumerate(agents):
+                if prop_name == "breed":
+                    tensor[i] = agent['breed']._breedidx
+                elif prop_name == "locations":
+                    tensor[i] = self.get_space()._locations[agent['id']]
+                else:
+                    tensor[i] = agent['properties'].get(
+                        prop_name, copy(af._property_name_2_defaults[prop_name]))
+            af._property_name_2_agent_data_tensor[prop_name] = tensor
 
-        # Flag so create_agent uses index writes instead of appends
-        af._partition_preallocated = True
+        # 4. Register remote agent ranks
+        if remote_agent_ranks:
+            af.register_remote_agents(remote_agent_ranks)
 
-        # Register remote agent ranks
-        af.register_remote_agents(remote_agent_ranks)
-
-    def load_partition(self, partition_file: str) -> None:
-        """Load a preprocessed partition file and create local agents + edges.
-
-        Each rank loads only its own partition file. The file must contain:
-        - 'agents': list of agent dicts with 'id', 'breed', 'properties'
-        - 'edges': list of edge dicts with 'source', 'target'
-        - 'remote_agent_ranks': dict mapping remote agent_id -> rank
-
-        Subclasses can override this method for application-specific agent
-        creation logic (e.g., SuperNeuroABM overrides to create somas/synapses).
-
-        :param partition_file: Path to enriched partition_{rank}.pkl
-        """
-        import pickle
-
-        rank = MPI.COMM_WORLD.Get_rank()
-
-        with open(partition_file, 'rb') as f:
-            partition = pickle.load(f)
-
-        local_ids = sorted([a['id'] for a in partition['agents']])
-        self._init_partition(local_ids, partition.get('remote_agent_ranks', {}))
-
-        # Create agents using standard API
-        for agent in partition['agents']:
-            self.create_agent_of_breed(
-                breed=self._agent_factory._breeds[agent['breed']],
-                rank=rank,
-                agent_id=agent['id'],
-                **agent['properties'],
-            )
-
-        # Create edges (source is always local, directed=True)
+        # 5. Create connections
         space = self.get_space()
-        for edge in partition['edges']:
-            space.connect_agents(
-                edge['source'], edge['target'], directed=True
-            )
+        for agent_a, agent_b in connections:
+            space.connect_agents(agent_a, agent_b, directed=True)
 
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
         if self._is_setup and hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
@@ -742,19 +723,6 @@ class Model:
         :param logical_id: Stable identifier (e.g. site_slot, gap_index)
         """
         self._logical_id_map[int(agent_id)] = int(logical_id)
-
-    def load_partition(self, partition_file: str, format: str = "auto") -> None:
-        """Load network partition from file to optimize multi-worker performance.
-
-        This method loads a pre-computed network partition that assigns agents to MPI ranks
-        to minimize cross-worker communication. Must be called BEFORE creating any agents.
-
-        For details on partition formats and usage, see AgentFactory.load_partition().
-
-        :param partition_file: Path to partition file
-        :param format: File format ('pickle', 'json', 'numpy', 'text', or 'auto')
-        """
-        self._agent_factory.load_partition(partition_file, format)
 
     def setup(self, use_gpu: bool = True, skip_priority_barriers=False) -> None:
         """

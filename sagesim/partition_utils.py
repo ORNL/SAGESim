@@ -15,7 +15,7 @@ Usage:
     save_partition(partition, "partition.pkl")
 
     # Load in your model
-    model.load_partition("partition.pkl")
+    # Use partition with build_from_local_data()
 """
 
 from typing import Dict, Optional
@@ -225,7 +225,7 @@ def example():
 
     print("\nTo use this partition in SAGESim:")
     print("  model = SAGESim(...)")
-    print("  model.load_partition('example_partition.pkl')")
+    print("  # Use partition with model.build_from_local_data()")
     print("  # ... create agents ...")
     print("  model.setup()")
 
