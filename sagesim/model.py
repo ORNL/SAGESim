@@ -419,7 +419,7 @@ class Model:
             self.get_space().add_agent(agent_id)
         return agent_id
 
-    def build_from_local_data(self, agents, connections, remote_agent_ranks=None):
+    def build_from_local_data(self, agents, connections, remote_agent_ranks=None, directed=False):
         """Build model from pre-prepared local agent data (bulk path).
 
         Application prepares all local agents with IDs, breeds, and property
@@ -431,9 +431,11 @@ class Model:
             - 'breed': Breed object (registered breed)
             - 'properties': dict of property_name -> value
         :param connections: list of (agent_a, agent_b) tuples.
-            Creates directed connections: connect_agents(a, b, directed=True).
-            agent_a must be local. agent_b can be local or remote.
+            If directed=False (default), creates bidirectional connections.
+            If directed=True, creates one-way connections (a can see b only).
         :param remote_agent_ranks: dict {remote_agent_id: rank} for MPI ghost exchange
+        :param directed: if True, connections are one-way. If False (default),
+            connections are bidirectional. Matches connect_agents() default.
         """
         from collections import OrderedDict
         from copy import copy
@@ -475,7 +477,7 @@ class Model:
         # 5. Create connections
         space = self.get_space()
         for agent_a, agent_b in connections:
-            space.connect_agents(agent_a, agent_b, directed=True)
+            space.connect_agents(agent_a, agent_b, directed=directed)
 
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
         if self._is_setup and hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
