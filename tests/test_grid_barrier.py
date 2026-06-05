@@ -142,7 +142,7 @@ def test_barrier_2phase():
 
 
 def test_barrier_3phase():
-    """Test 4: Three-phase kernel with 2 barriers (mimics Soma→Synapse→STDP).
+    """Test 4: Three-phase kernel with 2 barriers (three sequential phases).
 
     Phase 1: Each block writes value V1 = bid * 10
     Barrier 1

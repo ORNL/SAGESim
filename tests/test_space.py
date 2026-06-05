@@ -63,5 +63,99 @@ class TestNetworkSpace(unittest.TestCase):
         self.assertIn(0, self.network_space._locations[1])
 
 
+class TestBulkConnect(unittest.TestCase):
+    """bulk_connect must produce the same neighbor lists as per-connection
+    connect_agents(directed=True), in one pass, under sparse mode."""
+
+    def _sparse_space(self, ordered, agent_ids):
+        ns = NetworkSpace(ordered=ordered)
+        af = AgentFactory(ns)
+        ns._agent_factory = af
+        af.set_agent_property_value = MagicMock()
+        ns.add_local_agents(agent_ids)
+        return ns
+
+    def test_requires_sparse_mode(self):
+        ns = NetworkSpace()
+        with self.assertRaises(RuntimeError):
+            ns.bulk_connect({0: [1]})
+
+    def test_parity_with_connect_agents_unordered(self):
+        pairs = [(0, 1), (0, 2), (1, 2), (2, 0)]
+        ids = [0, 1, 2]
+
+        ref = self._sparse_space(False, ids)
+        for a, b in pairs:
+            ref.connect_agents(a, b, directed=True)
+
+        bulk = self._sparse_space(False, ids)
+        adj = {}
+        for a, b in pairs:
+            adj.setdefault(a, []).append(b)
+        bulk.bulk_connect(adj)
+
+        for aid in ids:
+            self.assertEqual(ref._locations[aid], bulk._locations[aid])
+
+    def test_parity_with_connect_agents_ordered(self):
+        # ordered=True: lists, insertion order preserved, no duplicates.
+        pairs = [(0, 2), (0, 1), (0, 2), (1, 0)]  # note duplicate (0, 2)
+        ids = [0, 1, 2]
+
+        ref = self._sparse_space(True, ids)
+        for a, b in pairs:
+            ref.connect_agents(a, b, directed=True)
+
+        bulk = self._sparse_space(True, ids)
+        adj = {}
+        for a, b in pairs:
+            adj.setdefault(a, []).append(b)
+        bulk.bulk_connect(adj)
+
+        for aid in ids:
+            # exact order AND membership must match
+            self.assertEqual(ref._locations[aid], bulk._locations[aid])
+            self.assertEqual(ref._locations_set[aid], bulk._locations_set[aid])
+        # sanity: duplicate (0, 2) collapsed, agent 0's neighbors stay [2, 1]
+        self.assertEqual(bulk._locations[0], [2, 1])
+
+    def test_dict_input_round_trips(self):
+        adj = {0: [1, 2], 1: [2], 2: [0]}
+        ns = self._sparse_space(True, [0, 1, 2])
+        ns.bulk_connect(adj)
+        self.assertEqual(ns._locations[0], [1, 2])
+        self.assertEqual(ns._locations[1], [2])
+        self.assertEqual(ns._locations[2], [0])
+
+    def test_ordered_preserves_given_neighbor_order(self):
+        # In ordered mode the neighbor slot index is meaningful (a consumer may
+        # read neighbor[0], neighbor[1], ... positionally). bulk_connect must
+        # keep neighbors in exactly the order given, NOT sorted, so that the
+        # i-th neighbor stays at slot i. Use a non-sorted, non-trivial order.
+        ns = self._sparse_space(True, [0, 1, 2, 3, 4, 5])
+        ns.bulk_connect({0: [5, 2, 8, 2, 4]})  # note out-of-order + duplicate 2
+        # 8 is a non-local neighbor (allowed); duplicate 2 collapses to first pos
+        self.assertEqual(ns._locations[0], [5, 2, 8, 4])
+        # parity: the same sequence via per-connection connect_agents
+        ref = self._sparse_space(True, [0, 1, 2, 3, 4, 5])
+        for b in [5, 2, 8, 2, 4]:
+            ref.connect_agents(0, b, directed=True)
+        self.assertEqual(ref._locations[0], ns._locations[0])
+
+    def test_remote_id_as_value_is_allowed(self):
+        # A non-local id (99) may appear as a neighbor (value) without having
+        # its own container: it's an agent on another partition that this rank
+        # does not own.
+        ns = self._sparse_space(True, [0, 1])
+        ns.bulk_connect({0: [99, 1]})
+        self.assertEqual(ns._locations[0], [99, 1])
+        self.assertNotIn(99, ns._locations)
+
+    def test_nonlocal_id_as_key_raises(self):
+        ns = self._sparse_space(True, [0, 1])
+        with self.assertRaises(KeyError):
+            ns.bulk_connect({99: [0]})
+
+
 if __name__ == "__main__":
     unittest.main()

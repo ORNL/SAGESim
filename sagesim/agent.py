@@ -185,6 +185,15 @@ class AgentFactory:
 
         return agent_id
 
+    def _owns_locally(self, agent_id: int) -> bool:
+        """True if this rank holds agent_id's data (no dependence on _agent2rank).
+
+        Uses this rank's own id->index map, which is populated only with owned
+        agents. Lets the collective accessors resolve ownership from local state
+        alone, so _agent2rank need not be global.
+        """
+        return agent_id in self._rank2agentid2agentidx.get(worker, {})
+
     def get_agent_property_value(self, property_name: str, agent_id: int) -> Any:
         """
         Returns the value of the specified property_name of the agent with
@@ -193,18 +202,29 @@ class AgentFactory:
         :param property_name: str name of property as registered in the breed.
         :param agent_id: Agent's id as returned by create_agent
         :return: value of property_name property for agent of agent_id
+
+        Collective: call on every rank with the same agent_id. The owner reads its
+        value and shares it to all via allgather, so this resolves correctly even
+        when _agent2rank is local-only (each rank knows only its own + ghost agents).
         """
-        agent_rank = self._agent2rank[agent_id]
-        if agent_rank == worker:
+        owned = self._owns_locally(agent_id)
+        if owned:
             subcontextidx = self._rank2agentid2agentidx.get(worker).get(agent_id)
-            result = self._property_name_2_agent_data_tensor[property_name][
+            mine = self._property_name_2_agent_data_tensor[property_name][
                 subcontextidx
             ]
         else:
-            result = None
-        result = comm.bcast(result, root=agent_rank)
-
-        return result
+            mine = None
+        # Single-rank fast path: no collective needed.
+        if num_workers == 1:
+            return mine
+        # Gather (owned, value) tuples; the owning rank's value wins. A bool flag
+        # (not a sentinel) is used because allgather pickles values across ranks,
+        # so identity-based sentinels would not survive.
+        for is_owner, value in comm.allgather((owned, mine)):
+            if is_owner:
+                return value
+        return None
 
     def set_agent_property_value(
         self,
@@ -219,13 +239,34 @@ class AgentFactory:
         :param agent_id: Agent's id as returned by create_agent
         :param value: New value for property
         """
-        if worker == self._agent2rank[agent_id]:
+        if self._owns_locally(agent_id):
             if property_name not in self._property_name_2_agent_data_tensor:
                 raise ValueError(f"{property_name} not a property of any breed")
             subcontextidx = self._rank2agentid2agentidx.get(worker).get(agent_id)
             self._property_name_2_agent_data_tensor[property_name][
                 subcontextidx
             ] = value
+
+    def get_local_agent_property_value(self, property_name: str, agent_id: int) -> Any:
+        """Read a locally-owned agent's property — non-collective, no MPI.
+
+        Caller must own ``agent_id``; a non-local id raises KeyError (intended).
+        CPU-side counterpart used before GPU buffers exist.
+        """
+        subcontextidx = self._rank2agentid2agentidx[worker][agent_id]
+        return self._property_name_2_agent_data_tensor[property_name][subcontextidx]
+
+    def set_local_agent_property_value(
+        self, property_name: str, agent_id: int, value: Any
+    ) -> None:
+        """Write a locally-owned agent's property — non-collective, no MPI.
+
+        Caller must own ``agent_id``; a non-local id raises KeyError (intended).
+        """
+        if property_name not in self._property_name_2_agent_data_tensor:
+            raise ValueError(f"{property_name} not a property of any breed")
+        subcontextidx = self._rank2agentid2agentidx[worker][agent_id]
+        self._property_name_2_agent_data_tensor[property_name][subcontextidx] = value
 
     def get_agents_with(self, query: Callable) -> Dict[int, List[Any]]:
         """
@@ -312,7 +353,7 @@ class AgentFactory:
         agent_id: int,
         property_name: str,
     ) -> None:
-        if worker == self._agent2rank[agent_id]:
+        if self._owns_locally(agent_id):
             subcontextidx = self._rank2agentid2agentidx.get(worker).get(agent_id)
             property_idx = self._property_name_2_index[property_name]
             adt = regularized_agent_data_tensors[property_idx]

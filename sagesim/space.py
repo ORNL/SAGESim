@@ -76,7 +76,7 @@ class NetworkSpace(Space):
 
         In this mode, _locations is a dict {agent_id: [neighbors]} instead of a
         list indexed by global agent ID. Only local agents get entries — remote
-        agents referenced in edges don't need their own neighbor lists.
+        agents referenced as neighbors don't need their own neighbor lists.
 
         :param agent_ids: Iterable of local agent IDs to create containers for.
         """
@@ -135,6 +135,54 @@ class NetworkSpace(Space):
             self._locations[agent_0].add(agent_1)
             if not directed:
                 self._locations[agent_1].add(agent_0)
+
+    def bulk_connect(self, adjacency) -> None:
+        """Bulk-register neighbor lists from a prebuilt adjacency map.
+
+        The bulk form of connect_agents: equivalent to calling
+        connect_agents(a, b, directed=True) for every neighbor b in
+        adjacency[a], but assigns each agent's whole neighbor list in ONE pass
+        instead of one duplicate-checked append per connection. For an agent
+        population with C total connections this avoids C Python-level
+        .append()/.add() calls; it is the bulk path used by build_from_local_data.
+
+        The adjacency dict is taken as ALREADY-DIRECTED: exactly what is written
+        is what you get (no reverse connections are added). Callers that want
+        undirected behavior must list a neighbor on both agents.
+
+        Only local agents (those given to add_local_agents) may be keys; a
+        non-local id that appears only as a *neighbor* (value) is fine and gets
+        no neighbor container of its own — matching connect_agents, which writes
+        only _locations[agent_0]. A non-local id used as a KEY is an error.
+
+        Containers created by add_local_agents are mutated IN PLACE (not
+        rebound): build_from_local_data captures the container object into the
+        agent's "locations" property tensor before connections are added, so the
+        list/set identity must be preserved.
+
+        :param adjacency: dict {agent_id: iterable_of_neighbor_ids}.
+        """
+        if not self._sparse:
+            raise RuntimeError(
+                "bulk_connect requires sparse mode; call add_local_agents first."
+            )
+        for agent_a, neighbors in adjacency.items():
+            agent_a = int(agent_a)
+            if agent_a not in self._locations:
+                raise KeyError(
+                    f"bulk_connect: agent {agent_a} is not a local agent "
+                    f"(only local agents may be adjacency keys)."
+                )
+            if self._ordered:
+                seen = self._locations_set[agent_a]
+                bucket = self._locations[agent_a]
+                for b in neighbors:
+                    b = int(b)
+                    if b not in seen:
+                        seen.add(b)
+                        bucket.append(b)
+            else:
+                self._locations[agent_a].update(int(b) for b in neighbors)
 
     def disconnect_agents(
         self, agent_0: int, agent_1: int, directed: bool = False

@@ -32,6 +32,27 @@ def is_gpu_aware_mpi():
     return False
 
 
+def _resolve_neighbor_ranks(neighbor_ids, agent2rank):
+    """Resolve the owner rank of each id in ``neighbor_ids`` (boundary-scoped).
+
+    Returns an int32 array the same length as ``neighbor_ids``; entries whose id is
+    not in ``agent2rank`` are -1. Work and memory are O(distinct neighbor ids), NOT
+    O(max agent id) — only the ids that actually appear get looked up. This is what
+    keeps per-rank tick-1 cost proportional to the partition boundary instead of the
+    global agent population (see plan: boundary-scoped ghost lookup).
+    """
+    ranks = np.full(len(neighbor_ids), -1, dtype=np.int32)
+    if len(neighbor_ids) == 0:
+        return ranks
+    # Only the distinct neighbor ids need resolving — bounded by the boundary size.
+    uniq = np.unique(neighbor_ids)
+    uniq_ranks = np.fromiter((agent2rank.get(int(a), -1) for a in uniq),
+                             dtype=np.int32, count=len(uniq))
+    # Map each neighbor id back to its rank via the sorted unique ids (vectorized).
+    pos = np.searchsorted(uniq, neighbor_ids)
+    return uniq_ranks[pos]
+
+
 def discover_ghost_topology(all_neighbors, agent2rank, my_rank):
     """Discover ghost agent IDs from local neighbor lists (CPU-only, no MPI).
 
@@ -66,20 +87,8 @@ def discover_ghost_topology(all_neighbors, agent2rank, my_rank):
     if len(neighbor_ids) == 0:
         return np.array([], dtype=np.int64)
 
-    # Build dense rank lookup array for vectorized rank resolution
-    if isinstance(agent2rank, np.ndarray):
-        rank_lookup = agent2rank.astype(np.int32, copy=False)
-        max_agent_id = len(rank_lookup) - 1
-    else:
-        max_agent_id = max(agent2rank.keys())
-        rank_lookup = np.full(max_agent_id + 1, -1, dtype=np.int32)
-        for aid, r in agent2rank.items():
-            rank_lookup[aid] = r
-
-    # Vectorized rank lookup
-    in_range = neighbor_ids <= max_agent_id
-    neighbor_ranks = np.full(len(neighbor_ids), -1, dtype=np.int32)
-    neighbor_ranks[in_range] = rank_lookup[neighbor_ids[in_range]]
+    # Resolve owner rank per neighbor (boundary-scoped: O(distinct neighbor ids)).
+    neighbor_ranks = _resolve_neighbor_ranks(neighbor_ids, agent2rank)
 
     # Keep only cross-rank neighbors
     cross_mask = (neighbor_ranks != my_rank) & (neighbor_ranks >= 0)
@@ -590,21 +599,9 @@ class CommunicationManager:
                 has_cross_rank_work = False
 
         if has_cross_rank_work:
-            # Build dense rank lookup: rank_lookup[agent_id] = rank
-            agent2rank = self.agent_factory._agent2rank
-            if isinstance(agent2rank, np.ndarray):
-                rank_lookup = agent2rank.astype(np.int32, copy=False)
-                max_agent_id = len(rank_lookup) - 1
-            else:
-                max_agent_id = max(agent2rank.keys())
-                rank_lookup = np.full(max_agent_id + 1, -1, dtype=np.int32)
-                for aid, r in agent2rank.items():
-                    rank_lookup[aid] = r
-
-            # Vectorized rank lookup for all neighbors
-            in_range = neighbor_ids <= max_agent_id
-            neighbor_ranks = np.full(len(neighbor_ids), -1, dtype=np.int32)
-            neighbor_ranks[in_range] = rank_lookup[neighbor_ids[in_range]]
+            # Resolve owner rank per neighbor (boundary-scoped: O(distinct neighbor ids)).
+            neighbor_ranks = _resolve_neighbor_ranks(
+                neighbor_ids, self.agent_factory._agent2rank)
 
             # Filter to cross-rank neighbors
             cross_mask = (neighbor_ranks != self.my_rank) & (neighbor_ranks >= 0)
