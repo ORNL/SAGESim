@@ -1,5 +1,8 @@
 """
-SuperNeuroABM basic Model class
+SAGESim basic Model class.
+
+Core agent-based-modeling Model: registers agents and their connections,
+builds the simulation state, and drives the GPU step kernels.
 
 """
 
@@ -413,20 +416,104 @@ class Model:
             raise Exception(f"All breeds must be registered before agents are created!")
         self._agent_factory.register_breed(breed)
 
-    def create_agent_of_breed(self, breed: Breed, add_to_space=True, rank: int = None, **kwargs) -> int:
-        agent_id = self._agent_factory.create_agent(breed, rank=rank, **kwargs)
+    def create_agent_of_breed(self, breed: Breed, add_to_space=True, rank: int = None, agent_id: int = None, **kwargs) -> int:
+        agent_id = self._agent_factory.create_agent(breed, rank=rank, agent_id=agent_id, **kwargs)
         if add_to_space:
             self.get_space().add_agent(agent_id)
         return agent_id
 
+    def build_from_local_data(self, agents, connections, remote_agent_ranks=None, directed=False):
+        """Build model from pre-prepared local agent data (bulk path).
+
+        Application prepares all local agents with IDs, breeds, and property
+        values, then calls this once. SAGESim pre-allocates and populates
+        everything in bulk — no per-agent create_agent_of_breed() calls.
+
+        :param agents: list of dicts, each with:
+            - 'id': int (global agent ID)
+            - 'breed': Breed object (registered breed)
+            - 'properties': dict of property_name -> value
+        :param connections: list of (agent_a, agent_b) tuples.
+            If directed=False (default), creates bidirectional connections.
+            If directed=True, creates one-way connections (a can see b only).
+        :param remote_agent_ranks: dict {remote_agent_id: rank} for MPI ghost exchange
+        :param directed: if True, connections are one-way. If False (default),
+            connections are bidirectional. Matches connect_agents() default.
+        """
+        from collections import OrderedDict
+        from copy import copy
+
+        rank = MPI.COMM_WORLD.Get_rank()
+        n_local = len(agents)
+        local_ids = [a['id'] for a in agents]
+
+        # 1. Sparse space — dict-based, local agents only
+        self.get_space().add_local_agents(local_ids)
+
+        # 2. Bulk agent factory setup
+        af = self._agent_factory
+        local_mapping = OrderedDict((int(aid), i) for i, aid in enumerate(local_ids))
+        af._rank2agentid2agentidx[rank] = local_mapping
+        af._num_agents = max(int(a) for a in local_ids) + 1 if local_ids else 0
+        for aid in local_ids:
+            af._agent2rank[int(aid)] = rank
+        for agent in agents:
+            af._agent2breed[agent['id']] = agent['breed']._breedidx
+
+        # 3. Fill property tensors in bulk
+        for prop_name in af._property_name_2_agent_data_tensor:
+            tensor = [None] * n_local
+            for i, agent in enumerate(agents):
+                if prop_name == "breed":
+                    tensor[i] = agent['breed']._breedidx
+                elif prop_name == "locations":
+                    tensor[i] = self.get_space()._locations[agent['id']]
+                else:
+                    tensor[i] = agent['properties'].get(
+                        prop_name, copy(af._property_name_2_defaults[prop_name]))
+            af._property_name_2_agent_data_tensor[prop_name] = tensor
+
+        # 4. Register remote agent ranks
+        if remote_agent_ranks:
+            af.register_remote_agents(remote_agent_ranks)
+
+        # 5. Create connections (bulk).
+        # `connections` is either a prebuilt adjacency dict {a: [neighbors]} or
+        # a list of (agent, neighbor) pairs [(a, b), ...]. Either way we
+        # normalize to a single adjacency dict and assign each neighbor list in
+        # ONE pass via bulk_connect — no per-connection connect_agents() call.
+        space = self.get_space()
+        if isinstance(connections, dict):
+            # Already-directed adjacency. `directed` does not apply; warn if the
+            # caller asked for undirected, since that combination is meaningless
+            # (the dict already encodes whatever directionality it has).
+            if not directed:
+                warnings.warn(
+                    "build_from_local_data: directed=False is ignored when "
+                    "connections is an adjacency dict; the dict is taken "
+                    "verbatim as directed adjacency.",
+                    stacklevel=2,
+                )
+            space.bulk_connect(connections)
+        else:
+            adjacency = {}
+            for agent_a, agent_b in connections:
+                adjacency.setdefault(agent_a, []).append(agent_b)
+                if not directed:
+                    adjacency.setdefault(agent_b, []).append(agent_a)
+            space.bulk_connect(adjacency)
+
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
         if self._is_setup and hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
-            # Fast path: read single agent directly from GPU
+            # Fast path: read single agent directly from GPU.
+            # Ownership is resolved from LOCAL membership (id in this rank's GPU
+            # buffer), not from a global _agent2rank — the owner reads and shares
+            # via allgather, so this works under a local-only map.
             buf = self._gpu_buffers
             prop_idx = self._agent_factory._property_name_2_index[property_name]
-            agent_rank = self._agent_factory._agent2rank[id]
 
-            if agent_rank == MPI.COMM_WORLD.Get_rank():
+            owned = id in buf.agent_id_to_index
+            if owned:
                 buf_idx = buf.agent_id_to_index[id]
                 if prop_idx == 1:
                     # CSR/locations: read one agent's neighbor slice
@@ -438,7 +525,15 @@ class Model:
             else:
                 result = None
 
-            return MPI.COMM_WORLD.bcast(result, root=agent_rank)
+            comm = MPI.COMM_WORLD
+            if comm.Get_size() == 1:
+                return result
+            # Gather (owned, value) tuples; the owning rank's value wins. A bool flag
+            # (not a sentinel) is used because allgather pickles values across ranks.
+            for is_owner, value in comm.allgather((owned, result)):
+                if is_owner:
+                    return value
+            return None
 
         # Pre-setup path: use CPU-side data
         if self._is_setup:
@@ -453,6 +548,43 @@ class Model:
         self._agent_factory.set_agent_property_value(
             property_name=property_name, agent_id=id, value=value
         )
+        # GPU buffers are now stale — force rebuild on next tick
+        if hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
+            self._gpu_buffers.is_initialized = False
+            self._cached_all_args = None
+
+    def get_local_agent_property_value(self, id: int, property_name: str) -> Any:
+        """Read a LOCALLY-OWNED agent's property — non-collective, no MPI.
+
+        Unlike get_agent_property_value (collective, resolves any rank), this reads
+        only an agent this rank owns and does NO communication. The caller must pass
+        an id it owns (e.g. resolved from app-level ownership metadata); passing a
+        non-local id is a programming error and raises KeyError. Use this on the
+        scalable path where every rank reads only its own agents and reduces results
+        itself, so no global agent->rank map is ever needed.
+        """
+        if not (self._is_setup and hasattr(self, '_gpu_buffers')
+                and self._gpu_buffers.is_initialized):
+            # Pre-setup / pre-first-tick: read from CPU-side AgentFactory storage.
+            return self._agent_factory.get_local_agent_property_value(
+                property_name=property_name, agent_id=id)
+        buf = self._gpu_buffers
+        prop_idx = self._agent_factory._property_name_2_index[property_name]
+        buf_idx = buf.agent_id_to_index[id]  # KeyError if id not local (intended)
+        if prop_idx == 1:
+            # CSR/locations: read one agent's neighbor slice
+            start = int(buf.neighbor_offsets[buf_idx].get())
+            end = int(buf.neighbor_offsets[buf_idx + 1].get())
+            return buf.neighbor_values_ids[start:end].get().tolist()
+        return buf.property_tensors[prop_idx][buf_idx].get().tolist()
+
+    def set_local_agent_property_value(self, id: int, property_name: str, value: Any) -> None:
+        """Write a LOCALLY-OWNED agent's property — non-collective, no MPI.
+
+        Counterpart to get_local_agent_property_value. Caller must own ``id``.
+        """
+        self._agent_factory.set_local_agent_property_value(
+            property_name=property_name, agent_id=id, value=value)
         # GPU buffers are now stale — force rebuild on next tick
         if hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
             self._gpu_buffers.is_initialized = False
@@ -666,19 +798,6 @@ class Model:
         """
         self._logical_id_map[int(agent_id)] = int(logical_id)
 
-    def load_partition(self, partition_file: str, format: str = "auto") -> None:
-        """Load network partition from file to optimize multi-worker performance.
-
-        This method loads a pre-computed network partition that assigns agents to MPI ranks
-        to minimize cross-worker communication. Must be called BEFORE creating any agents.
-
-        For details on partition formats and usage, see AgentFactory.load_partition().
-
-        :param partition_file: Path to partition file
-        :param format: File format ('pickle', 'json', 'numpy', 'text', or 'auto')
-        """
-        self._agent_factory.load_partition(partition_file, format)
-
     def setup(self, use_gpu: bool = True, skip_priority_barriers=False) -> None:
         """
         Must be called before first simulate call.
@@ -695,6 +814,26 @@ class Model:
 
         self._use_gpu = use_gpu
         self._skip_priority_barriers = skip_priority_barriers
+
+        # GPU selection is the launcher's job, not the application's. On Frontier the
+        # submit script binds each rank to its GPU with `srun --gpu-bind=closest`
+        # (each rank then sees exactly one device as device 0), so we simply use
+        # whatever Slurm made visible — no `rank % ndev` in user code. The only case
+        # this gets wrong is an UNBOUND multi-GPU launch (all GPUs visible to every
+        # rank, no --gpu-bind): cupy would default all ranks to device 0. We don't
+        # silently pick a device there (that would fight a future binding), but we
+        # warn so it isn't a quiet all-ranks-on-device-0 performance cliff.
+        if use_gpu:
+            ndev = cp.cuda.runtime.getDeviceCount()
+            comm = MPI.COMM_WORLD
+            if ndev > 1 and comm.Get_size() > 1 and comm.Get_rank() == 0:
+                warnings.warn(
+                    f"{ndev} GPUs visible to each of {comm.Get_size()} ranks and no "
+                    "per-rank GPU binding detected; all ranks will share device 0. "
+                    "Launch with `srun --gpu-bind=closest` (or --ntasks-per-gpu=1) "
+                    "so each rank gets its own GPU."
+                )
+
         # Globals uploaded to GPU in _build_gpu_buffers()
         self.tick = 0
 
@@ -868,12 +1007,15 @@ class Model:
 
         # Print agent distribution summary
         if worker == 0:
-            total_agents = self._agent_factory._num_agents
             agents_per_rank = {}
             a2r = self._agent_factory._agent2rank
-            for agent_id in range(total_agents):
-                r = int(a2r[agent_id]) if isinstance(a2r, np.ndarray) else a2r.get(agent_id, -1)
-                agents_per_rank[r] = agents_per_rank.get(r, 0) + 1
+            if isinstance(a2r, np.ndarray):
+                unique, counts = np.unique(a2r, return_counts=True)
+                for r, c in zip(unique, counts):
+                    agents_per_rank[int(r)] = int(c)
+            else:
+                for r in a2r.values():
+                    agents_per_rank[r] = agents_per_rank.get(r, 0) + 1
 
 
         self._is_setup = True
@@ -1497,7 +1639,7 @@ class Model:
             range_args.append(cp.float32(p_count))
             range_summary.append(f"P{p_idx}:{p_count}")
 
-        # Prepare subclass-specific extra kernel args (e.g. spike recording buffers)
+        # Prepare subclass-specific extra kernel args (e.g. extra output buffers)
         extra_kernel_args = self._prepare_kernel_extras(num_local_agents, sync_workers_every_n_ticks)
 
         if self._verbose_timing:
@@ -1549,7 +1691,7 @@ class Model:
 
         t_gpu_kernel_start = t_kernel_launch_start  # Keep for backward compat
 
-        # Process subclass-specific extra data (e.g. download spike records)
+        # Process subclass-specific extra data (e.g. download extra output buffers)
         if self._verbose_timing:
             t_extras_start = time.time()
         self._process_kernel_extras()
