@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sagesim"
 version = "0.6.0"
-dynamic = ["dependencies", "optional-dependencies"]
+dynamic = ["dependencies"]
 
 requires-python = ">=3.11"
 authors = [
@@ -31,6 +31,15 @@ where = ["."]
 
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
+
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["build", "scaling_tests", "docs", "examples"]
 
 
 [project.urls]
