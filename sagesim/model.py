@@ -45,7 +45,7 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map, return_arra
     :return: Same structure with IDs replaced by local indices (-1 if not found)
     """
     # OPTIMIZATION: Build lookup arrays ONCE instead of for every agent!
-    id_keys = np.array(list(agent_id_to_index_map.keys()), dtype=np.int32)
+    id_keys = np.array(list(agent_id_to_index_map.keys()), dtype=np.int64)
     id_values = np.array(list(agent_id_to_index_map.values()), dtype=np.int32)
     min_id = id_keys.min()
     max_id = id_keys.max()
@@ -75,7 +75,7 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map, return_arra
             converted = np.full(arr.shape, -1, dtype=np.int32)
 
             if np.any(valid_mask):
-                valid_ids = arr[valid_mask].astype(np.int32)
+                valid_ids = arr[valid_mask].astype(np.int64)
 
                 # Use pre-built lookup arrays
                 if use_dense:
@@ -128,7 +128,7 @@ def convert_agent_indices_to_ids(data_tensor, agent_index_to_id_list):
     :return: Same structure with indices replaced by agent IDs (-1 remains -1)
     """
     # Convert to numpy array for vectorized operations (much faster)
-    id_array = np.array(agent_index_to_id_list, dtype=np.int32)
+    id_array = np.array(agent_index_to_id_list, dtype=np.int64)
     list_len = len(agent_index_to_id_list)
 
     # FAST PATH: If data_tensor is already a 2D numpy array, vectorize everything
@@ -1390,7 +1390,7 @@ class Model:
                     np.asarray(_prebuilt_csr_offsets, dtype=np.int32),
                     np.full(num_ghost, last, dtype=np.int32),
                 ])
-                values_ids_np = np.asarray(prebuilt_values, dtype=np.int32)
+                values_ids_np = np.asarray(prebuilt_values, dtype=np.int64)
                 values_np = convert_agent_ids_to_indices(
                     [values_ids_np], agent_id_to_index, return_arrays=True)[0]
                 buf.allocate_csr(offsets_np, values_np, values_ids_np, buf.num_total_agents)

@@ -127,7 +127,7 @@ def build_csr_from_ragged(ragged_list: List[Any]):
     :return: (offsets, values) as numpy int32 arrays
     """
     if not ragged_list:
-        return np.array([0], dtype=np.int32), np.array([], dtype=np.int32)
+        return np.array([0], dtype=np.int32), np.array([], dtype=np.int64)
 
     # Compute offsets from lengths
     lengths = []
@@ -142,7 +142,7 @@ def build_csr_from_ragged(ragged_list: List[Any]):
     np.cumsum(lengths, out=offsets[1:])
 
     total_entries = offsets[-1]
-    values = np.empty(total_entries, dtype=np.int32)
+    values = np.empty(total_entries, dtype=np.int64)
 
     # Fill values array
     pos = 0
@@ -150,7 +150,7 @@ def build_csr_from_ragged(ragged_list: List[Any]):
         if isinstance(row, np.ndarray):
             n = len(row)
             if n > 0:
-                values[pos:pos + n] = row.astype(np.int32)
+                values[pos:pos + n] = row.astype(np.int64)
             pos += n
         elif isinstance(row, set):
             for val in row:

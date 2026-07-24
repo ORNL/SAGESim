@@ -287,7 +287,7 @@ class GPUBufferManager:
         self.write_buffers = []         # List of CuPy arrays for double-buffered properties
         self.neighbor_offsets = None    # CuPy int32 (CSR offsets)
         self.neighbor_values = None     # CuPy int32 (CSR values, local indices for kernel)
-        self.neighbor_values_ids = None # CuPy int32 (CSR values, agent IDs for MPI)
+        self.neighbor_values_ids = None # CuPy int64 (CSR values, agent IDs for MPI)
         self.agent_ids_gpu = None       # CuPy array of all agent IDs (local + ghost)
         self.logical_ids_gpu = None    # CuPy array of logical IDs for stable RNG
         self.device_breed_local_write_bufs = []  # Write buffers for double-buffered BLAs
@@ -363,7 +363,7 @@ class GPUBufferManager:
         self.neighbor_values = cp.array(padded_values)
 
         # Values (agent IDs): pre-allocate with slack
-        padded_values_ids = np.full(self.csr_values_capacity, -1, dtype=np.int32)
+        padded_values_ids = np.full(self.csr_values_capacity, -1, dtype=np.int64)
         padded_values_ids[:total_edges] = values_ids_np
         self.neighbor_values_ids = cp.array(padded_values_ids)
 
@@ -423,7 +423,7 @@ class GPUBufferManager:
             self.neighbor_values = new_vals
 
         if self.neighbor_values_ids is not None:
-            new_vals_ids = cp.full(new_capacity, -1, dtype=cp.int32)
+            new_vals_ids = cp.full(new_capacity, -1, dtype=cp.int64)
             new_vals_ids[:self.csr_values_capacity] = self.neighbor_values_ids
             self.neighbor_values_ids = new_vals_ids
 
@@ -583,7 +583,7 @@ class CommunicationManager:
 
         if has_cross_rank_work:
             cpu_values_ids = buf.neighbor_values_ids[:total_edges_local].get()
-            cpu_values_ids = np.asarray(cpu_values_ids, dtype=np.int32)
+            cpu_values_ids = np.asarray(cpu_values_ids, dtype=np.int64)
 
             # 3. Vectorized: expand (local_agent_idx, neighbor_id) pairs
             counts = np.diff(cpu_offsets)
@@ -629,8 +629,8 @@ class CommunicationManager:
         # ---- Phase 2: Exchange requested agent ID lists ----
         send_req_requests = []
         for src_rank, ids in need_from_rank.items():
-            ids_np = ids.astype(np.int32)
-            req = self.comm.Isend([ids_np, MPI.INT], dest=src_rank, tag=100)
+            ids_np = ids.astype(np.int64)
+            req = self.comm.Isend([ids_np, MPI.INT64_T], dest=src_rank, tag=100)
             send_req_requests.append(req)
 
         # Receive: other ranks tell us which of our local agents they need
@@ -638,10 +638,10 @@ class CommunicationManager:
         recv_req_requests = []
         for dest_rank in range(self.num_workers):
             if dest_rank != self.my_rank and supply_counts[dest_rank] > 0:
-                recv_buf = np.empty(int(supply_counts[dest_rank]), dtype=np.int32)
+                recv_buf = np.empty(int(supply_counts[dest_rank]), dtype=np.int64)
                 requested_by_rank[dest_rank] = recv_buf
                 req = self.comm.Irecv(
-                    [recv_buf, MPI.INT], source=dest_rank, tag=100
+                    [recv_buf, MPI.INT64_T], source=dest_rank, tag=100
                 )
                 recv_req_requests.append(req)
 
