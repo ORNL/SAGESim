@@ -117,7 +117,7 @@ When a rank calls `build_from_local_data(agents, connections, remote_agent_ranks
 
 5. **Create connections** — for each `(a, b)` in the connections list, calls `space.connect_agents(a, b, directed=directed)`. This populates the neighbor lists that step functions use to access neighbor data.
 
-After `build_from_local_data()`, the application calls `model.setup(use_gpu=True)` which transfers everything to GPU buffers and sets up MPI communication channels based on the remote agent rank info.
+After `build_from_local_data()`, the application calls `model.setup()` which transfers everything to GPU buffers and sets up MPI communication channels based on the remote agent rank info.
 
 ### What SAGESim Does NOT Do
 
@@ -128,6 +128,6 @@ After `build_from_local_data()`, the application calls `model.setup(use_gpu=True
 
 ## Runtime (After Agent Creation)
 
-1. `model.setup(use_gpu=True)` — builds GPU buffers, discovers ghost topology from `remote_agent_ranks`, initializes MPI communication channels
+1. `model.setup()` — builds GPU buffers, discovers ghost topology from `remote_agent_ranks`, initializes MPI communication channels
 2. `model.simulate(ticks=N)` or `model.step()` — each tick: executes GPU kernels, then exchanges ghost agent data across ranks via MPI
 3. Step functions read neighbor data transparently — whether the neighbor is local or on another rank, the access pattern is the same

@@ -189,7 +189,7 @@ if __name__ == "__main__":
 
     # Setup must be called AFTER creating agents
     model.set_property_neighbor_visible("breed", False)  # no step func reads neighbor breeds
-    model.setup(use_gpu=True)
+    model.setup()
 
     print(f"Buffer size: 10")
 

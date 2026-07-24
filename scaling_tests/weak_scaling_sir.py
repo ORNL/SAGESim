@@ -238,7 +238,7 @@ def main():
     timings['model_init'] = time.time() - t0
 
     t0 = time.time()
-    model.setup(use_gpu=True)
+    model.setup()
     timings['model_setup'] = time.time() - t0
 
     model_create_time = timings['model_init'] + timings['model_setup']

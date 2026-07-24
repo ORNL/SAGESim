@@ -798,21 +798,22 @@ class Model:
         """
         self._logical_id_map[int(agent_id)] = int(logical_id)
 
-    def setup(self, use_gpu: bool = True, skip_priority_barriers=False) -> None:
+    def setup(self, *, skip_priority_barriers=False) -> None:
         """
         Must be called before first simulate call.
         Initializes model and resets ticks. Readies step functions
         and for breeds.
 
-        :param use_cuda: runs model in GPU mode.
-        :param num_dask_worker: number of dask workers
-        :param scheduler_fpath: specify if using external dask cluster. Else
-            distributed.LocalCluster is set up.
+        Execution is always on GPU: the step functions are compiled to CuPy
+        kernels and there is no CPU backend.
+
+        :param skip_priority_barriers: priority values whose inter-priority
+            grid barrier can be skipped, when no step func at that priority
+            reads what the previous one wrote.
         """
         import time
         t_setup_total_start = time.time()
 
-        self._use_gpu = use_gpu
         self._skip_priority_barriers = skip_priority_barriers
 
         # GPU selection is the launcher's job, not the application's. On Frontier the
@@ -823,16 +824,14 @@ class Model:
         # rank, no --gpu-bind): cupy would default all ranks to device 0. We don't
         # silently pick a device there (that would fight a future binding), but we
         # warn so it isn't a quiet all-ranks-on-device-0 performance cliff.
-        if use_gpu:
-            ndev = cp.cuda.runtime.getDeviceCount()
-            comm = MPI.COMM_WORLD
-            if ndev > 1 and comm.Get_size() > 1 and comm.Get_rank() == 0:
-                warnings.warn(
-                    f"{ndev} GPUs visible to each of {comm.Get_size()} ranks and no "
-                    "per-rank GPU binding detected; all ranks will share device 0. "
-                    "Launch with `srun --gpu-bind=closest` (or --ntasks-per-gpu=1) "
-                    "so each rank gets its own GPU."
-                )
+        ndev = cp.cuda.runtime.getDeviceCount()
+        if ndev > 1 and comm.Get_size() > 1 and comm.Get_rank() == 0:
+            warnings.warn(
+                f"{ndev} GPUs visible to each of {comm.Get_size()} ranks and no "
+                "per-rank GPU binding detected; all ranks will share device 0. "
+                "Launch with `srun --gpu-bind=closest` (or --ntasks-per-gpu=1) "
+                "so each rank gets its own GPU."
+            )
 
         # Globals uploaded to GPU in _build_gpu_buffers()
         self.tick = 0

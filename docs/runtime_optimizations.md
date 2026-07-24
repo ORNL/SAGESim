@@ -414,7 +414,7 @@ def simulate(self, ticks, sync_workers_every_n_ticks=1):
 
 #### Before (Reimport Every Time)
 ```python
-def setup(self, use_gpu=True):
+def setup(self):
     # Generate step function file
     if worker == 0:
         with open(self._step_function_file_path, "w") as f:
@@ -431,7 +431,7 @@ def simulate(self, ticks, sync_workers_every_n_ticks=1):
 
 #### After (Import Once, Cache Forever)
 ```python
-def setup(self, use_gpu=True):
+def setup(self):
     # Generate step function file
     if worker == 0:
         with open(self._step_function_file_path, "w") as f:

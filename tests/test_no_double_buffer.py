@@ -197,7 +197,7 @@ class TestNoDoubleBuffer(unittest.TestCase):
         model = DoubleBufferModel()
         agent_id = model.create_agent()
 
-        model.setup(use_gpu=True)
+        model.setup()
         model.simulate(1, sync_workers_every_n_ticks=1)
 
         counter = model.get_agent_property_value(agent_id, "counter")
@@ -220,7 +220,7 @@ class TestNoDoubleBuffer(unittest.TestCase):
         model = NoDoubleBufferModel()
         agent_id = model.create_agent()
 
-        model.setup(use_gpu=True)
+        model.setup()
         model.simulate(1, sync_workers_every_n_ticks=1)
 
         counter = model.get_agent_property_value(agent_id, "counter")
@@ -245,7 +245,7 @@ class TestNoDoubleBuffer(unittest.TestCase):
         model = ReaderBeforeWriterDoubleBufferModel()
         agent_id = model.create_agent()
 
-        model.setup(use_gpu=True)
+        model.setup()
         model.simulate(1, sync_workers_every_n_ticks=1)
 
         counter = model.get_agent_property_value(agent_id, "counter")
@@ -268,7 +268,7 @@ class TestNoDoubleBuffer(unittest.TestCase):
         model = ReaderBeforeWriterNoDoubleBufferModel()
         agent_id = model.create_agent()
 
-        model.setup(use_gpu=True)
+        model.setup()
         model.simulate(1, sync_workers_every_n_ticks=1)
 
         counter = model.get_agent_property_value(agent_id, "counter")

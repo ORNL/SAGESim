@@ -215,7 +215,7 @@ class TestBuildFromLocalData(unittest.TestCase):
         model_a.set_agent_property_value(0, "state", 2)  # INFECTED
         for src, dst in network.edges:
             model_a.connect_agents(src, dst)
-        model_a.setup(use_gpu=True)
+        model_a.setup()
         model_a.simulate(1, sync_workers_every_n_ticks=1)
 
         # --- Model B: bulk path ---
@@ -233,7 +233,7 @@ class TestBuildFromLocalData(unittest.TestCase):
         connections = list(network.edges)
 
         model_b.build_from_local_data(agents, connections)
-        model_b.setup(use_gpu=True)
+        model_b.setup()
         model_b.simulate(1, sync_workers_every_n_ticks=1)
 
         # Compare all agent states

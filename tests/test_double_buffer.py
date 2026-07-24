@@ -294,7 +294,7 @@ class TestDoubleBuffer(unittest.TestCase):
         self.model = create_model_from_network(SIModel(p_infection=1.0), self.__class__.network)
         
         # Setup model
-        self.model.setup(use_gpu=True)
+        self.model.setup()
         
         
         # Run simulation
@@ -322,7 +322,7 @@ class TestDoubleBuffer(unittest.TestCase):
         self.model = create_model_from_network(SIRModel(p_infection=1.0, p_recovery=1.0), self.__class__.network)
         
         # Setup model
-        self.model.setup(use_gpu=True) 
+        self.model.setup() 
         
         # Run simulation for 2 ticks
         self.model.simulate(2, sync_workers_every_n_ticks=1)
