@@ -149,6 +149,12 @@ class AgentFactory:
             agent_id = self._num_agents
             self._num_agents += 1
         else:
+            if agent_id in self._agent2breed:
+                raise ValueError(
+                    f"Explicit agent_id {agent_id} is already in use; agent IDs must "
+                    f"be unique. Pass agent_id=None to auto-assign, or choose an "
+                    f"unused ID."
+                )
             self._num_agents = max(self._num_agents, agent_id + 1)
 
         # Assign agent to rank: explicit > round-robin

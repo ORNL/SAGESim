@@ -647,6 +647,52 @@ class CommunicationManager:
 
         MPI.Request.Waitall(send_req_requests + recv_req_requests)
 
+        # ---- Phase 2b: Exchange the BREED of each requested agent ----
+        # register_remote_agents() carries only agent->rank; a remote agent's
+        # breed lives with its owner. Breed-local-array ghost exchange is
+        # per-breed, so the requester must know which of its ghost agents belong
+        # to a given breed to size recv buffers and scatter values into the right
+        # BLA rows. The owner already knows which of its (local) agents each rank
+        # requested (requested_by_rank), so it reports their breeds here; the
+        # requester records them into _agent2breed for its ghost slots. Reply
+        # order matches the request order, so it aligns with need_from_rank.
+        #
+        # Ghost breeds are consumed ONLY by the neighbor-visible breed-local-array
+        # sizing below, so skip this exchange entirely when the model has none.
+        # `breed_local_ghost_info` is set in _build_gpu_buffers() before this call
+        # and is the same value the BLA block reads later, so the gate matches
+        # exactly when that block does work; it is symmetric across ranks (all
+        # register the same BLAs), so all ranks skip or all participate.
+        _bla_infos = getattr(buf, 'breed_local_ghost_info', [])
+        if any(info is not None for info in _bla_infos):
+            af = self.agent_factory
+            breed_send_bufs = {}
+            breed_send_requests = []
+            for dest_rank, agent_ids_np in requested_by_rank.items():
+                breeds_np = np.array(
+                    [af._agent2breed.get(int(aid), -1) for aid in agent_ids_np],
+                    dtype=np.int32,
+                )
+                breed_send_bufs[dest_rank] = breeds_np
+                breed_send_requests.append(
+                    self.comm.Isend([breeds_np, MPI.INT], dest=dest_rank, tag=101)
+                )
+            breed_recv_bufs = {}
+            breed_recv_requests = []
+            for src_rank, remote_ids in need_from_rank.items():
+                rbuf = np.empty(len(remote_ids), dtype=np.int32)
+                breed_recv_bufs[src_rank] = rbuf
+                breed_recv_requests.append(
+                    self.comm.Irecv([rbuf, MPI.INT], source=src_rank, tag=101)
+                )
+            MPI.Request.Waitall(breed_send_requests + breed_recv_requests)
+
+            # Record ghost breeds locally (used by buf_breeds below for BLA sizing).
+            for src_rank, remote_ids in need_from_rank.items():
+                recv_breeds = breed_recv_bufs[src_rank]
+                for aid, b in zip(remote_ids, recv_breeds):
+                    af._agent2breed[int(aid)] = int(b)
+
         # ---- Phase 3: Build send / recv index maps ----
         self.send_indices_gpu = {}
         self.send_counts = {}
