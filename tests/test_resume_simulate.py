@@ -120,8 +120,8 @@ class TestResumeSimulate(unittest.TestCase):
 
     def test_single_vs_multi_batch_small(self):
         """simulate(10) once vs simulate(1) x 10, 4 agents."""
-        m1 = AccumModel(); m1.create_agents(4); m1.set_seed(42); m1.setup(use_gpu=True)
-        m2 = AccumModel(); m2.create_agents(4); m2.set_seed(42); m2.setup(use_gpu=True)
+        m1 = AccumModel(); m1.create_agents(4); m1.set_seed(42); m1.setup()
+        m2 = AccumModel(); m2.create_agents(4); m2.set_seed(42); m2.setup()
 
         m1.simulate(ticks=10, sync_workers_every_n_ticks=1)
         for _ in range(10):
@@ -138,8 +138,8 @@ class TestResumeSimulate(unittest.TestCase):
 
     def test_single_vs_multi_batch_large(self):
         """simulate(50) once vs simulate(10) x 5, 1000 agents."""
-        m1 = AccumModel(); m1.create_agents(1000); m1.set_seed(42); m1.setup(use_gpu=True)
-        m2 = AccumModel(); m2.create_agents(1000); m2.set_seed(42); m2.setup(use_gpu=True)
+        m1 = AccumModel(); m1.create_agents(1000); m1.set_seed(42); m1.setup()
+        m2 = AccumModel(); m2.create_agents(1000); m2.set_seed(42); m2.setup()
 
         m1.simulate(ticks=50, sync_workers_every_n_ticks=1)
         for _ in range(5):
@@ -156,9 +156,9 @@ class TestResumeSimulate(unittest.TestCase):
 
     def test_various_batch_sizes(self):
         """simulate(60) vs simulate(20)x3 vs simulate(12)x5, 500 agents."""
-        m1 = AccumModel(); m1.create_agents(500); m1.set_seed(42); m1.setup(use_gpu=True)
-        m2 = AccumModel(); m2.create_agents(500); m2.set_seed(42); m2.setup(use_gpu=True)
-        m3 = AccumModel(); m3.create_agents(500); m3.set_seed(42); m3.setup(use_gpu=True)
+        m1 = AccumModel(); m1.create_agents(500); m1.set_seed(42); m1.setup()
+        m2 = AccumModel(); m2.create_agents(500); m2.set_seed(42); m2.setup()
+        m3 = AccumModel(); m3.create_agents(500); m3.set_seed(42); m3.setup()
 
         m1.simulate(ticks=60, sync_workers_every_n_ticks=1)
         for _ in range(3):
@@ -210,7 +210,7 @@ class TestDisconnectedClusters(unittest.TestCase):
                 m.set_agent_logical_id(aid, logical_id_offsets[cluster_idx] + i)
 
         m.set_seed(self.SEED)
-        m.setup(use_gpu=True)
+        m.setup()
         return m
 
     def test_two_clusters_small(self):
@@ -310,7 +310,7 @@ class TestBLAResume(unittest.TestCase):
         m.create_agents(n_agents)
         m.register_bla()
         m.set_seed(42)
-        m.setup(use_gpu=True)
+        m.setup()
         return m
 
     def test_bla_single_vs_multi(self):
@@ -434,7 +434,7 @@ class TestDisconnectedClustersBitExact(unittest.TestCase):
         m = NeighborModel()
         m.create_cluster(n, logical_id_offset=logical_offset)
         m.set_seed(self.SEED)
-        m.setup(use_gpu=True)
+        m.setup()
         for _ in range(self.TICKS):
             m.simulate(ticks=1, sync_workers_every_n_ticks=1)
         return m
@@ -444,7 +444,7 @@ class TestDisconnectedClustersBitExact(unittest.TestCase):
         m.create_cluster(n_a, logical_id_offset=0)
         m.create_cluster(n_b, logical_id_offset=n_a)
         m.set_seed(self.SEED)
-        m.setup(use_gpu=True)
+        m.setup()
         for _ in range(self.TICKS):
             m.simulate(ticks=1, sync_workers_every_n_ticks=1)
         return m
