@@ -186,6 +186,26 @@ def build_csr_values_only(ragged_list, offsets):
     return values
 
 
+# A padded property tensor is (capacity x width) float32. A width in the
+# thousands over a capacity of tens of millions is almost always a bug — e.g. a
+# shared/deduped column object mutated in place, so one row's length inflates the
+# whole column. Warn before the allocation so a would-be silent OOM prints its
+# shape first. Threshold ~8 GB (2e9 float32 elements).
+_PADDED_TENSOR_WARN_ELEMS = 2_000_000_000
+
+
+def _warn_if_huge_padded(capacity, width):
+    if capacity * width > _PADDED_TENSOR_WARN_ELEMS:
+        import sys
+        print(
+            f"[SAGESim][warn] convert_to_padded_gpu_tensor allocating a "
+            f"({capacity} x {width}) float32 tensor "
+            f"(~{capacity * width * 4 / 1e9:.1f} GB) — a width this large usually "
+            f"means a shared/deduped property column was mutated in place.",
+            file=sys.stderr, flush=True,
+        )
+
+
 def convert_to_padded_gpu_tensor(ragged_list, capacity):
     """Convert ragged list directly to padded GPU tensor (single allocation)."""
     if not ragged_list:
@@ -197,6 +217,7 @@ def convert_to_padded_gpu_tensor(ragged_list, capacity):
         if len(set(row_lengths)) == 1:
             first_len = len(ragged_list[0])
             if first_len > 0 and not isinstance(ragged_list[0][0], (list, tuple)):
+                _warn_if_huge_padded(capacity, first_len)
                 result = np.full((capacity, first_len), np.nan, dtype=np.float32)
                 result[:len(ragged_list)] = ragged_list
                 return cp.array(result)
@@ -212,6 +233,7 @@ def convert_to_padded_gpu_tensor(ragged_list, capacity):
                        for r in ragged_list), default=0)
         if max_len == 0:
             return cp.full((capacity, 0), np.nan, dtype=np.float32)
+        _warn_if_huge_padded(capacity, max_len)
         result = np.full((capacity, max_len), np.nan, dtype=np.float32)
         for i, row in enumerate(ragged_list):
             if isinstance(row, (list, tuple, set)) and len(row) > 0:

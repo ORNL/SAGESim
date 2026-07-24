@@ -87,6 +87,35 @@ class NetworkSpace(Space):
         else:
             self._locations = {int(aid): set() for aid in agent_ids}
 
+    def set_prebuilt_csr(self, neighbor_offsets, neighbor_values_ids) -> None:
+        """Accept an already-built local neighbor CSR instead of per-agent lists.
+
+        Columnar bulk build (Model.build_from_local_columns) hands the whole
+        rank's directed neighbor structure as two flat arrays — the same CSR that
+        add_local_agents + bulk_connect would otherwise produce, but constructed
+        with vectorized numpy from the source columns. Storing it here lets the
+        model skip both the O(num_agents) empty-container allocation and the
+        ragged-list → CSR transpose in setup, which is the whole point of the
+        columnar path (no per-agent Python objects).
+
+        The rows are in LOCAL-INDEX order (row i = the i-th local agent in the
+        order handed to build_from_local_columns) and the values are GLOBAL agent
+        ids (the -1 external-input sentinel is allowed), matching what
+        build_csr_from_ragged emits for the record path.
+
+        :param neighbor_offsets: numpy int32 array, length num_local_agents + 1.
+        :param neighbor_values_ids: numpy int32 array, flat neighbor global ids.
+        """
+        self._sparse = True
+        # No per-agent containers: the CSR is authoritative. Keep the dicts empty
+        # so get_location()/connect_agents() fail loudly rather than silently
+        # returning wrong (empty) neighbors for a prebuilt-CSR model.
+        self._locations = {}
+        if self._ordered:
+            self._locations_set = {}
+        self._prebuilt_csr_offsets = neighbor_offsets
+        self._prebuilt_csr_values = neighbor_values_ids
+
     def add_agent(self, agent: int) -> None:
         if self._sparse:
             # In sparse mode, container already exists from add_local_agents().

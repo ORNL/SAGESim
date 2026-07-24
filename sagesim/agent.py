@@ -53,6 +53,11 @@ class AgentFactory:
         self._rank2agentid2agentidx = {}  # global
 
         self._current_rank = 0
+        # Set by the columnar bulk build (Model.build_from_local_columns), which
+        # emits local agents already grouped by breed so a prebuilt neighbor CSR
+        # stays row-aligned. When True, sort_by_breed() verifies the order and
+        # skips the reorder rather than permuting (and desyncing) the CSR.
+        self._agents_prebreed_sorted = False
 
     @property
     def breeds(self) -> List[Breed]:
@@ -309,6 +314,22 @@ class AgentFactory:
 
         # Get breed data (property index 0)
         breed_data = self._property_name_2_agent_data_tensor["breed"]
+
+        # Columnar build already emits agents in breed-sorted order and holds the
+        # neighbor CSR in that same row order (see Model.build_from_local_columns).
+        # Reordering here would permute the property tensors while leaving the
+        # separately-stored CSR untouched — a silent miswiring. The order is
+        # already what this method would produce, so verify (cheap) and skip.
+        if self._agents_prebreed_sorted:
+            ordered = [breed_data[old_mapping[aid]] for aid in agent_ids]
+            if any(ordered[i] > ordered[i + 1] for i in range(n - 1)):
+                raise RuntimeError(
+                    "build_from_local_columns set _agents_prebreed_sorted but the "
+                    "local agents are not in non-decreasing breed order; the "
+                    "prebuilt CSR would desync. Sort the columns by breed index "
+                    "before calling build_from_local_columns."
+                )
+            return
         old_indices = [old_mapping[aid] for aid in agent_ids]
         breeds = [breed_data[idx] for idx in old_indices]
 

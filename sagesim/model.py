@@ -31,12 +31,17 @@ from sagesim.internal_utils import convert_to_equal_side_tensor, build_csr_from_
 from sagesim.gpu_kernels import GPUBufferManager, GPUHashMap, CommunicationManager, is_gpu_aware_mpi, discover_ghost_topology
 
 
-def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
+def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map, return_arrays=False):
     """
     Convert agent IDs in nested arrays to local indices using a hash map.
 
     :param data_tensor: Nested list structure containing agent IDs (can also contain sets)
     :param agent_id_to_index_map: Dictionary mapping agent_id -> local_index
+    :param return_arrays: When True, numpy-array rows are returned as numpy int32
+        arrays instead of Python lists. Set by the columnar CSR path, where the
+        single row holds the whole ~150M-element flat CSR: a ``.tolist()`` there
+        materializes a multi-GB Python list only to be re-arrayed in allocate_csr.
+        Non-array rows are unaffected; the default keeps the record path identical.
     :return: Same structure with IDs replaced by local indices (-1 if not found)
     """
     # OPTIMIZATION: Build lookup arrays ONCE instead of for every agent!
@@ -86,7 +91,7 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
 
                 converted[valid_mask] = indices
 
-            result.append(converted.tolist())
+            result.append(converted if return_arrays else converted.tolist())
         elif isinstance(agent_data, (list, tuple, set)):
             # Handle collections (list, tuple, set) with multiple connections
             converted_data = []
@@ -502,6 +507,111 @@ class Model:
                 if not directed:
                     adjacency.setdefault(agent_b, []).append(agent_a)
             space.bulk_connect(adjacency)
+
+    def build_from_local_columns(
+        self,
+        agent_ids,
+        breed_indices,
+        property_columns,
+        neighbor_offsets,
+        neighbor_values_ids,
+        remote_agent_ranks=None,
+    ):
+        """Build the model from columnar local data + a prebuilt neighbor CSR.
+
+        Columnar sibling of build_from_local_data. Where that path takes a list
+        of per-agent dicts and a ragged adjacency (one Python object per agent,
+        then transposed to columns + CSR at setup), this path takes the columns
+        and the CSR directly, so nothing per-agent is ever materialized. It is
+        the bulk build for very large local populations where the per-agent
+        object staging is the memory ceiling.
+
+        Domain-neutral: agents carry an id, a breed index, and named property
+        columns; connectivity is a directed neighbor CSR. No assumption about
+        what the agents or properties mean.
+
+        Ordering contract: rows are in one fixed LOCAL-INDEX order shared by
+        every argument — agent_ids[i], breed_indices[i], property_columns[p][i],
+        and CSR row i (neighbor_values_ids[neighbor_offsets[i]:neighbor_offsets[i+1]])
+        all describe the same local agent i. The caller MUST supply agents already
+        grouped by non-decreasing breed index (so setup's breed sort is a no-op and
+        the CSR stays row-aligned — see AgentFactory.sort_by_breed).
+
+        :param agent_ids: sequence of global agent ids, length n_local.
+        :param breed_indices: sequence of breed indices (breed._breedidx), length n_local.
+        :param property_columns: dict {property_name: sequence(length n_local)}. Must
+            not include the built-in "breed"/"locations"; any registered property
+            absent here is filled with its default. Values may be shared objects.
+        :param neighbor_offsets: numpy int32 array, length n_local + 1 (CSR offsets).
+        :param neighbor_values_ids: numpy int32 array of neighbor GLOBAL ids (flat CSR
+            values; the -1 external sentinel is allowed).
+        :param remote_agent_ranks: dict {remote_agent_id: rank} for MPI ghost exchange.
+        """
+        from collections import OrderedDict
+        from copy import copy
+
+        rank = MPI.COMM_WORLD.Get_rank()
+        agent_ids = [int(a) for a in agent_ids]
+        n_local = len(agent_ids)
+        if len(breed_indices) != n_local:
+            raise ValueError(
+                f"breed_indices length {len(breed_indices)} != agent_ids length {n_local}")
+        if len(neighbor_offsets) != n_local + 1:
+            raise ValueError(
+                f"neighbor_offsets length {len(neighbor_offsets)} != n_local + 1 "
+                f"({n_local + 1})")
+
+        af = self._agent_factory
+        reserved = {"breed", "locations"}
+        for name in property_columns:
+            if name in reserved:
+                raise ValueError(
+                    f"property_columns may not include the built-in '{name}'")
+            if name not in af._property_name_2_agent_data_tensor:
+                raise ValueError(f"unknown property '{name}' (register its breed first)")
+            if len(property_columns[name]) != n_local:
+                raise ValueError(
+                    f"property column '{name}' length {len(property_columns[name])} "
+                    f"!= n_local {n_local}")
+
+        # 1. Space: hand it the prebuilt CSR instead of per-agent containers.
+        space = self.get_space()
+        space.set_prebuilt_csr(neighbor_offsets, neighbor_values_ids)
+
+        # 2. Agent-factory bookkeeping (id <-> local index, rank, breed).
+        local_mapping = OrderedDict((aid, i) for i, aid in enumerate(agent_ids))
+        af._rank2agentid2agentidx[rank] = local_mapping
+        af._num_agents = (max(agent_ids) + 1) if agent_ids else 0
+        for aid in agent_ids:
+            af._agent2rank[aid] = rank
+        breed_list = [int(b) for b in breed_indices]
+        for aid, b in zip(agent_ids, breed_list):
+            af._agent2breed[aid] = b
+
+        # 3. Property tensors, columnar: assign each registered property's column
+        # directly (built-ins first, then supplied columns, then defaults for any
+        # property no column was given for). "locations" is intentionally empty —
+        # neighbors live in the prebuilt CSR, not per-agent lists.
+        for prop_name in af._property_name_2_agent_data_tensor:
+            if prop_name == "breed":
+                af._property_name_2_agent_data_tensor[prop_name] = breed_list
+            elif prop_name == "locations":
+                af._property_name_2_agent_data_tensor[prop_name] = []
+            elif prop_name in property_columns:
+                af._property_name_2_agent_data_tensor[prop_name] = list(
+                    property_columns[prop_name])
+            else:
+                default = af._property_name_2_defaults[prop_name]
+                af._property_name_2_agent_data_tensor[prop_name] = [
+                    copy(default) for _ in range(n_local)]
+
+        # 4. Remote ranks for ghost exchange.
+        if remote_agent_ranks:
+            af.register_remote_agents(remote_agent_ranks)
+
+        # 5. Mark breed-presorted so setup's sort_by_breed verifies-and-skips
+        # (reordering would desync the separately-held CSR).
+        af._agents_prebreed_sorted = True
 
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
         if self._is_setup and hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
@@ -1261,9 +1371,31 @@ class Model:
             _t0 = time.time()
 
         # 6. Combine local + ghost placeholder data and build GPU arrays
+        _prebuilt_csr_offsets = getattr(
+            self.get_space(), "_prebuilt_csr_offsets", None)
         combined_lists = []
         for i in range(self._agent_factory.num_properties):
             local_data = self.__rank_local_agent_data_tensors[i]
+
+            if i == 1 and _prebuilt_csr_offsets is not None:
+                # Columnar build: the local neighbor CSR is prebuilt. Extend its
+                # offsets with num_ghost empty rows (ghosts are never iterated) and
+                # map the flat global-id values to local buffer indices — the same
+                # two arrays build_csr_from_ragged would have produced, without the
+                # ragged list-of-lists staging. combined_lists[1] is a placeholder
+                # (allocate_property_tensors skips property index 1).
+                prebuilt_values = self.get_space()._prebuilt_csr_values
+                last = int(_prebuilt_csr_offsets[-1])
+                offsets_np = np.concatenate([
+                    np.asarray(_prebuilt_csr_offsets, dtype=np.int32),
+                    np.full(num_ghost, last, dtype=np.int32),
+                ])
+                values_ids_np = np.asarray(prebuilt_values, dtype=np.int32)
+                values_np = convert_agent_ids_to_indices(
+                    [values_ids_np], agent_id_to_index, return_arrays=True)[0]
+                buf.allocate_csr(offsets_np, values_np, values_ids_np, buf.num_total_agents)
+                combined_lists.append(None)
+                continue
 
             if i == 1:
                 # CSR: ghost agents get empty neighbor lists (never iterated by kernel)
@@ -1505,9 +1637,17 @@ class Model:
         if not buf.is_initialized:
             # --- FIRST TICK: full build ---
             t_neighbor_start = time.time()
-            rank_local_agents_neighbors = self.get_space()._neighbor_compute_func(
-                self.__rank_local_agent_data_tensors[1]
-            )
+            _prebuilt_csr_values = getattr(
+                self.get_space(), "_prebuilt_csr_values", None)
+            if _prebuilt_csr_values is not None:
+                # Columnar build: neighbors are one flat CSR values array already.
+                # discover_ghost_topology only needs the flat neighbor ids, so wrap
+                # it as a single "row" (np.concatenate of a 1-list is a no-op).
+                rank_local_agents_neighbors = [_prebuilt_csr_values]
+            else:
+                rank_local_agents_neighbors = self.get_space()._neighbor_compute_func(
+                    self.__rank_local_agent_data_tensors[1]
+                )
             t_neighbor_end = time.time()
 
             t_before_context = time.time()

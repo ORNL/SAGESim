@@ -204,6 +204,105 @@ class TestBuildFromLocalData(unittest.TestCase):
         for i in range(3):
             self.assertEqual(af._agent2rank[i], 0)
 
+    def test_columns_match_local_data(self):
+        """build_from_local_columns produces the SAME af tensors + CSR as
+        build_from_local_data for the same network (CPU-only; no GPU/setup)."""
+        import numpy as np
+        from sagesim.internal_utils import build_csr_from_ragged
+
+        states = [10, 20, 30, 40, 50]
+        # Directed adjacency, deliberately ragged (widths 2,1,0,1,0).
+        adj = {0: [1, 2], 1: [3], 2: [], 3: [4], 4: []}
+
+        # --- record path ---
+        mr = SIModel()
+        br = mr._infection_breed
+        agents = [{'id': i, 'breed': br, 'properties': {'state': s}}
+                  for i, s in enumerate(states)]
+        mr.build_from_local_data(agents, dict(adj), directed=True)
+        afr = mr._agent_factory
+        rec_off, rec_val = build_csr_from_ragged(
+            afr._property_name_2_agent_data_tensor['locations'])
+
+        # --- columnar path (prebuilt CSR from the same ragged adjacency) ---
+        mc = SIModel()
+        bc = mc._infection_breed
+        off, val = build_csr_from_ragged([adj[i] for i in range(5)])
+        mc.build_from_local_columns(
+            agent_ids=list(range(5)),
+            breed_indices=[bc._breedidx] * 5,
+            property_columns={'state': states},
+            neighbor_offsets=off,
+            neighbor_values_ids=val,
+        )
+        afc = mc._agent_factory
+
+        # Property tensors identical (every registered property except locations).
+        for prop in afr._property_name_2_agent_data_tensor:
+            if prop == 'locations':
+                continue
+            self.assertEqual(
+                afr._property_name_2_agent_data_tensor[prop],
+                afc._property_name_2_agent_data_tensor[prop],
+                f"property '{prop}' differs")
+        # Bookkeeping identical.
+        self.assertEqual(afr._agent2breed, afc._agent2breed)
+        self.assertEqual(dict(afr._rank2agentid2agentidx[0]),
+                         dict(afc._rank2agentid2agentidx[0]))
+        # CSR stored on the space matches the record path's build_csr_from_ragged.
+        self.assertTrue(np.array_equal(
+            rec_off, np.asarray(mc.get_space()._prebuilt_csr_offsets)))
+        self.assertTrue(np.array_equal(
+            rec_val, np.asarray(mc.get_space()._prebuilt_csr_values)))
+        # sort_by_breed is a verified no-op under the presorted flag.
+        afc.sort_by_breed()
+        self.assertEqual(dict(afc._rank2agentid2agentidx[0]),
+                         dict(afr._rank2agentid2agentidx[0]))
+
+    def test_columns_vs_sequential_1tick_spread(self):
+        """Columnar bulk path yields the same simulation as the sequential path.
+
+        GPU test (setup + simulate); run on a compute node with a GPU.
+        """
+        from sagesim.internal_utils import build_csr_from_ragged
+
+        network = generate_hierarchical_network(111)
+
+        # --- Model A: sequential path ---
+        model_a = SIModel(p_infection=1.0)
+        for node in network.nodes:
+            model_a.create_agent(1)
+        model_a.set_agent_property_value(0, "state", 2)  # INFECTED
+        for src, dst in network.edges:
+            model_a.connect_agents(src, dst)  # undirected
+        model_a.setup()
+        model_a.simulate(1, sync_workers_every_n_ticks=1)
+
+        # --- Model C: columnar path (build the same undirected CSR) ---
+        model_c = SIModel(p_infection=1.0)
+        breed = model_c._infection_breed
+        states = [2 if node == 0 else 1 for node in range(111)]
+        adj = {i: [] for i in range(111)}
+        for src, dst in network.edges:
+            adj[src].append(dst)
+            adj[dst].append(src)  # undirected, matches connect_agents default
+        off, val = build_csr_from_ragged([adj[i] for i in range(111)])
+        model_c.build_from_local_columns(
+            agent_ids=list(range(111)),
+            breed_indices=[breed._breedidx] * 111,
+            property_columns={'state': states},
+            neighbor_offsets=off,
+            neighbor_values_ids=val,
+        )
+        model_c.setup()
+        model_c.simulate(1, sync_workers_every_n_ticks=1)
+
+        for agent_id in range(111):
+            self.assertEqual(
+                model_a.get_agent_property_value(agent_id, "state"),
+                model_c.get_agent_property_value(agent_id, "state"),
+                f"Agent {agent_id}: columnar path diverged from sequential")
+
     def test_bulk_vs_sequential_1tick_spread(self):
         """Bulk and sequential paths produce identical simulation results."""
         network = generate_hierarchical_network(111)
