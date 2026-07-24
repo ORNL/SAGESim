@@ -40,6 +40,10 @@ test = ["pytest>=8.0"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = ["build", "scaling_tests", "docs", "examples"]
+markers = [
+    "benchmark: timing benchmark, deselected by default (run with `-m benchmark`)",
+]
+addopts = "-m 'not benchmark'"
 
 
 [project.urls]

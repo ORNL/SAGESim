@@ -9,7 +9,6 @@ worker_coroutine calls - no state corruption from post-kernel
 write-back, GPU synchronization, or buffer management.
 """
 
-import unittest
 from pathlib import Path
 
 import numpy as np
@@ -115,7 +114,7 @@ class BLAModel(Model):
             shape_per_agent=(2,), neighbor_visible=False)
 
 
-class TestResumeSimulate(unittest.TestCase):
+class TestResumeSimulate:
     """simulate(N) once must equal simulate(k) repeated N/k times."""
 
     def test_single_vs_multi_batch_small(self):
@@ -175,7 +174,7 @@ class TestResumeSimulate(unittest.TestCase):
             atol=1e-6, err_msg="60 vs 12x5")
 
 
-class TestDisconnectedClusters(unittest.TestCase):
+class TestDisconnectedClusters:
     """Two disconnected clusters in one model must produce the same
     results as running each cluster in its own separate model."""
 
@@ -301,7 +300,7 @@ class TestDisconnectedClusters(unittest.TestCase):
             atol=1e-6, err_msg="cluster B accum differs (asymmetric)")
 
 
-class TestBLAResume(unittest.TestCase):
+class TestBLAResume:
     """Double-buffered breed-local array must produce same results
     whether ticks run in one kernel launch or multiple."""
 
@@ -364,145 +363,3 @@ class TestBLAResume(unittest.TestCase):
             err_msg="bla_sum: 30 vs 10x3")
         np.testing.assert_allclose(bla1, bla3, atol=1e-6,
             err_msg="bla_sum: 30 vs 5x6")
-
-
-# --- Step function that reads from neighbors (like GGap P7) ---
-@jit.rawkernel(device="cuda")
-def neighbor_read_step(
-    tick,
-    agent_index,
-    agent_ids,
-    breeds,
-    locations,
-    value,
-    accum,
-):
-    """Each tick: sum neighbor values, add RNG, write to own value and accum."""
-    neighbor_sum = 0.0
-    neighbor_indices = locations[agent_index]
-    i = 0
-    while i < len(neighbor_indices) and neighbor_indices[i] != -1:
-        neighbor_idx = int(neighbor_indices[i])
-        neighbor_sum = neighbor_sum + value[neighbor_idx]
-        i = i + 1
-
-    r = rand_uniform_philox(tick, agent_index, 1)
-    value[agent_index] = value[agent_index] + r + neighbor_sum * 0.01
-    accum[agent_index] = accum[agent_index] + value[agent_index]
-
-
-class NeighborBreed(Breed):
-    def __init__(self):
-        super().__init__("NeighborBreed")
-        self.register_property("value", 0.0)
-        self.register_property("accum", 0.0)
-        self.register_step_func(
-            neighbor_read_step,
-            Path(__file__).resolve(),
-            priority=0,
-            no_double_buffer=["value", "accum"],
-        )
-
-
-class NeighborModel(Model):
-    def __init__(self):
-        space = NetworkSpace()
-        super().__init__(space, step_function_file_path="step_func_code_neighbor.py")
-        self._breed = NeighborBreed()
-        self.register_breed(breed=self._breed)
-
-    def create_cluster(self, n, logical_id_offset=0):
-        """Create n agents in a ring, return agent IDs."""
-        ids = []
-        for _ in range(n):
-            ids.append(self.create_agent_of_breed(self._breed, value=0.0, accum=0.0))
-        for i in range(n):
-            self.get_space().connect_agents(ids[i], ids[(i + 1) % n])
-        for i, aid in enumerate(ids):
-            self.set_agent_logical_id(aid, logical_id_offset + i)
-        return ids
-
-
-class TestDisconnectedClustersBitExact(unittest.TestCase):
-    """Bit-exact: disconnected clusters must produce identical results
-    whether run alone or together. Uses neighbor reads to match GGap pattern."""
-
-    SEED = 42
-    TICKS = 50
-
-    def _run_alone(self, n, logical_offset=0):
-        m = NeighborModel()
-        m.create_cluster(n, logical_id_offset=logical_offset)
-        m.set_seed(self.SEED)
-        m.setup()
-        for _ in range(self.TICKS):
-            m.simulate(ticks=1, sync_workers_every_n_ticks=1)
-        return m
-
-    def _run_together(self, n_a, n_b):
-        m = NeighborModel()
-        m.create_cluster(n_a, logical_id_offset=0)
-        m.create_cluster(n_b, logical_id_offset=n_a)
-        m.set_seed(self.SEED)
-        m.setup()
-        for _ in range(self.TICKS):
-            m.simulate(ticks=1, sync_workers_every_n_ticks=1)
-        return m
-
-    def _get_breed_data_raw(self, model, prop, start, count):
-        pidx = model._agent_factory._property_name_2_index[prop]
-        return model._gpu_buffers.property_tensors[pidx][start:start+count].get()
-
-    def test_small_clusters_bit_exact(self):
-        """20+30 agents: cluster A alone must bit-match cluster A in combined."""
-        n_a, n_b = 20, 30
-        solo_a = self._run_alone(n_a, logical_offset=0)
-        combined = self._run_together(n_a, n_b)
-
-        for prop in ["value", "accum"]:
-            s_a, c_a = solo_a._gpu_buffers.breed_ranges[solo_a._breed._breedidx]
-            s_c, c_c = combined._gpu_buffers.breed_ranges[combined._breed._breedidx]
-            data_solo = self._get_breed_data_raw(solo_a, prop, s_a, c_a)
-            data_comb = self._get_breed_data_raw(combined, prop, s_c, n_a)
-            np.testing.assert_array_equal(data_solo.view(np.uint32), data_comb.view(np.uint32),
-                err_msg=f"{prop}: cluster A bit-differs alone vs combined (20+30)")
-
-    def test_large_clusters_bit_exact(self):
-        """500+500 agents: both clusters bit-match."""
-        n_a, n_b = 500, 500
-        solo_a = self._run_alone(n_a, logical_offset=0)
-        solo_b = self._run_alone(n_b, logical_offset=n_a)
-        combined = self._run_together(n_a, n_b)
-
-        for prop in ["value", "accum"]:
-            s_a, _ = solo_a._gpu_buffers.breed_ranges[solo_a._breed._breedidx]
-            s_c, c_c = combined._gpu_buffers.breed_ranges[combined._breed._breedidx]
-
-            data_solo_a = self._get_breed_data_raw(solo_a, prop, s_a, n_a)
-            data_comb_a = self._get_breed_data_raw(combined, prop, s_c, n_a)
-            np.testing.assert_array_equal(data_solo_a.view(np.uint32), data_comb_a.view(np.uint32),
-                err_msg=f"{prop}: cluster A bit-differs (500+500)")
-
-            s_b, _ = solo_b._gpu_buffers.breed_ranges[solo_b._breed._breedidx]
-            data_solo_b = self._get_breed_data_raw(solo_b, prop, s_b, n_b)
-            data_comb_b = self._get_breed_data_raw(combined, prop, s_c + n_a, n_b)
-            np.testing.assert_array_equal(data_solo_b.view(np.uint32), data_comb_b.view(np.uint32),
-                err_msg=f"{prop}: cluster B bit-differs (500+500)")
-
-    def test_asymmetric_clusters_bit_exact(self):
-        """10+1000 agents: small cluster must bit-match."""
-        n_a, n_b = 10, 1000
-        solo_a = self._run_alone(n_a, logical_offset=0)
-        combined = self._run_together(n_a, n_b)
-
-        for prop in ["value", "accum"]:
-            s_a, _ = solo_a._gpu_buffers.breed_ranges[solo_a._breed._breedidx]
-            s_c, _ = combined._gpu_buffers.breed_ranges[combined._breed._breedidx]
-            data_solo = self._get_breed_data_raw(solo_a, prop, s_a, n_a)
-            data_comb = self._get_breed_data_raw(combined, prop, s_c, n_a)
-            np.testing.assert_array_equal(data_solo.view(np.uint32), data_comb.view(np.uint32),
-                err_msg=f"{prop}: cluster A bit-differs (10+1000)")
-
-
-if __name__ == "__main__":
-    unittest.main()

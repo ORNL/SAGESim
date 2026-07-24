@@ -16,7 +16,8 @@ Expected results:
 """
 
 import sys
-import unittest
+
+import pytest
 from pathlib import Path
 
 import cupy as cp
@@ -175,109 +176,103 @@ class ReaderBeforeWriterNoDoubleBufferModel(Model):
         return self.create_agent_of_breed(self._breed, counter=0, result=0)
 
 
-class TestNoDoubleBuffer(unittest.TestCase):
-
-    def tearDown(self):
-        """Clean up cached modules between tests."""
-        # Clear any cached step function modules to force regeneration
-        modules_to_remove = [
-            key for key in sys.modules.keys()
-            if key.startswith('step_func_code')
-        ]
-        for module_name in modules_to_remove:
-            del sys.modules[module_name]
-
-    def test_with_double_buffer_default(self):
-        """
-        WITH double buffering (default):
-        - Priority 0 writes counter = 10 to write buffer
-        - Priority 1 reads counter from read buffer (still 0)
-        - result = 0 * 2 = 0
-        """
-        model = DoubleBufferModel()
-        agent_id = model.create_agent()
-
-        model.setup()
-        model.simulate(1, sync_workers_every_n_ticks=1)
-
-        counter = model.get_agent_property_value(agent_id, "counter")
-        result = model.get_agent_property_value(agent_id, "result")
-
-        # Counter should be updated (write buffer copied to read buffer at end of tick)
-        self.assertEqual(counter, 10, "Counter should be 10 after tick")
-
-        # Result should be 0 because Priority 1 read from read buffer (old value)
-        self.assertEqual(result, 0,
-            "With double buffering, result should be 0 (read old counter value)")
-
-    def test_without_double_buffer(self):
-        """
-        WITHOUT double buffering for counter:
-        - Priority 0 writes counter = 10 directly to read buffer
-        - Priority 1 reads counter from read buffer (now 10)
-        - result = 10 * 2 = 20
-        """
-        model = NoDoubleBufferModel()
-        agent_id = model.create_agent()
-
-        model.setup()
-        model.simulate(1, sync_workers_every_n_ticks=1)
-
-        counter = model.get_agent_property_value(agent_id, "counter")
-        result = model.get_agent_property_value(agent_id, "result")
-
-        # Counter should be updated
-        self.assertEqual(counter, 10, "Counter should be 10 after tick")
-
-        # Result should be 20 because Priority 1 read the updated counter value
-        self.assertEqual(result, 20,
-            "Without double buffering, result should be 20 (read new counter value)")
-
-    def test_reader_before_writer_with_double_buffer(self):
-        """
-        Reader priority (0) < Writer priority (1), WITH double buffering:
-        - Priority 0 reads counter = 0, writes result = 0
-        - Priority 1 writes counter = 10
-        - result = 0 * 2 = 0
-
-        Double buffering doesn't matter here because reader runs first.
-        """
-        model = ReaderBeforeWriterDoubleBufferModel()
-        agent_id = model.create_agent()
-
-        model.setup()
-        model.simulate(1, sync_workers_every_n_ticks=1)
-
-        counter = model.get_agent_property_value(agent_id, "counter")
-        result = model.get_agent_property_value(agent_id, "result")
-
-        self.assertEqual(counter, 10, "Counter should be 10 after tick")
-        self.assertEqual(result, 0,
-            "Reader runs before writer, result should be 0")
-
-    def test_reader_before_writer_without_double_buffer(self):
-        """
-        Reader priority (0) < Writer priority (1), WITHOUT double buffering:
-        - Priority 0 reads counter = 0, writes result = 0
-        - Priority 1 writes counter = 10
-        - result = 0 * 2 = 0
-
-        Same result as with double buffering! Double buffering is unnecessary
-        when reader priority < writer priority.
-        """
-        model = ReaderBeforeWriterNoDoubleBufferModel()
-        agent_id = model.create_agent()
-
-        model.setup()
-        model.simulate(1, sync_workers_every_n_ticks=1)
-
-        counter = model.get_agent_property_value(agent_id, "counter")
-        result = model.get_agent_property_value(agent_id, "result")
-
-        self.assertEqual(counter, 10, "Counter should be 10 after tick")
-        self.assertEqual(result, 0,
-            "Reader runs before writer, result should be 0 (same as with double buffer)")
+@pytest.fixture(autouse=True)
+def clear_step_func_cache():
+    """Drop generated step-function modules so each test regenerates its own."""
+    yield
+    for name in [k for k in sys.modules if k.startswith("step_func_code")]:
+        del sys.modules[name]
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_with_double_buffer_default():
+    """
+    WITH double buffering (default):
+    - Priority 0 writes counter = 10 to write buffer
+    - Priority 1 reads counter from read buffer (still 0)
+    - result = 0 * 2 = 0
+    """
+    model = DoubleBufferModel()
+    agent_id = model.create_agent()
+
+    model.setup()
+    model.simulate(1, sync_workers_every_n_ticks=1)
+
+    counter = model.get_agent_property_value(agent_id, "counter")
+    result = model.get_agent_property_value(agent_id, "result")
+
+    # Counter is updated (write buffer copied to read buffer at end of tick)
+    assert counter == 10, "counter should be 10 after tick"
+    # Result is 0 because priority 1 read from the read buffer (old value)
+    assert result == 0, (
+        "with double buffering, result should be 0 (read old counter value)"
+    )
+
+
+def test_without_double_buffer():
+    """
+    WITHOUT double buffering for counter:
+    - Priority 0 writes counter = 10 directly to read buffer
+    - Priority 1 reads counter from read buffer (now 10)
+    - result = 10 * 2 = 20
+    """
+    model = NoDoubleBufferModel()
+    agent_id = model.create_agent()
+
+    model.setup()
+    model.simulate(1, sync_workers_every_n_ticks=1)
+
+    counter = model.get_agent_property_value(agent_id, "counter")
+    result = model.get_agent_property_value(agent_id, "result")
+
+    assert counter == 10, "counter should be 10 after tick"
+    # Result is 20 because priority 1 read the updated counter value
+    assert result == 20, (
+        "without double buffering, result should be 20 (read new counter value)"
+    )
+
+
+def test_reader_before_writer_with_double_buffer():
+    """
+    Reader priority (0) < writer priority (1), WITH double buffering:
+    - Priority 0 reads counter = 0, writes result = 0
+    - Priority 1 writes counter = 10
+    - result = 0 * 2 = 0
+
+    Double buffering doesn't matter here because the reader runs first.
+    """
+    model = ReaderBeforeWriterDoubleBufferModel()
+    agent_id = model.create_agent()
+
+    model.setup()
+    model.simulate(1, sync_workers_every_n_ticks=1)
+
+    counter = model.get_agent_property_value(agent_id, "counter")
+    result = model.get_agent_property_value(agent_id, "result")
+
+    assert counter == 10, "counter should be 10 after tick"
+    assert result == 0, "reader runs before writer, result should be 0"
+
+
+def test_reader_before_writer_without_double_buffer():
+    """
+    Reader priority (0) < writer priority (1), WITHOUT double buffering:
+    - Priority 0 reads counter = 0, writes result = 0
+    - Priority 1 writes counter = 10
+    - result = 0 * 2 = 0
+
+    Same result as with double buffering: double buffering is unnecessary when
+    reader priority < writer priority.
+    """
+    model = ReaderBeforeWriterNoDoubleBufferModel()
+    agent_id = model.create_agent()
+
+    model.setup()
+    model.simulate(1, sync_workers_every_n_ticks=1)
+
+    counter = model.get_agent_property_value(agent_id, "counter")
+    result = model.get_agent_property_value(agent_id, "result")
+
+    assert counter == 10, "counter should be 10 after tick"
+    assert result == 0, (
+        "reader runs before writer, result should be 0 (same as with double buffer)"
+    )

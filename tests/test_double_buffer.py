@@ -1,11 +1,13 @@
 import sys
-import unittest
+
 import networkx as nx
 import random
 import numpy as np
 import cupy as cp
 from cupyx import jit
 from pathlib import Path
+
+import pytest
 
 from sagesim.model import Model
 from sagesim.space import NetworkSpace
@@ -271,80 +273,60 @@ def create_model_from_network(model, network):
     return model
 
 
-class TestDoubleBuffer(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        """Set up the network once for all tests"""
-        cls.total_agents = 111
-        cls.network = generate_hierarchical_network(cls.total_agents)
-        
-    def tearDown(self):
-        """Clean up after each test"""
-        if hasattr(self, 'model'):
-            del self.model
-        
-        # Clear any cached modules to force regeneration
-        if 'step_func_code' in sys.modules:
-            del sys.modules['step_func_code']
-        
-    def test_1_tick_spread_with_SIModel(self):
-        """Test internal ticks with infection spreading on hierarchical network"""
-        # Generate network and create model
+@pytest.fixture(scope="module")
+def network():
+    """Built once for the module: both tests run on the same 111-agent network."""
+    return generate_hierarchical_network(111)
 
-        self.model = create_model_from_network(SIModel(p_infection=1.0), self.__class__.network)
-        
-        # Setup model
-        self.model.setup()
-        
-        
-        # Run simulation
-        # test with 1 tick to make sure infection spreads only to the middle agents
-        self.model.simulate(1, sync_workers_every_n_ticks=1)
 
-        
-        # Check that root agent (0) is still infected
-        root_state = self.model.get_agent_property_value(0, "state")
-        self.assertEqual(root_state, 2, "Root agent should remain infected")
-        
-        # Check that all middle agents (1-10) are infected
-        for agent_id in range(1, 11):
-            state = self.model.get_agent_property_value(agent_id, "state")
-            self.assertEqual(state, 2, f"Middle agent {agent_id} should be infected after 1 tick")
-        
-        # Check that all second layer agents (11-110) are still susceptible
-        for agent_id in range(11, 111):
-            state = self.model.get_agent_property_value(agent_id, "state")
-            self.assertEqual(state, 1, f"Second layer agent {agent_id} should be susceptible after 1 tick")
+@pytest.fixture(autouse=True)
+def clear_step_func_cache():
+    """Drop the generated step-function module so each test regenerates it."""
+    yield
+    sys.modules.pop("step_func_code", None)
 
-    def test_2_tick_spread_with_SIRModel(self):
-        """Test 2 ticks with SIR model: middle layer recovers, second layer gets infected"""
-        # Generate network and create model with both infection and recovery probabilities = 1
-        self.model = create_model_from_network(SIRModel(p_infection=1.0, p_recovery=1.0), self.__class__.network)
-        
-        # Setup model
-        self.model.setup() 
-        
-        # Run simulation for 2 ticks
-        self.model.simulate(2, sync_workers_every_n_ticks=1)
-        
-        # After 2 ticks with SIR model (infection and recovery prob = 1):
-        # Tick 1: Root (0) infects middle layer (1-10), then root recovers
-        # Tick 2: Middle layer (1-10) infects second layer (11-110), then middle layer recovers
-   
-        # Check that root agent (0) is recovered
-        root_state = self.model.get_agent_property_value(0, "state")
-        self.assertEqual(root_state, 3, "Root agent should be recovered after 2 ticks")
-        
-        # Check that all middle agents (1-10) are recovered
-        for agent_id in range(1, 11):
-            state = self.model.get_agent_property_value(agent_id, "state")
-            self.assertEqual(state, 3, f"Middle agent {agent_id} should be recovered after 2 ticks")
-        
-        # Check that all second layer agents (11-110) are infected
-        for agent_id in range(11, 111):
-            state = self.model.get_agent_property_value(agent_id, "state")
-            self.assertEqual(state, 2, f"Second layer agent {agent_id} should be infected after 2 ticks")
 
-    
-if __name__ == "__main__":
-    unittest.main()
+def test_1_tick_spread_with_SIModel(network):
+    """One tick on a hierarchical network infects only the middle layer."""
+    model = create_model_from_network(SIModel(p_infection=1.0), network)
+    model.setup()
+
+    # 1 tick, so infection must spread only to the middle agents
+    model.simulate(1, sync_workers_every_n_ticks=1)
+
+    assert model.get_agent_property_value(0, "state") == 2, (
+        "root agent should remain infected"
+    )
+    for agent_id in range(1, 11):
+        assert model.get_agent_property_value(agent_id, "state") == 2, (
+            f"middle agent {agent_id} should be infected after 1 tick"
+        )
+    for agent_id in range(11, 111):
+        assert model.get_agent_property_value(agent_id, "state") == 1, (
+            f"second layer agent {agent_id} should be susceptible after 1 tick"
+        )
+
+
+def test_2_tick_spread_with_SIRModel(network):
+    """Two ticks with SIR: middle layer recovers, second layer gets infected.
+
+    Tick 1: root (0) infects the middle layer (1-10), then root recovers.
+    Tick 2: middle layer infects the second layer (11-110), then it recovers.
+    """
+    model = create_model_from_network(
+        SIRModel(p_infection=1.0, p_recovery=1.0), network
+    )
+    model.setup()
+    model.simulate(2, sync_workers_every_n_ticks=1)
+
+    assert model.get_agent_property_value(0, "state") == 3, (
+        "root agent should be recovered after 2 ticks"
+    )
+    for agent_id in range(1, 11):
+        assert model.get_agent_property_value(agent_id, "state") == 3, (
+            f"middle agent {agent_id} should be recovered after 2 ticks"
+        )
+    for agent_id in range(11, 111):
+        assert model.get_agent_property_value(agent_id, "state") == 2, (
+            f"second layer agent {agent_id} should be infected after 2 ticks"
+        )

@@ -1,65 +1,28 @@
-#!/usr/bin/env python3
-"""
-Standalone tests for the software grid barrier used in SAGESim's fused kernel.
+"""Tests for the software grid barrier used in SAGESim's fused kernel.
 
-Run: conda activate superneuroabm && python tests/test_grid_barrier.py
+The barrier lets a single kernel launch run multiple dependent phases: every
+block arrives at a counter, spins until all blocks have arrived, and two
+threadfences bracket the atomic so writes from the previous phase are visible
+device-wide afterwards. ``sagesim/model.py`` emits this pattern into generated
+step functions; the kernels below are hand-written replicas of it.
 
-Tests:
-1. GPU detection (NVIDIA vs AMD)
-2. __threadfence() availability via CuPy JIT monkeypatch
-3. Software grid barrier correctness (2-phase kernel)
-4. Multi-barrier correctness (3 phases, 2 barriers)
-5. Fused tick-loop (100 ticks with barriers)
-6. Performance: N separate launches vs 1 fused launch
+The ``jit.threadfence`` builtin these kernels need is installed by the
+session-scoped fixture in conftest.py.
 """
 
-import sys
 import time
+
 import numpy as np
-
-# Ensure sagesim is importable
-sys.path.insert(0, ".")
-
 import cupy as cp
+import pytest
 from cupyx import jit
 
 
-def test_gpu_detection():
-    """Test 1: Detect GPU type and print info."""
-    print("=" * 60)
-    print("Test 1: GPU Detection")
-    print("=" * 60)
+def test_threadfence_builtin_is_installed():
+    """``jit.threadfence`` compiles and executes inside a rawkernel."""
+    assert hasattr(jit, "threadfence"), "jit.threadfence not installed"
 
-    dev = cp.cuda.Device()
-    attrs = dev.attributes
-    name = cp.cuda.runtime.getDeviceProperties(dev.id)['name']
-
-    is_hip = hasattr(cp.cuda.runtime, 'is_hip') and cp.cuda.runtime.is_hip
-    gpu_type = "AMD (HIP/ROCm)" if is_hip else "NVIDIA (CUDA)"
-
-    print(f"  GPU: {name}")
-    print(f"  Type: {gpu_type}")
-    print(f"  SMs: {attrs['MultiProcessorCount']}")
-    print(f"  Max threads/SM: {attrs.get('MaxThreadsPerMultiProcessor', 'N/A')}")
-    print(f"  Max blocks/SM: {attrs.get('MaxBlocksPerMultiprocessor', 'N/A')}")
-    print("  PASSED")
-    return True
-
-
-def test_threadfence():
-    """Test 2: Verify __threadfence() monkeypatch works in CuPy JIT."""
-    print("\n" + "=" * 60)
-    print("Test 2: __threadfence() Monkeypatch")
-    print("=" * 60)
-
-    from sagesim.jit_extensions import install_jit_extensions
-    install_jit_extensions()
-
-    # Verify the attribute exists
-    assert hasattr(jit, 'threadfence'), "jit.threadfence not installed"
-
-    # Test it compiles in a kernel
-    @jit.rawkernel(device='cuda')
+    @jit.rawkernel(device="cuda")
     def fence_test(out):
         tid = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x
         out[tid] = 1
@@ -70,28 +33,18 @@ def test_threadfence():
     fence_test[1, 32](out)
     cp.cuda.Stream.null.synchronize()
 
-    assert (out == 2).all(), f"Expected all 2s, got {out}"
-    print("  threadfence() compiles and executes correctly")
-    print("  PASSED")
-    return True
+    assert (out == 2).all(), f"expected all 2s, got {out}"
 
 
-def test_barrier_2phase():
-    """Test 3: Two-phase kernel with one grid barrier.
+def test_barrier_makes_writes_visible_across_blocks():
+    """Two-phase kernel, one barrier.
 
-    Phase 1: Each block writes its block index to its slot.
-    Barrier.
-    Phase 2: Each block reads from a different block's slot.
-    Verifies cross-block visibility after barrier.
+    Phase 1: each block writes its own index. Barrier. Phase 2: each block reads
+    a *different* block's slot. Without a working barrier the phase-2 read races
+    the phase-1 write.
     """
-    print("\n" + "=" * 60)
-    print("Test 3: Software Grid Barrier (2-phase)")
-    print("=" * 60)
 
-    from sagesim.jit_extensions import install_jit_extensions
-    install_jit_extensions()
-
-    @jit.rawkernel(device='cuda')
+    @jit.rawkernel(device="cuda")
     def barrier_2phase(data, barrier_counter, num_blocks_param):
         bid = jit.blockIdx.x
         tid = jit.threadIdx.x
@@ -132,32 +85,19 @@ def test_barrier_2phase():
     # Phase 2 reads: data[8+i] = data[(i+1) % 8] = (i+1) % 8 + 1
     for i in range(num_blocks):
         expected = (i + 1) % num_blocks + 1
-        actual = result[num_blocks + i]
-        assert actual == expected, \
-            f"Block {i}: expected {expected}, got {actual}"
-
-    print(f"  {num_blocks} blocks, cross-block reads all correct after barrier")
-    print("  PASSED")
-    return True
+        assert result[num_blocks + i] == expected, (
+            f"block {i}: expected {expected}, got {result[num_blocks + i]}"
+        )
 
 
-def test_barrier_3phase():
-    """Test 4: Three-phase kernel with 2 barriers (three sequential phases).
+def test_two_barriers_chain_three_phases():
+    """Three phases separated by two barriers.
 
-    Phase 1: Each block writes value V1 = bid * 10
-    Barrier 1
-    Phase 2: Each block reads neighbor's V1, writes V2 = V1_neighbor + bid
-    Barrier 2
-    Phase 3: Each block reads neighbor's V2, writes final result
+    Phase 1 writes V1, phase 2 reads a neighbor's V1 to build V2, phase 3 reads a
+    neighbor's V2. Catches a barrier that works once but not repeatedly.
     """
-    print("\n" + "=" * 60)
-    print("Test 4: Multi-Barrier (3 phases, 2 barriers)")
-    print("=" * 60)
 
-    from sagesim.jit_extensions import install_jit_extensions
-    install_jit_extensions()
-
-    @jit.rawkernel(device='cuda')
+    @jit.rawkernel(device="cuda")
     def barrier_3phase(v1, v2, result, barrier_counter, num_blocks_param):
         bid = jit.blockIdx.x
         tid = jit.threadIdx.x
@@ -214,37 +154,31 @@ def test_barrier_3phase():
     for i in range(num_blocks):
         neighbor = (i + 1) % num_blocks
         neighbor2 = (neighbor + 1) % num_blocks
-        expected_v2_neighbor = float(neighbor2 * 10 + neighbor)
-        assert result_cpu[i] == expected_v2_neighbor, \
-            f"Block {i}: expected {expected_v2_neighbor}, got {result_cpu[i]}"
-
-    print(f"  {num_blocks} blocks, 3 phases with 2 barriers all correct")
-    print("  PASSED")
-    return True
+        expected = float(neighbor2 * 10 + neighbor)
+        assert result_cpu[i] == expected, (
+            f"block {i}: expected {expected}, got {result_cpu[i]}"
+        )
 
 
-def test_fused_tick_loop():
-    """Test 5: Fused tick-loop with barriers, verify against sequential.
+def test_fused_tick_loop_matches_sequential_reference():
+    """50 ticks fused into one launch must match a sequential CPU reference.
 
-    Simulates 50 ticks where each tick:
-      Phase A: data[i] += 0.5 (all blocks)
-      Barrier
-      Phase B: data[i] = data[i] * 0.9 + data[(i+1)%N] * 0.1 (neighbor blend)
-      Barrier
+    Each tick, per block ``i``:
+      A. ``data[i] += 0.5 * (i + 1)``   — block-dependent, so blocks diverge
+      B. ``out[i] = data[i]*0.9 + data[i+1]*0.1``  — reads a *neighbor's* slot
+      C. ``data[i] = out[i]``
 
-    Uses float32 (matching SAGESim) and a stable operation (no overflow).
+    with a barrier after each phase. The per-block increment in A matters: with a
+    uniform increment every slot holds the same value, the blend in B collapses to
+    ``data[i] * 1.0``, and the neighbor read is never actually exercised. B writes
+    to a separate buffer so it has no intra-phase race of its own — the only thing
+    under test is whether the barrier makes the previous phase's writes visible
+    device-wide. float32 throughout to match SAGESim.
     """
-    print("\n" + "=" * 60)
-    print("Test 5: Fused Tick-Loop (50 ticks)")
-    print("=" * 60)
-
-    from sagesim.jit_extensions import install_jit_extensions
-    install_jit_extensions()
-
     num_ticks = 50
 
-    @jit.rawkernel(device='cuda')
-    def fused_kernel(data, barrier_counter, num_blocks_param, num_ticks_param):
+    @jit.rawkernel(device="cuda")
+    def fused_kernel(data, out, barrier_counter, num_blocks_param, num_ticks_param):
         bid = jit.blockIdx.x
         tid = jit.threadIdx.x
 
@@ -252,9 +186,9 @@ def test_fused_tick_loop():
         neighbor = (bid + 1) % jit.gridDim.x
 
         for tick in range(num_ticks_param):
-            # Phase A: increment own value
+            # Phase A: block-dependent increment
             if tid == 0:
-                data[bid] = data[bid] + 0.5
+                data[bid] = data[bid] + 0.5 * (float(bid) + 1.0)
 
             # --- barrier ---
             jit.syncthreads()
@@ -268,9 +202,25 @@ def test_fused_tick_loop():
             jit.syncthreads()
             barrier_id = barrier_id + 1
 
-            # Phase B: blend with neighbor
+            # Phase B: blend with neighbor, into a separate buffer
             if tid == 0:
-                data[bid] = data[bid] * 0.9 + data[neighbor] * 0.1
+                out[bid] = data[bid] * 0.9 + data[neighbor] * 0.1
+
+            # --- barrier ---
+            jit.syncthreads()
+            if tid == 0:
+                jit.threadfence()
+                jit.atomic_add(barrier_counter, 0, 1)
+                _barrier_target = (barrier_id + 1) * num_blocks_param
+                while jit.atomic_add(barrier_counter, 0, 0) < _barrier_target:
+                    pass
+                jit.threadfence()
+            jit.syncthreads()
+            barrier_id = barrier_id + 1
+
+            # Phase C: copy back
+            if tid == 0:
+                data[bid] = out[bid]
 
             # --- barrier ---
             jit.syncthreads()
@@ -286,49 +236,45 @@ def test_fused_tick_loop():
 
     num_blocks = 8
     data_gpu = cp.zeros(num_blocks, dtype=cp.float32)
+    out_gpu = cp.zeros(num_blocks, dtype=cp.float32)
     counter = cp.zeros(1, dtype=cp.int32)
 
-    fused_kernel[num_blocks, 32](data_gpu, counter, cp.int32(num_blocks), num_ticks)
+    fused_kernel[num_blocks, 32](
+        data_gpu, out_gpu, counter, cp.int32(num_blocks), num_ticks
+    )
     cp.cuda.Stream.null.synchronize()
     result_gpu = data_gpu.get()
 
     # Sequential reference on CPU (float32 to match GPU precision)
     data_ref = np.zeros(num_blocks, dtype=np.float32)
-    for tick in range(num_ticks):
-        data_ref += np.float32(0.5)
+    increment = np.float32(0.5) * (np.arange(num_blocks, dtype=np.float32) + 1)
+    for _ in range(num_ticks):
+        data_ref = data_ref + increment
         new_data = np.empty_like(data_ref)
         for i in range(num_blocks):
-            new_data[i] = np.float32(data_ref[i] * 0.9 + data_ref[(i + 1) % num_blocks] * 0.1)
+            new_data[i] = np.float32(
+                data_ref[i] * 0.9 + data_ref[(i + 1) % num_blocks] * 0.1
+            )
         data_ref = new_data
 
-    match = np.allclose(result_gpu, data_ref, rtol=1e-5)
-    print(f"  GPU result: {result_gpu[:4]}...")
-    print(f"  CPU result: {data_ref[:4]}...")
-    print(f"  Max diff: {np.max(np.abs(result_gpu - data_ref)):.2e}")
-    print(f"  Match: {match}")
-    if not match:
-        print("  FAILED")
-        return False
-    print("  PASSED")
-    return True
+    max_diff = float(np.max(np.abs(result_gpu - data_ref)))
+    assert np.allclose(result_gpu, data_ref, rtol=1e-5), (
+        f"fused tick-loop diverged from sequential reference over {num_ticks} "
+        f"ticks: max diff {max_diff:.2e}\n  gpu={result_gpu}\n  cpu={data_ref}"
+    )
 
 
-def test_persistent_threads():
-    """Test 5b: Persistent thread pattern — fewer blocks than work items.
+def test_persistent_threads_with_barriers():
+    """Persistent-thread pattern: far fewer threads than work items.
 
-    Tests that persistent threads (while agent_index < N, stride by total_threads)
-    produce correct results with barriers.
+    10k agents over 128 threads, striding by total_threads, 10 ticks with a
+    barrier between the update and the write-back.
     """
-    print("\n" + "=" * 60)
-    print("Test 5b: Persistent Threads with Barriers")
-    print("=" * 60)
 
-    from sagesim.jit_extensions import install_jit_extensions
-    install_jit_extensions()
-
-    @jit.rawkernel(device='cuda')
-    def persistent_kernel(data, read_buf, write_buf, barrier_counter,
-                          num_blocks_param, num_agents):
+    @jit.rawkernel(device="cuda")
+    def persistent_kernel(
+        data, read_buf, write_buf, barrier_counter, num_blocks_param, num_agents
+    ):
         thread_id = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x
         total_threads = jit.gridDim.x * jit.blockDim.x
         barrier_id = 0
@@ -387,30 +333,25 @@ def test_persistent_threads():
 
     result = read_buf.get()
     expected = 10.0  # 10 ticks, each adds 1
-    assert np.allclose(result, expected), \
-        f"Expected all {expected}, got min={result.min()} max={result.max()}"
-
-    print(f"  {num_agents} agents with {num_blocks * threads_per_block} threads")
-    print(f"  All values = {result[0]} (expected {expected})")
-    print("  PASSED")
-    return True
+    assert np.allclose(result, expected), (
+        f"expected all {expected}, got min={result.min()} max={result.max()}"
+    )
 
 
-def test_performance():
-    """Test 6: Benchmark N separate launches vs 1 fused launch."""
-    print("\n" + "=" * 60)
-    print("Test 6: Performance Benchmark")
-    print("=" * 60)
+@pytest.mark.benchmark
+def test_fused_launch_beats_separate_launches(capsys):
+    """Timing: 1000 separate launches vs one fused launch with barriers.
 
-    from sagesim.jit_extensions import install_jit_extensions
-    install_jit_extensions()
+    Deselected by default (``-m 'not benchmark'`` in pyproject.toml) because
+    timings on a shared login node are noise. Run with ``pytest -m benchmark -s``.
+    """
 
-    @jit.rawkernel(device='cuda')
+    @jit.rawkernel(device="cuda")
     def single_phase(data):
         tid = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x
         data[tid] = data[tid] + 1
 
-    @jit.rawkernel(device='cuda')
+    @jit.rawkernel(device="cuda")
     def fused_phases(data, barrier_counter, num_blocks_param, num_phases):
         tid = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x
         barrier_id = 0
@@ -458,56 +399,13 @@ def test_performance():
     cp.cuda.Stream.null.synchronize()
     t_fused = time.perf_counter() - t0
 
-    speedup = t_separate / t_fused if t_fused > 0 else float('inf')
-    print(f"  {num_phases} phases:")
-    print(f"    Separate launches: {t_separate*1000:.1f} ms ({t_separate/num_phases*1e6:.1f} us/launch)")
-    print(f"    Fused (barriers):  {t_fused*1000:.1f} ms ({t_fused/num_phases*1e6:.1f} us/barrier)")
-    print(f"    Speedup: {speedup:.1f}x")
-    print("  PASSED")
-    return True
-
-
-def main():
-    print("SAGESim Fused Kernel - Grid Barrier Validation Tests")
-    print("=" * 60)
-
-    tests = [
-        ("GPU Detection", test_gpu_detection),
-        ("ThreadFence Monkeypatch", test_threadfence),
-        ("2-Phase Barrier", test_barrier_2phase),
-        ("3-Phase Multi-Barrier", test_barrier_3phase),
-        ("Fused Tick-Loop", test_fused_tick_loop),
-        ("Persistent Threads", test_persistent_threads),
-        ("Performance Benchmark", test_performance),
-    ]
-
-    results = []
-    for name, test_fn in tests:
-        try:
-            passed = test_fn()
-            results.append((name, passed))
-        except Exception as e:
-            print(f"\n  FAILED with exception: {e}")
-            import traceback
-            traceback.print_exc()
-            results.append((name, False))
-
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    all_passed = True
-    for name, passed in results:
-        status = "PASS" if passed else "FAIL"
-        print(f"  [{status}] {name}")
-        if not passed:
-            all_passed = False
-
-    if all_passed:
-        print("\nAll tests passed!")
-    else:
-        print("\nSome tests FAILED!")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+    speedup = t_separate / t_fused if t_fused > 0 else float("inf")
+    with capsys.disabled():
+        print(
+            f"\n  {num_phases} phases:"
+            f"\n    separate launches: {t_separate * 1000:.1f} ms "
+            f"({t_separate / num_phases * 1e6:.1f} us/launch)"
+            f"\n    fused (barriers):  {t_fused * 1000:.1f} ms "
+            f"({t_fused / num_phases * 1e6:.1f} us/barrier)"
+            f"\n    speedup: {speedup:.1f}x"
+        )
