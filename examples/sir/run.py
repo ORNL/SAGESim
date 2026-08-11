@@ -231,7 +231,7 @@ if __name__ == "__main__":
     random_seed = 2  # Set seed for reproducible results
 
     model = SIRModel(p_infection=1.0, p_recovery=1.0, enable_state_tracking=True)
-    model.setup(use_gpu=True)
+    model.setup()
 
     model_creation_start = time()
     model = generate_small_world_of_agents(

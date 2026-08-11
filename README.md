@@ -94,7 +94,7 @@ for i in range(999):
     model.connect_agents(i, i + 1)
 
 # Setup and run
-model.setup(use_gpu=True)
+model.setup()
 model.simulate(ticks=100, sync_workers_every_n_ticks=1)
 ```
 

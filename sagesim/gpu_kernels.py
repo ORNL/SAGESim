@@ -32,6 +32,27 @@ def is_gpu_aware_mpi():
     return False
 
 
+def _resolve_neighbor_ranks(neighbor_ids, agent2rank):
+    """Resolve the owner rank of each id in ``neighbor_ids`` (boundary-scoped).
+
+    Returns an int32 array the same length as ``neighbor_ids``; entries whose id is
+    not in ``agent2rank`` are -1. Work and memory are O(distinct neighbor ids), NOT
+    O(max agent id) — only the ids that actually appear get looked up. This is what
+    keeps per-rank tick-1 cost proportional to the partition boundary instead of the
+    global agent population (see plan: boundary-scoped ghost lookup).
+    """
+    ranks = np.full(len(neighbor_ids), -1, dtype=np.int32)
+    if len(neighbor_ids) == 0:
+        return ranks
+    # Only the distinct neighbor ids need resolving — bounded by the boundary size.
+    uniq = np.unique(neighbor_ids)
+    uniq_ranks = np.fromiter((agent2rank.get(int(a), -1) for a in uniq),
+                             dtype=np.int32, count=len(uniq))
+    # Map each neighbor id back to its rank via the sorted unique ids (vectorized).
+    pos = np.searchsorted(uniq, neighbor_ids)
+    return uniq_ranks[pos]
+
+
 def discover_ghost_topology(all_neighbors, agent2rank, my_rank):
     """Discover ghost agent IDs from local neighbor lists (CPU-only, no MPI).
 
@@ -66,20 +87,8 @@ def discover_ghost_topology(all_neighbors, agent2rank, my_rank):
     if len(neighbor_ids) == 0:
         return np.array([], dtype=np.int64)
 
-    # Build dense rank lookup array for vectorized rank resolution
-    if isinstance(agent2rank, np.ndarray):
-        rank_lookup = agent2rank.astype(np.int32, copy=False)
-        max_agent_id = len(rank_lookup) - 1
-    else:
-        max_agent_id = max(agent2rank.keys())
-        rank_lookup = np.full(max_agent_id + 1, -1, dtype=np.int32)
-        for aid, r in agent2rank.items():
-            rank_lookup[aid] = r
-
-    # Vectorized rank lookup
-    in_range = neighbor_ids <= max_agent_id
-    neighbor_ranks = np.full(len(neighbor_ids), -1, dtype=np.int32)
-    neighbor_ranks[in_range] = rank_lookup[neighbor_ids[in_range]]
+    # Resolve owner rank per neighbor (boundary-scoped: O(distinct neighbor ids)).
+    neighbor_ranks = _resolve_neighbor_ranks(neighbor_ids, agent2rank)
 
     # Keep only cross-rank neighbors
     cross_mask = (neighbor_ranks != my_rank) & (neighbor_ranks >= 0)
@@ -278,7 +287,7 @@ class GPUBufferManager:
         self.write_buffers = []         # List of CuPy arrays for double-buffered properties
         self.neighbor_offsets = None    # CuPy int32 (CSR offsets)
         self.neighbor_values = None     # CuPy int32 (CSR values, local indices for kernel)
-        self.neighbor_values_ids = None # CuPy int32 (CSR values, agent IDs for MPI)
+        self.neighbor_values_ids = None # CuPy int64 (CSR values, agent IDs for MPI)
         self.agent_ids_gpu = None       # CuPy array of all agent IDs (local + ghost)
         self.logical_ids_gpu = None    # CuPy array of logical IDs for stable RNG
         self.device_breed_local_write_bufs = []  # Write buffers for double-buffered BLAs
@@ -354,7 +363,7 @@ class GPUBufferManager:
         self.neighbor_values = cp.array(padded_values)
 
         # Values (agent IDs): pre-allocate with slack
-        padded_values_ids = np.full(self.csr_values_capacity, -1, dtype=np.int32)
+        padded_values_ids = np.full(self.csr_values_capacity, -1, dtype=np.int64)
         padded_values_ids[:total_edges] = values_ids_np
         self.neighbor_values_ids = cp.array(padded_values_ids)
 
@@ -414,7 +423,7 @@ class GPUBufferManager:
             self.neighbor_values = new_vals
 
         if self.neighbor_values_ids is not None:
-            new_vals_ids = cp.full(new_capacity, -1, dtype=cp.int32)
+            new_vals_ids = cp.full(new_capacity, -1, dtype=cp.int64)
             new_vals_ids[:self.csr_values_capacity] = self.neighbor_values_ids
             self.neighbor_values_ids = new_vals_ids
 
@@ -574,7 +583,7 @@ class CommunicationManager:
 
         if has_cross_rank_work:
             cpu_values_ids = buf.neighbor_values_ids[:total_edges_local].get()
-            cpu_values_ids = np.asarray(cpu_values_ids, dtype=np.int32)
+            cpu_values_ids = np.asarray(cpu_values_ids, dtype=np.int64)
 
             # 3. Vectorized: expand (local_agent_idx, neighbor_id) pairs
             counts = np.diff(cpu_offsets)
@@ -590,21 +599,9 @@ class CommunicationManager:
                 has_cross_rank_work = False
 
         if has_cross_rank_work:
-            # Build dense rank lookup: rank_lookup[agent_id] = rank
-            agent2rank = self.agent_factory._agent2rank
-            if isinstance(agent2rank, np.ndarray):
-                rank_lookup = agent2rank.astype(np.int32, copy=False)
-                max_agent_id = len(rank_lookup) - 1
-            else:
-                max_agent_id = max(agent2rank.keys())
-                rank_lookup = np.full(max_agent_id + 1, -1, dtype=np.int32)
-                for aid, r in agent2rank.items():
-                    rank_lookup[aid] = r
-
-            # Vectorized rank lookup for all neighbors
-            in_range = neighbor_ids <= max_agent_id
-            neighbor_ranks = np.full(len(neighbor_ids), -1, dtype=np.int32)
-            neighbor_ranks[in_range] = rank_lookup[neighbor_ids[in_range]]
+            # Resolve owner rank per neighbor (boundary-scoped: O(distinct neighbor ids)).
+            neighbor_ranks = _resolve_neighbor_ranks(
+                neighbor_ids, self.agent_factory._agent2rank)
 
             # Filter to cross-rank neighbors
             cross_mask = (neighbor_ranks != self.my_rank) & (neighbor_ranks >= 0)
@@ -632,8 +629,8 @@ class CommunicationManager:
         # ---- Phase 2: Exchange requested agent ID lists ----
         send_req_requests = []
         for src_rank, ids in need_from_rank.items():
-            ids_np = ids.astype(np.int32)
-            req = self.comm.Isend([ids_np, MPI.INT], dest=src_rank, tag=100)
+            ids_np = ids.astype(np.int64)
+            req = self.comm.Isend([ids_np, MPI.INT64_T], dest=src_rank, tag=100)
             send_req_requests.append(req)
 
         # Receive: other ranks tell us which of our local agents they need
@@ -641,14 +638,60 @@ class CommunicationManager:
         recv_req_requests = []
         for dest_rank in range(self.num_workers):
             if dest_rank != self.my_rank and supply_counts[dest_rank] > 0:
-                recv_buf = np.empty(int(supply_counts[dest_rank]), dtype=np.int32)
+                recv_buf = np.empty(int(supply_counts[dest_rank]), dtype=np.int64)
                 requested_by_rank[dest_rank] = recv_buf
                 req = self.comm.Irecv(
-                    [recv_buf, MPI.INT], source=dest_rank, tag=100
+                    [recv_buf, MPI.INT64_T], source=dest_rank, tag=100
                 )
                 recv_req_requests.append(req)
 
         MPI.Request.Waitall(send_req_requests + recv_req_requests)
+
+        # ---- Phase 2b: Exchange the BREED of each requested agent ----
+        # register_remote_agents() carries only agent->rank; a remote agent's
+        # breed lives with its owner. Breed-local-array ghost exchange is
+        # per-breed, so the requester must know which of its ghost agents belong
+        # to a given breed to size recv buffers and scatter values into the right
+        # BLA rows. The owner already knows which of its (local) agents each rank
+        # requested (requested_by_rank), so it reports their breeds here; the
+        # requester records them into _agent2breed for its ghost slots. Reply
+        # order matches the request order, so it aligns with need_from_rank.
+        #
+        # Ghost breeds are consumed ONLY by the neighbor-visible breed-local-array
+        # sizing below, so skip this exchange entirely when the model has none.
+        # `breed_local_ghost_info` is set in _build_gpu_buffers() before this call
+        # and is the same value the BLA block reads later, so the gate matches
+        # exactly when that block does work; it is symmetric across ranks (all
+        # register the same BLAs), so all ranks skip or all participate.
+        _bla_infos = getattr(buf, 'breed_local_ghost_info', [])
+        if any(info is not None for info in _bla_infos):
+            af = self.agent_factory
+            breed_send_bufs = {}
+            breed_send_requests = []
+            for dest_rank, agent_ids_np in requested_by_rank.items():
+                breeds_np = np.array(
+                    [af._agent2breed.get(int(aid), -1) for aid in agent_ids_np],
+                    dtype=np.int32,
+                )
+                breed_send_bufs[dest_rank] = breeds_np
+                breed_send_requests.append(
+                    self.comm.Isend([breeds_np, MPI.INT], dest=dest_rank, tag=101)
+                )
+            breed_recv_bufs = {}
+            breed_recv_requests = []
+            for src_rank, remote_ids in need_from_rank.items():
+                rbuf = np.empty(len(remote_ids), dtype=np.int32)
+                breed_recv_bufs[src_rank] = rbuf
+                breed_recv_requests.append(
+                    self.comm.Irecv([rbuf, MPI.INT], source=src_rank, tag=101)
+                )
+            MPI.Request.Waitall(breed_send_requests + breed_recv_requests)
+
+            # Record ghost breeds locally (used by buf_breeds below for BLA sizing).
+            for src_rank, remote_ids in need_from_rank.items():
+                recv_breeds = breed_recv_bufs[src_rank]
+                for aid, b in zip(remote_ids, recv_breeds):
+                    af._agent2breed[int(aid)] = int(b)
 
         # ---- Phase 3: Build send / recv index maps ----
         self.send_indices_gpu = {}

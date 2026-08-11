@@ -1,5 +1,8 @@
 """
-SuperNeuroABM basic Model class
+SAGESim basic Model class.
+
+Core agent-based-modeling Model: registers agents and their connections,
+builds the simulation state, and drives the GPU step kernels.
 
 """
 
@@ -28,16 +31,21 @@ from sagesim.internal_utils import convert_to_equal_side_tensor, build_csr_from_
 from sagesim.gpu_kernels import GPUBufferManager, GPUHashMap, CommunicationManager, is_gpu_aware_mpi, discover_ghost_topology
 
 
-def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
+def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map, return_arrays=False):
     """
     Convert agent IDs in nested arrays to local indices using a hash map.
 
     :param data_tensor: Nested list structure containing agent IDs (can also contain sets)
     :param agent_id_to_index_map: Dictionary mapping agent_id -> local_index
+    :param return_arrays: When True, numpy-array rows are returned as numpy int32
+        arrays instead of Python lists. Set by the columnar CSR path, where the
+        single row holds the whole ~150M-element flat CSR: a ``.tolist()`` there
+        materializes a multi-GB Python list only to be re-arrayed in allocate_csr.
+        Non-array rows are unaffected; the default keeps the record path identical.
     :return: Same structure with IDs replaced by local indices (-1 if not found)
     """
     # OPTIMIZATION: Build lookup arrays ONCE instead of for every agent!
-    id_keys = np.array(list(agent_id_to_index_map.keys()), dtype=np.int32)
+    id_keys = np.array(list(agent_id_to_index_map.keys()), dtype=np.int64)
     id_values = np.array(list(agent_id_to_index_map.values()), dtype=np.int32)
     min_id = id_keys.min()
     max_id = id_keys.max()
@@ -67,7 +75,7 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
             converted = np.full(arr.shape, -1, dtype=np.int32)
 
             if np.any(valid_mask):
-                valid_ids = arr[valid_mask].astype(np.int32)
+                valid_ids = arr[valid_mask].astype(np.int64)
 
                 # Use pre-built lookup arrays
                 if use_dense:
@@ -83,7 +91,7 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map):
 
                 converted[valid_mask] = indices
 
-            result.append(converted.tolist())
+            result.append(converted if return_arrays else converted.tolist())
         elif isinstance(agent_data, (list, tuple, set)):
             # Handle collections (list, tuple, set) with multiple connections
             converted_data = []
@@ -120,7 +128,7 @@ def convert_agent_indices_to_ids(data_tensor, agent_index_to_id_list):
     :return: Same structure with indices replaced by agent IDs (-1 remains -1)
     """
     # Convert to numpy array for vectorized operations (much faster)
-    id_array = np.array(agent_index_to_id_list, dtype=np.int32)
+    id_array = np.array(agent_index_to_id_list, dtype=np.int64)
     list_len = len(agent_index_to_id_list)
 
     # FAST PATH: If data_tensor is already a 2D numpy array, vectorize everything
@@ -413,20 +421,209 @@ class Model:
             raise Exception(f"All breeds must be registered before agents are created!")
         self._agent_factory.register_breed(breed)
 
-    def create_agent_of_breed(self, breed: Breed, add_to_space=True, rank: int = None, **kwargs) -> int:
-        agent_id = self._agent_factory.create_agent(breed, rank=rank, **kwargs)
+    def create_agent_of_breed(self, breed: Breed, add_to_space=True, rank: int = None, agent_id: int = None, **kwargs) -> int:
+        agent_id = self._agent_factory.create_agent(breed, rank=rank, agent_id=agent_id, **kwargs)
         if add_to_space:
             self.get_space().add_agent(agent_id)
         return agent_id
 
+    def build_from_local_data(self, agents, connections, remote_agent_ranks=None, directed=False):
+        """Build model from pre-prepared local agent data (bulk path).
+
+        Application prepares all local agents with IDs, breeds, and property
+        values, then calls this once. SAGESim pre-allocates and populates
+        everything in bulk — no per-agent create_agent_of_breed() calls.
+
+        :param agents: list of dicts, each with:
+            - 'id': int (global agent ID)
+            - 'breed': Breed object (registered breed)
+            - 'properties': dict of property_name -> value
+        :param connections: list of (agent_a, agent_b) tuples.
+            If directed=False (default), creates bidirectional connections.
+            If directed=True, creates one-way connections (a can see b only).
+        :param remote_agent_ranks: dict {remote_agent_id: rank} for MPI ghost exchange
+        :param directed: if True, connections are one-way. If False (default),
+            connections are bidirectional. Matches connect_agents() default.
+        """
+        from collections import OrderedDict
+        from copy import copy
+
+        rank = MPI.COMM_WORLD.Get_rank()
+        n_local = len(agents)
+        local_ids = [a['id'] for a in agents]
+
+        # 1. Sparse space — dict-based, local agents only
+        self.get_space().add_local_agents(local_ids)
+
+        # 2. Bulk agent factory setup
+        af = self._agent_factory
+        local_mapping = OrderedDict((int(aid), i) for i, aid in enumerate(local_ids))
+        af._rank2agentid2agentidx[rank] = local_mapping
+        af._num_agents = max(int(a) for a in local_ids) + 1 if local_ids else 0
+        for aid in local_ids:
+            af._agent2rank[int(aid)] = rank
+        for agent in agents:
+            af._agent2breed[agent['id']] = agent['breed']._breedidx
+
+        # 3. Fill property tensors in bulk
+        for prop_name in af._property_name_2_agent_data_tensor:
+            tensor = [None] * n_local
+            for i, agent in enumerate(agents):
+                if prop_name == "breed":
+                    tensor[i] = agent['breed']._breedidx
+                elif prop_name == "locations":
+                    tensor[i] = self.get_space()._locations[agent['id']]
+                else:
+                    tensor[i] = agent['properties'].get(
+                        prop_name, copy(af._property_name_2_defaults[prop_name]))
+            af._property_name_2_agent_data_tensor[prop_name] = tensor
+
+        # 4. Register remote agent ranks
+        if remote_agent_ranks:
+            af.register_remote_agents(remote_agent_ranks)
+
+        # 5. Create connections (bulk).
+        # `connections` is either a prebuilt adjacency dict {a: [neighbors]} or
+        # a list of (agent, neighbor) pairs [(a, b), ...]. Either way we
+        # normalize to a single adjacency dict and assign each neighbor list in
+        # ONE pass via bulk_connect — no per-connection connect_agents() call.
+        space = self.get_space()
+        if isinstance(connections, dict):
+            # Already-directed adjacency. `directed` does not apply; warn if the
+            # caller asked for undirected, since that combination is meaningless
+            # (the dict already encodes whatever directionality it has).
+            if not directed:
+                warnings.warn(
+                    "build_from_local_data: directed=False is ignored when "
+                    "connections is an adjacency dict; the dict is taken "
+                    "verbatim as directed adjacency.",
+                    stacklevel=2,
+                )
+            space.bulk_connect(connections)
+        else:
+            adjacency = {}
+            for agent_a, agent_b in connections:
+                adjacency.setdefault(agent_a, []).append(agent_b)
+                if not directed:
+                    adjacency.setdefault(agent_b, []).append(agent_a)
+            space.bulk_connect(adjacency)
+
+    def build_from_local_columns(
+        self,
+        agent_ids,
+        breed_indices,
+        property_columns,
+        neighbor_offsets,
+        neighbor_values_ids,
+        remote_agent_ranks=None,
+    ):
+        """Build the model from columnar local data + a prebuilt neighbor CSR.
+
+        Columnar sibling of build_from_local_data. Where that path takes a list
+        of per-agent dicts and a ragged adjacency (one Python object per agent,
+        then transposed to columns + CSR at setup), this path takes the columns
+        and the CSR directly, so nothing per-agent is ever materialized. It is
+        the bulk build for very large local populations where the per-agent
+        object staging is the memory ceiling.
+
+        Domain-neutral: agents carry an id, a breed index, and named property
+        columns; connectivity is a directed neighbor CSR. No assumption about
+        what the agents or properties mean.
+
+        Ordering contract: rows are in one fixed LOCAL-INDEX order shared by
+        every argument — agent_ids[i], breed_indices[i], property_columns[p][i],
+        and CSR row i (neighbor_values_ids[neighbor_offsets[i]:neighbor_offsets[i+1]])
+        all describe the same local agent i. The caller MUST supply agents already
+        grouped by non-decreasing breed index (so setup's breed sort is a no-op and
+        the CSR stays row-aligned — see AgentFactory.sort_by_breed).
+
+        :param agent_ids: sequence of global agent ids, length n_local.
+        :param breed_indices: sequence of breed indices (breed._breedidx), length n_local.
+        :param property_columns: dict {property_name: sequence(length n_local)}. Must
+            not include the built-in "breed"/"locations"; any registered property
+            absent here is filled with its default. Values may be shared objects.
+        :param neighbor_offsets: numpy int32 array, length n_local + 1 (CSR offsets).
+        :param neighbor_values_ids: numpy int32 array of neighbor GLOBAL ids (flat CSR
+            values; the -1 external sentinel is allowed).
+        :param remote_agent_ranks: dict {remote_agent_id: rank} for MPI ghost exchange.
+        """
+        from collections import OrderedDict
+        from copy import copy
+
+        rank = MPI.COMM_WORLD.Get_rank()
+        agent_ids = [int(a) for a in agent_ids]
+        n_local = len(agent_ids)
+        if len(breed_indices) != n_local:
+            raise ValueError(
+                f"breed_indices length {len(breed_indices)} != agent_ids length {n_local}")
+        if len(neighbor_offsets) != n_local + 1:
+            raise ValueError(
+                f"neighbor_offsets length {len(neighbor_offsets)} != n_local + 1 "
+                f"({n_local + 1})")
+
+        af = self._agent_factory
+        reserved = {"breed", "locations"}
+        for name in property_columns:
+            if name in reserved:
+                raise ValueError(
+                    f"property_columns may not include the built-in '{name}'")
+            if name not in af._property_name_2_agent_data_tensor:
+                raise ValueError(f"unknown property '{name}' (register its breed first)")
+            if len(property_columns[name]) != n_local:
+                raise ValueError(
+                    f"property column '{name}' length {len(property_columns[name])} "
+                    f"!= n_local {n_local}")
+
+        # 1. Space: hand it the prebuilt CSR instead of per-agent containers.
+        space = self.get_space()
+        space.set_prebuilt_csr(neighbor_offsets, neighbor_values_ids)
+
+        # 2. Agent-factory bookkeeping (id <-> local index, rank, breed).
+        local_mapping = OrderedDict((aid, i) for i, aid in enumerate(agent_ids))
+        af._rank2agentid2agentidx[rank] = local_mapping
+        af._num_agents = (max(agent_ids) + 1) if agent_ids else 0
+        for aid in agent_ids:
+            af._agent2rank[aid] = rank
+        breed_list = [int(b) for b in breed_indices]
+        for aid, b in zip(agent_ids, breed_list):
+            af._agent2breed[aid] = b
+
+        # 3. Property tensors, columnar: assign each registered property's column
+        # directly (built-ins first, then supplied columns, then defaults for any
+        # property no column was given for). "locations" is intentionally empty —
+        # neighbors live in the prebuilt CSR, not per-agent lists.
+        for prop_name in af._property_name_2_agent_data_tensor:
+            if prop_name == "breed":
+                af._property_name_2_agent_data_tensor[prop_name] = breed_list
+            elif prop_name == "locations":
+                af._property_name_2_agent_data_tensor[prop_name] = []
+            elif prop_name in property_columns:
+                af._property_name_2_agent_data_tensor[prop_name] = list(
+                    property_columns[prop_name])
+            else:
+                default = af._property_name_2_defaults[prop_name]
+                af._property_name_2_agent_data_tensor[prop_name] = [
+                    copy(default) for _ in range(n_local)]
+
+        # 4. Remote ranks for ghost exchange.
+        if remote_agent_ranks:
+            af.register_remote_agents(remote_agent_ranks)
+
+        # 5. Mark breed-presorted so setup's sort_by_breed verifies-and-skips
+        # (reordering would desync the separately-held CSR).
+        af._agents_prebreed_sorted = True
+
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
         if self._is_setup and hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
-            # Fast path: read single agent directly from GPU
+            # Fast path: read single agent directly from GPU.
+            # Ownership is resolved from LOCAL membership (id in this rank's GPU
+            # buffer), not from a global _agent2rank — the owner reads and shares
+            # via allgather, so this works under a local-only map.
             buf = self._gpu_buffers
             prop_idx = self._agent_factory._property_name_2_index[property_name]
-            agent_rank = self._agent_factory._agent2rank[id]
 
-            if agent_rank == MPI.COMM_WORLD.Get_rank():
+            owned = id in buf.agent_id_to_index
+            if owned:
                 buf_idx = buf.agent_id_to_index[id]
                 if prop_idx == 1:
                     # CSR/locations: read one agent's neighbor slice
@@ -438,7 +635,15 @@ class Model:
             else:
                 result = None
 
-            return MPI.COMM_WORLD.bcast(result, root=agent_rank)
+            comm = MPI.COMM_WORLD
+            if comm.Get_size() == 1:
+                return result
+            # Gather (owned, value) tuples; the owning rank's value wins. A bool flag
+            # (not a sentinel) is used because allgather pickles values across ranks.
+            for is_owner, value in comm.allgather((owned, result)):
+                if is_owner:
+                    return value
+            return None
 
         # Pre-setup path: use CPU-side data
         if self._is_setup:
@@ -453,6 +658,43 @@ class Model:
         self._agent_factory.set_agent_property_value(
             property_name=property_name, agent_id=id, value=value
         )
+        # GPU buffers are now stale — force rebuild on next tick
+        if hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
+            self._gpu_buffers.is_initialized = False
+            self._cached_all_args = None
+
+    def get_local_agent_property_value(self, id: int, property_name: str) -> Any:
+        """Read a LOCALLY-OWNED agent's property — non-collective, no MPI.
+
+        Unlike get_agent_property_value (collective, resolves any rank), this reads
+        only an agent this rank owns and does NO communication. The caller must pass
+        an id it owns (e.g. resolved from app-level ownership metadata); passing a
+        non-local id is a programming error and raises KeyError. Use this on the
+        scalable path where every rank reads only its own agents and reduces results
+        itself, so no global agent->rank map is ever needed.
+        """
+        if not (self._is_setup and hasattr(self, '_gpu_buffers')
+                and self._gpu_buffers.is_initialized):
+            # Pre-setup / pre-first-tick: read from CPU-side AgentFactory storage.
+            return self._agent_factory.get_local_agent_property_value(
+                property_name=property_name, agent_id=id)
+        buf = self._gpu_buffers
+        prop_idx = self._agent_factory._property_name_2_index[property_name]
+        buf_idx = buf.agent_id_to_index[id]  # KeyError if id not local (intended)
+        if prop_idx == 1:
+            # CSR/locations: read one agent's neighbor slice
+            start = int(buf.neighbor_offsets[buf_idx].get())
+            end = int(buf.neighbor_offsets[buf_idx + 1].get())
+            return buf.neighbor_values_ids[start:end].get().tolist()
+        return buf.property_tensors[prop_idx][buf_idx].get().tolist()
+
+    def set_local_agent_property_value(self, id: int, property_name: str, value: Any) -> None:
+        """Write a LOCALLY-OWNED agent's property — non-collective, no MPI.
+
+        Counterpart to get_local_agent_property_value. Caller must own ``id``.
+        """
+        self._agent_factory.set_local_agent_property_value(
+            property_name=property_name, agent_id=id, value=value)
         # GPU buffers are now stale — force rebuild on next tick
         if hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
             self._gpu_buffers.is_initialized = False
@@ -666,35 +908,41 @@ class Model:
         """
         self._logical_id_map[int(agent_id)] = int(logical_id)
 
-    def load_partition(self, partition_file: str, format: str = "auto") -> None:
-        """Load network partition from file to optimize multi-worker performance.
-
-        This method loads a pre-computed network partition that assigns agents to MPI ranks
-        to minimize cross-worker communication. Must be called BEFORE creating any agents.
-
-        For details on partition formats and usage, see AgentFactory.load_partition().
-
-        :param partition_file: Path to partition file
-        :param format: File format ('pickle', 'json', 'numpy', 'text', or 'auto')
-        """
-        self._agent_factory.load_partition(partition_file, format)
-
-    def setup(self, use_gpu: bool = True, skip_priority_barriers=False) -> None:
+    def setup(self, *, skip_priority_barriers=False) -> None:
         """
         Must be called before first simulate call.
         Initializes model and resets ticks. Readies step functions
         and for breeds.
 
-        :param use_cuda: runs model in GPU mode.
-        :param num_dask_worker: number of dask workers
-        :param scheduler_fpath: specify if using external dask cluster. Else
-            distributed.LocalCluster is set up.
+        Execution is always on GPU: the step functions are compiled to CuPy
+        kernels and there is no CPU backend.
+
+        :param skip_priority_barriers: priority values whose inter-priority
+            grid barrier can be skipped, when no step func at that priority
+            reads what the previous one wrote.
         """
         import time
         t_setup_total_start = time.time()
 
-        self._use_gpu = use_gpu
         self._skip_priority_barriers = skip_priority_barriers
+
+        # GPU selection is the launcher's job, not the application's. On Frontier the
+        # submit script binds each rank to its GPU with `srun --gpu-bind=closest`
+        # (each rank then sees exactly one device as device 0), so we simply use
+        # whatever Slurm made visible — no `rank % ndev` in user code. The only case
+        # this gets wrong is an UNBOUND multi-GPU launch (all GPUs visible to every
+        # rank, no --gpu-bind): cupy would default all ranks to device 0. We don't
+        # silently pick a device there (that would fight a future binding), but we
+        # warn so it isn't a quiet all-ranks-on-device-0 performance cliff.
+        ndev = cp.cuda.runtime.getDeviceCount()
+        if ndev > 1 and comm.Get_size() > 1 and comm.Get_rank() == 0:
+            warnings.warn(
+                f"{ndev} GPUs visible to each of {comm.Get_size()} ranks and no "
+                "per-rank GPU binding detected; all ranks will share device 0. "
+                "Launch with `srun --gpu-bind=closest` (or --ntasks-per-gpu=1) "
+                "so each rank gets its own GPU."
+            )
+
         # Globals uploaded to GPU in _build_gpu_buffers()
         self.tick = 0
 
@@ -868,12 +1116,15 @@ class Model:
 
         # Print agent distribution summary
         if worker == 0:
-            total_agents = self._agent_factory._num_agents
             agents_per_rank = {}
             a2r = self._agent_factory._agent2rank
-            for agent_id in range(total_agents):
-                r = int(a2r[agent_id]) if isinstance(a2r, np.ndarray) else a2r.get(agent_id, -1)
-                agents_per_rank[r] = agents_per_rank.get(r, 0) + 1
+            if isinstance(a2r, np.ndarray):
+                unique, counts = np.unique(a2r, return_counts=True)
+                for r, c in zip(unique, counts):
+                    agents_per_rank[int(r)] = int(c)
+            else:
+                for r in a2r.values():
+                    agents_per_rank[r] = agents_per_rank.get(r, 0) + 1
 
 
         self._is_setup = True
@@ -976,8 +1227,21 @@ class Model:
             print(f"[TIMING] MPI barrier wait at simulate start: {t_barrier_wait*1000:.2f} ms", flush=True)
 
         # Step function is cached during setup() - no need to reimport
-        # Single worker: fuse all ticks in one kernel launch (no MPI sync needed)
-        if num_workers == 1:
+        # Single worker: fuse all ticks in one kernel launch (no MPI sync needed).
+        #
+        # Skipped when verbose_timing is on, because one worker_coroutine() call appends one
+        # entry to _tick_timings: fusing records a single row covering construction plus every
+        # tick, leaving no per-tick step time at all. Unfusing also puts the single worker on
+        # the same per-tick path as every multi-worker run, which is what makes a 1-GPU point
+        # comparable to the rest of a scaling curve.
+        #
+        # NOTE (measured 2026-07-30, superneuroabm weak campaign, npp=12500, 100 ticks): fusing
+        # is not actually faster here. Per tick, fused vs unfused was 57.8 vs 4.2 ms at K=1000
+        # and 64.3 vs 7.5 ms at K=2000 -- 8-14x SLOWER fused, with construction matching to 1%
+        # at K=2000, so the runs are otherwise comparable. Whether the fast path is worth
+        # keeping at all is an open question, but that is a behaviour change on two data points
+        # at one problem size, so it is left alone here.
+        if num_workers == 1 and not self._verbose_timing:
             self.worker_coroutine(ticks)
         else:
             # Multi-worker: need periodic synchronization
@@ -1120,9 +1384,31 @@ class Model:
             _t0 = time.time()
 
         # 6. Combine local + ghost placeholder data and build GPU arrays
+        _prebuilt_csr_offsets = getattr(
+            self.get_space(), "_prebuilt_csr_offsets", None)
         combined_lists = []
         for i in range(self._agent_factory.num_properties):
             local_data = self.__rank_local_agent_data_tensors[i]
+
+            if i == 1 and _prebuilt_csr_offsets is not None:
+                # Columnar build: the local neighbor CSR is prebuilt. Extend its
+                # offsets with num_ghost empty rows (ghosts are never iterated) and
+                # map the flat global-id values to local buffer indices — the same
+                # two arrays build_csr_from_ragged would have produced, without the
+                # ragged list-of-lists staging. combined_lists[1] is a placeholder
+                # (allocate_property_tensors skips property index 1).
+                prebuilt_values = self.get_space()._prebuilt_csr_values
+                last = int(_prebuilt_csr_offsets[-1])
+                offsets_np = np.concatenate([
+                    np.asarray(_prebuilt_csr_offsets, dtype=np.int32),
+                    np.full(num_ghost, last, dtype=np.int32),
+                ])
+                values_ids_np = np.asarray(prebuilt_values, dtype=np.int64)
+                values_np = convert_agent_ids_to_indices(
+                    [values_ids_np], agent_id_to_index, return_arrays=True)[0]
+                buf.allocate_csr(offsets_np, values_np, values_ids_np, buf.num_total_agents)
+                combined_lists.append(None)
+                continue
 
             if i == 1:
                 # CSR: ghost agents get empty neighbor lists (never iterated by kernel)
@@ -1364,9 +1650,17 @@ class Model:
         if not buf.is_initialized:
             # --- FIRST TICK: full build ---
             t_neighbor_start = time.time()
-            rank_local_agents_neighbors = self.get_space()._neighbor_compute_func(
-                self.__rank_local_agent_data_tensors[1]
-            )
+            _prebuilt_csr_values = getattr(
+                self.get_space(), "_prebuilt_csr_values", None)
+            if _prebuilt_csr_values is not None:
+                # Columnar build: neighbors are one flat CSR values array already.
+                # discover_ghost_topology only needs the flat neighbor ids, so wrap
+                # it as a single "row" (np.concatenate of a 1-list is a no-op).
+                rank_local_agents_neighbors = [_prebuilt_csr_values]
+            else:
+                rank_local_agents_neighbors = self.get_space()._neighbor_compute_func(
+                    self.__rank_local_agent_data_tensors[1]
+                )
             t_neighbor_end = time.time()
 
             t_before_context = time.time()
@@ -1497,7 +1791,7 @@ class Model:
             range_args.append(cp.float32(p_count))
             range_summary.append(f"P{p_idx}:{p_count}")
 
-        # Prepare subclass-specific extra kernel args (e.g. spike recording buffers)
+        # Prepare subclass-specific extra kernel args (e.g. extra output buffers)
         extra_kernel_args = self._prepare_kernel_extras(num_local_agents, sync_workers_every_n_ticks)
 
         if self._verbose_timing:
@@ -1549,7 +1843,7 @@ class Model:
 
         t_gpu_kernel_start = t_kernel_launch_start  # Keep for backward compat
 
-        # Process subclass-specific extra data (e.g. download spike records)
+        # Process subclass-specific extra data (e.g. download extra output buffers)
         if self._verbose_timing:
             t_extras_start = time.time()
         self._process_kernel_extras()

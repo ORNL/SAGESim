@@ -1,4 +1,3 @@
-awkward==2.7.4,
-networkx==3.4.2,
-numpy==2.2.3,
-ragged==0.2.0,
+awkward>=2.7.4,
+networkx>=3.4.2,
+numpy>=2.2.3,

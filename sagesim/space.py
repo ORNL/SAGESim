@@ -63,6 +63,7 @@ class NetworkSpace(Space):
         locations_max_dims = [0]
         locations_defaults = []
         self._ordered = ordered
+        self._sparse = False
         # Parallel set for O(1) duplicate checks when ordered=True
         if ordered:
             self._locations_set = {}
@@ -70,31 +71,71 @@ class NetworkSpace(Space):
             _network_space_compute_neighbors, locations_max_dims, locations_defaults
         )
 
-    def add_agent(self, agent: int) -> None:
-        # Use list for ordered neighbors, set for unordered
-        neighbor_container = [] if self._ordered else set()
-        self._locations.append(neighbor_container)
-        if self._ordered:
-            self._locations_set[agent] = set()
-        self._agent_factory.set_agent_property_value(
-            "locations",
-            agent,
-            self._locations[agent],
-        )
+    def add_local_agents(self, agent_ids) -> None:
+        """Create location containers for specific local agents only.
 
-    def bulk_add_agents(self, total_agents):
-        """Pre-populate location containers for all agents.
+        In this mode, _locations is a dict {agent_id: [neighbors]} instead of a
+        list indexed by global agent ID. Only local agents get entries — remote
+        agents referenced as neighbors don't need their own neighbor lists.
 
-        Replaces N individual add_agent() calls with a single bulk allocation.
-        Property tensor linking is handled separately by create_agent_at_index.
-
-        :param total_agents: Total number of agents across all ranks
+        :param agent_ids: Iterable of local agent IDs to create containers for.
         """
+        self._sparse = True
         if self._ordered:
-            self._locations = [[] for _ in range(total_agents)]
-            self._locations_set = {i: set() for i in range(total_agents)}
+            self._locations = {int(aid): [] for aid in agent_ids}
+            self._locations_set = {int(aid): set() for aid in agent_ids}
         else:
-            self._locations = [set() for _ in range(total_agents)]
+            self._locations = {int(aid): set() for aid in agent_ids}
+
+    def set_prebuilt_csr(self, neighbor_offsets, neighbor_values_ids) -> None:
+        """Accept an already-built local neighbor CSR instead of per-agent lists.
+
+        Columnar bulk build (Model.build_from_local_columns) hands the whole
+        rank's directed neighbor structure as two flat arrays — the same CSR that
+        add_local_agents + bulk_connect would otherwise produce, but constructed
+        with vectorized numpy from the source columns. Storing it here lets the
+        model skip both the O(num_agents) empty-container allocation and the
+        ragged-list → CSR transpose in setup, which is the whole point of the
+        columnar path (no per-agent Python objects).
+
+        The rows are in LOCAL-INDEX order (row i = the i-th local agent in the
+        order handed to build_from_local_columns) and the values are GLOBAL agent
+        ids (the -1 external-input sentinel is allowed), matching what
+        build_csr_from_ragged emits for the record path.
+
+        :param neighbor_offsets: numpy int32 array, length num_local_agents + 1.
+        :param neighbor_values_ids: numpy int32 array, flat neighbor global ids.
+        """
+        self._sparse = True
+        # No per-agent containers: the CSR is authoritative. Keep the dicts empty
+        # so get_location()/connect_agents() fail loudly rather than silently
+        # returning wrong (empty) neighbors for a prebuilt-CSR model.
+        self._locations = {}
+        if self._ordered:
+            self._locations_set = {}
+        self._prebuilt_csr_offsets = neighbor_offsets
+        self._prebuilt_csr_values = neighbor_values_ids
+
+    def add_agent(self, agent: int) -> None:
+        if self._sparse:
+            # In sparse mode, container already exists from add_local_agents().
+            # Just link the locations property to the agent's property tensor.
+            self._agent_factory.set_agent_property_value(
+                "locations",
+                agent,
+                self._locations[agent],
+            )
+        else:
+            # Original behavior
+            neighbor_container = [] if self._ordered else set()
+            self._locations.append(neighbor_container)
+            if self._ordered:
+                self._locations_set[agent] = set()
+            self._agent_factory.set_agent_property_value(
+                "locations",
+                agent,
+                self._locations[agent],
+            )
 
     def get_location(self, agent_id: int) -> Union[List[int], set]:
         """Returns agent's location (neighbors as list if ordered=True, set if ordered=False)"""
@@ -123,6 +164,54 @@ class NetworkSpace(Space):
             self._locations[agent_0].add(agent_1)
             if not directed:
                 self._locations[agent_1].add(agent_0)
+
+    def bulk_connect(self, adjacency) -> None:
+        """Bulk-register neighbor lists from a prebuilt adjacency map.
+
+        The bulk form of connect_agents: equivalent to calling
+        connect_agents(a, b, directed=True) for every neighbor b in
+        adjacency[a], but assigns each agent's whole neighbor list in ONE pass
+        instead of one duplicate-checked append per connection. For an agent
+        population with C total connections this avoids C Python-level
+        .append()/.add() calls; it is the bulk path used by build_from_local_data.
+
+        The adjacency dict is taken as ALREADY-DIRECTED: exactly what is written
+        is what you get (no reverse connections are added). Callers that want
+        undirected behavior must list a neighbor on both agents.
+
+        Only local agents (those given to add_local_agents) may be keys; a
+        non-local id that appears only as a *neighbor* (value) is fine and gets
+        no neighbor container of its own — matching connect_agents, which writes
+        only _locations[agent_0]. A non-local id used as a KEY is an error.
+
+        Containers created by add_local_agents are mutated IN PLACE (not
+        rebound): build_from_local_data captures the container object into the
+        agent's "locations" property tensor before connections are added, so the
+        list/set identity must be preserved.
+
+        :param adjacency: dict {agent_id: iterable_of_neighbor_ids}.
+        """
+        if not self._sparse:
+            raise RuntimeError(
+                "bulk_connect requires sparse mode; call add_local_agents first."
+            )
+        for agent_a, neighbors in adjacency.items():
+            agent_a = int(agent_a)
+            if agent_a not in self._locations:
+                raise KeyError(
+                    f"bulk_connect: agent {agent_a} is not a local agent "
+                    f"(only local agents may be adjacency keys)."
+                )
+            if self._ordered:
+                seen = self._locations_set[agent_a]
+                bucket = self._locations[agent_a]
+                for b in neighbors:
+                    b = int(b)
+                    if b not in seen:
+                        seen.add(b)
+                        bucket.append(b)
+            else:
+                self._locations[agent_a].update(int(b) for b in neighbors)
 
     def disconnect_agents(
         self, agent_0: int, agent_1: int, directed: bool = False
