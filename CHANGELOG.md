@@ -5,6 +5,46 @@ All notable changes to SAGESim will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-08-11
+
+### Added
+- **Distributed model construction**: each rank builds only its own partition — no global
+  graph is ever materialized. `Model.build_from_local_data()`, `Model.build_from_local_columns()`,
+  `NetworkSpace.set_prebuilt_csr()`, `NetworkSpace.add_local_agents()`, `NetworkSpace.bulk_connect()`,
+  `AgentFactory.register_remote_agents()`
+- **Local-only accessors**: `get_local_agent_property_value()`, `set_local_agent_property_value()`,
+  and a `local=` flag on `get_breed_data()` / `get_breed_agent_ids()` to read this rank's agents
+  without a collective
+- **`set_agent_logical_id()`**: stable per-agent identifier for reproducible RNG independent of
+  partitioning
+- **Caller-supplied agent IDs**: `agent_id=` on `create_agent()` / `create_agent_of_breed()`
+- **Breed info exchange** when a neighbor-visible breed-local array is present
+- **First-tick topology cache** for models whose network does not change
+- **Test suite**: pytest suite under `tests/`, with GPU-absent auto-skip and a `benchmark`
+  marker deselected by default (`pytest -m benchmark` to run timing tests)
+- **Docs**: `docs/frontier_setup_rocm720_cupy1401.md` (ROCm 7.2.0 / CuPy 14.0.1 setup),
+  `docs/partition_loading.md`
+
+### Changed
+- Agent IDs are `int64` throughout, lifting the previous magnitude limit
+- `_agent2rank` on the GPU now holds only local and ghost entries instead of all ranks
+- `GPUBufferManager` accepts slack and minimum-capacity tuning parameters
+- `convert_agent_ids_to_indices()` gained `return_arrays=`
+- Single-worker tick fusing is bypassed when `verbose_timing=True`, so per-tick timing rows are
+  emitted instead of one row covering the whole run
+
+### Removed
+- **`Model.setup(use_gpu=...)`** — execution is always on GPU; there is no CPU backend
+- **`sagesim/generate_partition.py`** in full (`partition_with_metis`, `partition_with_communities`,
+  `partition_random`, `partition_round_robin`, `save_partition`, `analyze_partition`) and
+  `Model.load_partition()` / `Model.load_partition_from_dict()`. Partitioning now happens outside
+  SAGESim; see `docs/partition_loading.md`
+- `AgentFactory.bulk_add_agents()`, `AgentFactory.bulk_register_agents()`,
+  `AgentFactory.create_agent_at_index()`
+
+### Fixed
+- Registering an agent ID that has already exited is now rejected instead of silently accepted
+
 ## [0.6.0] - 2026-03-27
 
 ### Added
