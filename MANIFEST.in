@@ -10,5 +10,10 @@ recursive-include sagesim *.py
 # Include main example
 recursive-include examples/sir *.py *.sh *.ipynb
 
+# Include the test suite so an sdist can be tested as shipped.
+# Without this, setuptools' legacy default picks up tests/test_*.py but drops
+# conftest.py and __init__.py, leaving a suite that cannot run.
+recursive-include tests *.py
+
 # Exclude generated step function sources (written at runtime next to the model)
 global-exclude step_func_code*.py
