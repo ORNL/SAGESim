@@ -37,7 +37,7 @@ pip install sagesim
 # Or install from source
 git clone https://github.com/ORNL/sagesim.git
 cd sagesim
-pip install -e .
+pip install .
 ```
 
 ### Dependencies
@@ -63,7 +63,7 @@ from cupyx import jit
 from sagesim.breed import Breed
 
 @jit.rawkernel(device="cuda")
-def my_step_func(tick, agent_index, globals, agent_ids, breeds, locations, health):
+def my_step_func(tick, agent_index, agent_ids, breeds, locations, health):
     """Agent behavior: heal by 1 each tick"""
     health[agent_index] = health[agent_index] + 1
 
@@ -73,6 +73,18 @@ class MyBreed(Breed):
         self.register_property("health", 100)  # Initial value
         self.register_step_func(my_step_func, __file__, priority=0)
 ```
+
+SAGESim calls your step function with a fixed parameter order, and the argument list must match
+it exactly:
+
+```
+tick, agent_index, <one per registered global>, agent_ids, breeds, locations, <one per registered property>
+```
+
+The breed above registers no globals and one property, hence
+`(tick, agent_index, agent_ids, breeds, locations, health)`. Declaring a parameter that does not
+correspond to a registered global or property fails at the first `simulate()` call with
+`TypeError: ... takes N positional arguments but M were given`.
 
 ### 2. Define a Model
 
@@ -95,22 +107,46 @@ class MyModel(Model):
 
 ### 3. Run the Simulation
 
+Driver code must sit under an `if __name__ == "__main__":` guard. `setup()` generates a kernel
+source file that imports your module to pick up the step function, so anything at module level
+runs a second time during that import.
+
 ```python
-# Create model and agents
-model = MyModel()
-for i in range(1000):
-    model.create_agent(health=100)
+if __name__ == "__main__":
+    # Create model and agents
+    model = MyModel()
+    for i in range(1000):
+        model.create_agent(health=100)
 
-# Connect agents in a network
-for i in range(999):
-    model.connect_agents(i, i + 1)
+    # Connect agents in a network
+    for i in range(999):
+        model.connect_agents(i, i + 1)
 
-# Setup and run
-model.setup()
-model.simulate(ticks=100, sync_workers_every_n_ticks=1)
+    # Setup and run
+    model.setup()
+    model.simulate(ticks=100, sync_workers_every_n_ticks=1)
 ```
 
-### 4. Run with MPI (Multiple GPUs)
+Agents must exist before `setup()` — it inspects the registered agent data to determine each
+property's shape.
+
+### 4. Read the Results
+
+Continuing inside the same `__main__` block:
+
+```python
+    # One agent
+    health = model.get_agent_property_value(0, property_name="health")
+
+    # Or every agent of a breed at once
+    all_health = model.get_breed_data("MyBreed", "health")
+```
+
+Each agent healed 1 per tick for 100 ticks, so `health` is `200.0`.
+
+### Running on multiple GPUs
+
+The same script runs unchanged under MPI, one rank per GPU:
 
 ```bash
 mpirun -n 4 python my_simulation.py
@@ -118,16 +154,26 @@ mpirun -n 4 python my_simulation.py
 
 ## Run Example: SIR Epidemic Model
 
+Runs on a single GPU, no MPI launcher needed:
+
 ```bash
 git clone https://github.com/ORNL/sagesim.git
 cd sagesim/examples/sir
-mpirun -n 4 python run.py --num_agents 10000 --percent_init_connections 0.1 --num_nodes 1
+python run.py
+```
+
+The parameters (20 agents, 2 initial connections, 10 ticks) are set at the top of the
+`if __name__ == "__main__":` block in `run.py` — there are no command-line flags; edit the file
+to change them. To spread the same run across 4 GPUs:
+
+```bash
+mpirun -n 4 python run.py
 ```
 
 ## Testing
 
 ```bash
-pip install -e ".[test]"
+pip install ".[test]"
 
 pytest                 # full suite
 pytest -m benchmark    # timing benchmarks, deselected by default
@@ -161,6 +207,7 @@ SAGESim is designed for HPC clusters. Example SLURM script for ORNL Frontier:
 
 ```bash
 #!/bin/bash
+#SBATCH -A <your_project>
 #SBATCH -N 10
 #SBATCH -t 00:30:00
 

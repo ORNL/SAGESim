@@ -44,14 +44,14 @@ CC=gcc CXX=g++ pip install --no-cache-dir --no-binary=cupy cupy==14.0.1
 
 ## 5. Install SAGESim and superneuroabm
 
-Install each package in editable mode from its respective repository root:
+Install each package from its respective repository root:
 
 ```bash
 # Inside the SAGESim repo
 cd /path/to/SAGESim
-pip install -e .
+pip install .
 
 # Inside the superneuroabm repo
 cd /path/to/superneuroabm
-pip install -e .
+pip install .
 ```
