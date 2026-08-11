@@ -56,6 +56,10 @@ install these yourself first:
 
 ## Quick Start
 
+Steps 1-4 below build up a **single file** — call it `my_simulation.py`. The step function has to
+live in an importable module, and the driver code has to sit behind a `__main__` guard (step 3
+explains why), so splitting the pieces across files or a REPL will not work.
+
 ### 1. Define a Breed (Agent Type)
 
 ```python
@@ -149,7 +153,11 @@ Each agent healed 1 per tick for 100 ticks, so `health` is `200.0`.
 The same script runs unchanged under MPI, one rank per GPU:
 
 ```bash
+# Generic MPI (OpenMPI / MPICH)
 mpirun -n 4 python my_simulation.py
+
+# SLURM sites such as ORNL Frontier, where mpirun is not available
+srun -n 4 --ntasks-per-gpu=1 --gpu-bind=closest python my_simulation.py
 ```
 
 ## Run Example: SIR Epidemic Model
@@ -167,7 +175,11 @@ The parameters (20 agents, 2 initial connections, 10 ticks) are set at the top o
 to change them. To spread the same run across 4 GPUs:
 
 ```bash
+# Generic MPI (OpenMPI / MPICH)
 mpirun -n 4 python run.py
+
+# SLURM sites such as ORNL Frontier, where mpirun is not available
+srun -n 4 --ntasks-per-gpu=1 --gpu-bind=closest python run.py
 ```
 
 ## Testing
@@ -233,8 +245,21 @@ When writing step functions, be aware of these `cupyx.jit.rawkernel` constraints
 - **No `break`/`continue`**: Use boolean flags instead
 - **No variable reassignment in scopes**: Declare at top level
 - **No `-1` indexing**: Use `len(array) - 1` instead
+- **Random numbers**: use `rand_uniform_philox(tick, agent_index, salt)` from `sagesim.math_utils`, not `random.random()` — see below
 
 See [CuPy documentation](https://docs.cupy.dev/en/stable/reference/routines.html) for supported operations.
+
+### Random numbers in step functions
+
+Draw with `rand_uniform_philox(tick, agent_index, salt)` (or `rand_uniform_xorshift`,
+`rand_normal`, `rand_normal_bounded`) from `sagesim.math_utils`. SAGESim rewrites these calls to
+inject the run seed and key them on the agent's stable logical ID, so draws vary per tick and per
+agent and stay reproducible across runs and rank counts. `salt` is any small integer
+distinguishing one call site from another.
+
+Python's `random.random()` is not rewritten and does not advance with the tick, so an agent draws
+the same value on every step. A probabilistic model built on it stalls silently instead of
+raising.
 
 ## Project Structure
 

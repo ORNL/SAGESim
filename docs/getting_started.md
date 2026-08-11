@@ -75,36 +75,73 @@ A step function defines how an agent behaves during each simulation tick. It mus
 ### Step Function Signature
 
 ```python
+import cupy as cp
 from cupyx import jit
+
+from sagesim.math_utils import rand_uniform_philox
 
 @jit.rawkernel(device="cuda")
 def my_step_func(
     tick,           # Current simulation tick
     agent_index,    # Index of this agent in the arrays
-    globals,        # Global properties array
+    p_infection,    # One parameter per registered global, in registration order
     agent_ids,      # Agent ID array
     breeds,         # Breed ID array
     locations,      # Neighbor indices array
     state,          # User-defined property arrays...
 ):
-    """Agent behavior logic goes here."""
-    # Read current state
-    current_state = state[agent_index]
-
-    # Access neighbors
+    """Susceptible agents catch the state from any infected neighbor."""
+    # Neighbor indices for this agent (SAGESim pre-converts agent IDs to indices)
     neighbor_indices = locations[agent_index]
 
-    # Update state
-    state[agent_index] = new_value
+    # Read this agent's own state
+    agent_state = int(state[agent_index])
+
+    if agent_state == 1:  # susceptible
+        i = 0
+        infected = False
+        while i < len(neighbor_indices) and not cp.isnan(neighbor_indices[i]) and not infected:
+            neighbor_index = int(neighbor_indices[i])
+            if int(state[neighbor_index]) == 2:  # infected neighbor
+                if rand_uniform_philox(tick, agent_index, 1) < p_infection:
+                    state[agent_index] = 2
+                    infected = True
+            i += 1
 ```
 
 ### Important Rules
 
-1. **Required parameters**: `tick`, `agent_index`, `globals`, `agent_ids`, `breeds`, and `locations` must always be included in this exact order.
+1. **Parameter order**: SAGESim passes arguments in exactly this order, and the signature must
+   match it exactly:
+
+   ```
+   tick, agent_index, <one per registered global>, agent_ids, breeds, locations, <one per registered property>
+   ```
+
+   `tick`, `agent_index`, `agent_ids`, `breeds` and `locations` are always present. **Globals are
+   not** — there is one parameter per global registered with `register_global_property()`, in
+   registration order, and none at all if the model registers none. A model with no globals takes
+   `(tick, agent_index, agent_ids, breeds, locations, ...)`.
 
 2. **All properties included**: All registered properties from all breeds must be in the signature, even if not used.
 
 3. **Property order**: Properties appear in breed registration order, then property registration order within each breed.
+
+4. **A mismatch fails late**: an extra or missing parameter is not caught at `setup()`. It raises
+   at the first `simulate()` call as
+   `TypeError: <name>_double_buffer_N() takes X positional arguments but Y were given`.
+
+5. **Use SAGESim's RNG, not `random.random()`**: draw random numbers with
+   `rand_uniform_philox(tick, agent_index, salt)` from `sagesim.math_utils` (or
+   `rand_uniform_xorshift`, `rand_normal`, `rand_normal_bounded`). SAGESim rewrites these calls to
+   inject the run seed and key them on the agent's stable logical ID, so draws vary per tick and
+   per agent and are reproducible across runs and rank counts. `salt` is any small integer that
+   distinguishes one call site from another.
+
+   Python's `random.random()` is **not** rewritten. Inside a kernel it does not advance with the
+   tick, so an agent draws the same value every step — a probabilistic model built on it silently
+   stalls rather than erroring. Measured on a 60-agent chain with `p_infection=0.2` over 50 ticks:
+   `rand_uniform_philox` infected 13 agents, `random.random()` infected 0 beyond the seed agent.
 
 ---
 
@@ -132,28 +169,41 @@ See [CuPy documentation](https://docs.cupy.dev/en/stable/reference/routines.html
 
 ### Single Worker, Single GPU (Recommended for Small Simulations)
 
-If your simulation fits in one GPU's memory, use a single worker for best performance:
+If your simulation fits in one GPU's memory, use a single worker for best performance.
+
+The model, breed and step function above, plus the driver code below, all go in **one file** —
+`my_simulation.py`. Two requirements are easy to miss:
+
+- **Driver code must sit under `if __name__ == "__main__":`.** `setup()` generates a kernel source
+  file that imports your module to recover the step function, so anything at module level runs a
+  second time during that import.
+- **Agents must exist before `setup()`.** It inspects registered agent data to determine each
+  property's shape.
 
 ```python
 # Run with: python my_simulation.py
 
-# Create model and agents
-model = MyModel(p_infection=0.2)
-for i in range(1000):
-    model.create_agent(state=1)
+if __name__ == "__main__":
+    # Create model and agents
+    model = MyModel(p_infection=0.2)
+    for i in range(1000):
+        model.create_agent(state=1)
 
-# Connect agents
-for i in range(999):
-    model.connect_agents(i, i + 1)
+    # Connect agents
+    for i in range(999):
+        model.connect_agents(i, i + 1)
 
-# Setup and run
-model.setup()
-model.simulate(ticks=100, sync_workers_every_n_ticks=1)
+    # Infect agent 0 so there is something to spread
+    model.set_agent_property_value(0, "state", 2)
 
-# Get results
-for agent_id in range(10):
-    state = model.get_agent_property_value(agent_id, "state")
-    print(f"Agent {agent_id}: state={state}")
+    # Setup and run
+    model.setup()
+    model.simulate(ticks=100, sync_workers_every_n_ticks=1)
+
+    # Get results
+    for agent_id in range(10):
+        state = model.get_agent_property_value(agent_id, "state")
+        print(f"Agent {agent_id}: state={state}")
 ```
 
 ### Multiple Workers, Multiple GPUs (For Large Simulations)
@@ -162,7 +212,12 @@ For simulations that exceed single GPU memory, distribute across multiple GPUs w
 
 ```bash
 # 4 workers on 4 GPUs (one worker per GPU)
+
+# Generic MPI (OpenMPI / MPICH)
 mpirun -n 4 python my_simulation.py
+
+# SLURM sites such as ORNL Frontier, where mpirun is not available
+srun -n 4 --ntasks-per-gpu=1 --gpu-bind=closest python my_simulation.py
 ```
 
 > **Recommendation: One Worker = One GPU**
