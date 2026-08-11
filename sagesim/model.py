@@ -1227,8 +1227,21 @@ class Model:
             print(f"[TIMING] MPI barrier wait at simulate start: {t_barrier_wait*1000:.2f} ms", flush=True)
 
         # Step function is cached during setup() - no need to reimport
-        # Single worker: fuse all ticks in one kernel launch (no MPI sync needed)
-        if num_workers == 1:
+        # Single worker: fuse all ticks in one kernel launch (no MPI sync needed).
+        #
+        # Skipped when verbose_timing is on, because one worker_coroutine() call appends one
+        # entry to _tick_timings: fusing records a single row covering construction plus every
+        # tick, leaving no per-tick step time at all. Unfusing also puts the single worker on
+        # the same per-tick path as every multi-worker run, which is what makes a 1-GPU point
+        # comparable to the rest of a scaling curve.
+        #
+        # NOTE (measured 2026-07-30, superneuroabm weak campaign, npp=12500, 100 ticks): fusing
+        # is not actually faster here. Per tick, fused vs unfused was 57.8 vs 4.2 ms at K=1000
+        # and 64.3 vs 7.5 ms at K=2000 -- 8-14x SLOWER fused, with construction matching to 1%
+        # at K=2000, so the runs are otherwise comparable. Whether the fast path is worth
+        # keeping at all is an open question, but that is a behaviour change on two data points
+        # at one problem size, so it is left alone here.
+        if num_workers == 1 and not self._verbose_timing:
             self.worker_coroutine(ticks)
         else:
             # Multi-worker: need periodic synchronization
