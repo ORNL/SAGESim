@@ -223,5 +223,5 @@ srun -N${num_nodes} -n${num_mpi_ranks} -c7 \
 
 - [Architecture Overview](architecture_overview.md) - System design and data flow
 - [Synchronization and Double Buffering](synchronization_and_double_buffering.md) - Race condition prevention
-- [Network Partitioning](network_partition.md) - Load balancing for distributed execution
+- [Partition Loading](partition_loading.md) - Building a model from per-rank partitions
 - [Runtime Optimizations](runtime_optimizations.md) - Performance tuning

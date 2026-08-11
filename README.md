@@ -10,15 +10,21 @@
 - **Pure Python**: Write agent behaviors in Python using CuPy's JIT-compiled GPU kernels
 - **Scalable**: From laptop GPUs to HPC clusters with thousands of GPUs
 - **Network-Based Models**: Built-in support for agent networks with automatic neighbor data synchronization
+- **Distributed Construction**: Each rank builds only its own partition — the full graph is never materialized on any one rank
+- **GPU-Resident State**: Persistent GPU buffers and CSR neighbor storage, so agent data stays on the device across ticks
+- **GPU-Aware MPI**: Direct GPU-to-GPU transfers where the MPI implementation supports it, with automatic detection
+- **Fused Ticks**: All ticks and priorities in a single kernel launch, synchronized by in-kernel grid barriers
 - **Double Buffering**: Race condition prevention for concurrent agent interactions
-- **Graph Partitioning**: Load pre-computed partitions to minimize cross-worker communication
 - **Flexible Properties**: Support for scalar and nested list properties with automatic padding
 
 ## Requirements
 
 - Python 3.11+
-- NVIDIA GPU with CUDA drivers **or** AMD GPU with ROCm 5.7.1+
+- NVIDIA GPU with CUDA drivers **or** AMD GPU with ROCm
 - MPI implementation (OpenMPI, MPICH, etc.)
+
+Tested on ORNL Frontier with ROCm 7.2.0 and CuPy 14.0.1 — see
+[Frontier setup](docs/frontier_setup_rocm720_cupy1401.md) for a known-good environment.
 
 ## Installation
 
@@ -36,11 +42,17 @@ pip install -e .
 
 ### Dependencies
 
-- `cupy` - GPU array computing
-- `mpi4py` - MPI bindings for Python
+Resolved automatically by `pip install sagesim`:
+
 - `networkx` - Graph/network handling
 - `numpy` - CPU array operations
 - `awkward` - Ragged array support
+
+**Not** installed automatically, because the correct build depends on your GPU and MPI stack —
+install these yourself first:
+
+- `cupy` - GPU array computing (choose the CUDA or ROCm build matching your hardware)
+- `mpi4py` - MPI bindings for Python (must be built against your system MPI)
 
 ## Quick Start
 
@@ -112,6 +124,18 @@ cd sagesim/examples/sir
 mpirun -n 4 python run.py --num_agents 10000 --percent_init_connections 0.1 --num_nodes 1
 ```
 
+## Testing
+
+```bash
+pip install -e ".[test]"
+
+pytest                 # full suite
+pytest -m benchmark    # timing benchmarks, deselected by default
+```
+
+Every test executes GPU kernels, so the suite skips itself entirely when no device is visible
+rather than failing.
+
 ## Documentation
 
 Comprehensive documentation is available in the `docs/` directory:
@@ -121,12 +145,15 @@ Comprehensive documentation is available in the `docs/` directory:
 | [Architecture Overview](docs/architecture_overview.md) | System design, MPI distribution, GPU threading |
 | [Getting Started](docs/getting_started.md) | Step-by-step guide to building models |
 | [Double Buffering](docs/synchronization_and_double_buffering.md) | Race condition prevention mechanisms |
-| [Network Partitioning](docs/network_partition.md) | Loading pre-computed partitions for load balancing |
+| [Partition Loading](docs/partition_loading.md) | Building a model from per-rank partitions |
 | [Runtime Optimizations](docs/runtime_optimizations.md) | Performance tuning techniques |
+| [Overhead Analysis](docs/overhead_analysis.md) | Where per-tick time actually goes |
 | [Selective Sync](docs/selective_property_synchronization.md) | Reducing MPI overhead |
 | [Property History](docs/property_history_tracking.md) | Tracking property changes over time |
 | [Ordered Neighbors](docs/ordered_neighbors.md) | Ordered neighbor storage for agent networks |
 | [GPU-CPU Data Flow](docs/gpu_cpu_data_flow.md) | Data flow between CPU and GPU |
+| [GPU Communication Redesign](docs/gpu_communication_redesign.md) | GPU-resident buffers and CSR-based ghost exchange |
+| [Frontier Setup](docs/frontier_setup_rocm720_cupy1401.md) | Known-good ROCm 7.2.0 / CuPy 14.0.1 environment |
 
 ## HPC Deployment
 
@@ -166,15 +193,21 @@ See [CuPy documentation](https://docs.cupy.dev/en/stable/reference/routines.html
 
 ```
 sagesim/
-├── sagesim/           # Core library
-│   ├── model.py       # Model class, simulation loop, GPU kernel generation
-│   ├── agent.py       # Agent factory, MPI data synchronization
-│   ├── breed.py       # Breed definition, property registration
-│   ├── space.py       # NetworkSpace for agent topology
-│   └── internal_utils.py  # Array conversion utilities
-├── examples/          # Example models (SIR epidemic model)
-├── docs/              # Comprehensive documentation
-└── tests/             # Test suite
+├── sagesim/               # Core library
+│   ├── model.py           # Model class, simulation loop, GPU kernel generation
+│   ├── gpu_kernels.py     # GPU buffer manager, GPU hash map, MPI communication manager
+│   ├── agent.py           # Agent factory, rank assignment, agent data tensors
+│   ├── breed.py           # Breed definition, property registration
+│   ├── space.py           # NetworkSpace for agent topology
+│   ├── math_utils.py      # Math helpers callable from step kernels
+│   ├── utils.py           # Agent/neighbor data accessors for step kernels
+│   ├── partition_utils.py # Helpers for per-rank partition loading
+│   ├── internal_utils.py  # Array conversion and CSR construction
+│   └── jit_extensions.py  # CuPy JIT builtins (e.g. threadfence)
+├── examples/              # Example models (SIR epidemic model)
+├── scaling_tests/         # Weak scaling harness and SLURM launcher
+├── docs/                  # Comprehensive documentation
+└── tests/                 # Test suite
 ```
 
 ## Contributing

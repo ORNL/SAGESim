@@ -90,20 +90,21 @@ Agent 5 → Worker 1
 ...
 ```
 
-#### 2. Graph Partitioning (METIS)
+#### 2. Explicit Rank Assignment
 
-For networked simulations, loading a pre-computed partition minimizes cross-worker communication:
+For networked simulations, placing agents according to a pre-computed partition minimizes
+cross-worker communication. Rank placement is caller-controlled: pass `rank=` to override
+round-robin for a single agent, or build the whole rank-local model at once.
 
-**Key file:** `sagesim/agent.py:329-346`
+**Key file:** `sagesim/agent.py:160-169`
 
 ```python
-# Assign agent to rank: use partition if loaded, otherwise round-robin
-if self._partition_loaded and agent_id in self._partition_mapping:
-    # Use pre-loaded partition
-    assigned_rank = self._partition_mapping[agent_id]
+# Assign agent to rank: explicit > round-robin
+if rank is not None:
+    assigned_rank = rank
 else:
-    # Fall back to round-robin assignment
-    ...
+    assigned_rank = self._current_rank
+    self._current_rank = (self._current_rank + 1) % num_workers
 ```
 
 **Benefits of graph partitioning:**
@@ -112,14 +113,21 @@ else:
 - Typical edge-cut ratios: 10-15% with good partitions vs 50%+ with round-robin
 
 **Usage:**
+
+Partitioning happens outside SAGESim. Each rank reads only its own share of the graph and
+hands it to the model directly, so the full graph is never materialized on any one rank:
+
 ```python
 model = Model(space)
-model.load_partition("partition.pkl")  # BEFORE creating agents
-# ... create agents ...
+model.build_from_local_data(agents, connections, remote_agent_ranks)  # BEFORE setup()
 model.setup()
 ```
 
-See `docs/network_partition.md` for detailed partition generation instructions.
+For very large partitions, `model.build_from_local_columns()` takes columnar arrays and
+`space.set_prebuilt_csr()` takes a neighbor list that is already in CSR form, skipping the
+per-edge Python path entirely.
+
+See `docs/partition_loading.md` for the full workflow.
 
 ---
 
@@ -499,6 +507,6 @@ The GPU array includes both local and non-local (ghost) agents:
 ## See Also
 
 - `docs/synchronization_and_double_buffering.md` - Detailed explanation of race condition prevention
-- `docs/network_partition.md` - Guide to generating and using network partitions
+- `docs/partition_loading.md` - Building a model from per-rank partitions
 - `docs/selective_property_synchronization.md` - Reducing MPI overhead with neighbor_visible
 - `docs/gpu_cpu_data_flow.md` - Detailed data flow diagrams
