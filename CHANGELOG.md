@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.7.0] - 2026-08-11
 
+> **Upgrading from 0.6.x:** `model.setup(use_gpu=True)` → `model.setup()`.
+
 ### Added
 - **Distributed model construction**: each rank builds only its own partition — no global
   graph is ever materialized. `Model.build_from_local_data()`, `Model.build_from_local_columns()`,
