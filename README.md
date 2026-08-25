@@ -282,6 +282,10 @@ sagesim/
 └── tests/                 # Test suite
 ```
 
+## Changelog
+
+Release notes for every version live in [CHANGELOG.md](https://github.com/ORNL/SAGESim/blob/main/CHANGELOG.md), and each release is also published on the [Releases page](https://github.com/ORNL/SAGESim/releases).
+
 ## Contributing
 
 Contributions are welcome! Please see the [GitHub repository](https://github.com/ORNL/sagesim) for issues and pull requests.
