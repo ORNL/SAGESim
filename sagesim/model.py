@@ -239,9 +239,13 @@ def _build_param_to_property_index(param_names: list, num_properties: int) -> di
     The last num_properties params map 1:1 to property indices.
 
     The parameter order in the user's step function is:
-        tick, agent_index, globals, agent_ids,
+        tick, agent_index, <one param per registered global>, agent_ids,
         breeds, locations, prop2, prop3, ...
         ^-- property params (num_properties total) --^
+
+    Globals are not passed as a single array: there is one parameter per global
+    registered with register_global_property(), in registration order, and none
+    at all when the model registers no globals.
 
     Returns dict: {param_name: property_index}
     """
@@ -258,9 +262,12 @@ def _build_param_to_property_index_csr(param_names: list, num_properties: int) -
     property-like parameters.
 
     The parameter order after CSR transformation:
-        tick, agent_index, globals, agent_ids,
+        tick, agent_index, <one param per registered global>, agent_ids,
         breeds, neighbor_offsets, neighbor_values, prop2, prop3, ...
         ^-- property-like params (num_properties + 1 total) --^
+
+    As above, globals contribute one parameter each in registration order, and
+    none at all when the model registers no globals.
 
     Returns dict: {param_name: property_index} where CSR params map to -1.
     """

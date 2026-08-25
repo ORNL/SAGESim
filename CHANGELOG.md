@@ -5,6 +5,35 @@ All notable changes to SAGESim will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-08-25
+
+Documentation-only release. No library code changed between 0.7.0 and 0.7.1, so upgrading requires
+no changes to model code.
+
+### Fixed
+- **Step function signature** in `README.md` and `docs/getting_started.md` — SAGESim passes one
+  parameter per registered global, in registration order, and none at all when the model registers
+  no globals. The documented signature previously showed a single `globals` array, which raises
+  `TypeError: <name>_double_buffer_N() takes X positional arguments but Y were given` at the first
+  `simulate()` call. The real order is
+  `tick, agent_index, <one per registered global>, agent_ids, breeds, locations, <one per property>`
+- **`__main__` guard**: documented that driver code must sit under `if __name__ == "__main__":`,
+  because `setup()` generates a kernel source file that imports the caller's module to recover the
+  step function, so module-level code runs a second time during that import
+- **Agent creation ordering**: documented that agents must exist before `setup()`, which infers
+  each property's shape from the registered agent data
+- **SIR example invocation**: `examples/sir/run.py` takes no command-line flags — parameters are set
+  in its `if __name__ == "__main__":` block. The previously documented
+  `--num_agents 10000 --percent_init_connections 0.1 --num_nodes 1` flags were silently ignored
+- **SLURM launch**: added `srun -n 4 --ntasks-per-gpu=1 --gpu-bind=closest` alongside `mpirun`, for
+  sites such as ORNL Frontier where `mpirun` is unavailable
+- **Random numbers in step functions**: documented that `random.random()` is not rewritten by the
+  AST pass and does not advance with the tick, so every agent draws the same value on every step and
+  probabilistic models stall silently instead of raising. Use `rand_uniform_philox`,
+  `rand_uniform_xorshift`, `rand_normal` or `rand_normal_bounded` from `sagesim.math_utils`
+- Corrected the stale step-function parameter order in the `_build_param_to_property_index()` and
+  `_build_param_to_property_index_csr()` docstrings in `sagesim/model.py`
+
 ## [0.7.0] - 2026-08-11
 
 ### Added
