@@ -206,10 +206,80 @@ def _warn_if_huge_padded(capacity, width):
         )
 
 
+# Set by convert_to_padded_gpu_tensor to name the branch the last call took.
+# Read by the GPU buffer manager so per-property timings can be attributed to a
+# code path: "depth3_awkward" is the slow one (ak.from_iter walks every row).
+LAST_CONVERSION_PATH = None
+
+
+# A shared/deduplicated column is built as [row_a] * n + [row_b] * m, so a strided
+# sample of object ids tells us whether a full scan is worth running. It matters:
+# `map(id, column)` over genuinely distinct rows chases scattered heap objects at
+# ~0.66 us/row, about 8 s per column at 12.5M rows, and the record construction path
+# has no shared rows at all. The sample costs microseconds at any column size.
+_DEDUP_SAMPLE = 64
+# Cap the table two ways: an absolute ceiling, and a compression ratio, so the gather
+# is only used when it actually replaces a lot of per-row work. A Poisson-driven
+# input_spikes_tensor is the motivating case: ~12.5k distinct rows among 12.5M still
+# compresses 1000:1 and converts in a fraction of the per-row path.
+_DEDUP_MAX_DISTINCT = 1 << 17
+_DEDUP_MIN_RATIO = 8
+
+
+def _identity_groups(ragged_list):
+    """Distinct rows and an inverse index, when a column is built from a few shared
+    row objects. Returns None when deduplicating would not pay.
+
+    Only rows that are list/tuple are considered: depth-1 scalars may be interned,
+    and sets have no stable order (the existing uniform fast path skips them too).
+    """
+    n = len(ragged_list)
+    if n <= _DEDUP_SAMPLE or not isinstance(ragged_list[0], (list, tuple)):
+        return None
+
+    step = max(1, n // _DEDUP_SAMPLE)
+    sampled = [ragged_list[i] for i in range(0, n, step)]
+    if len({id(r) for r in sampled}) * 4 > len(sampled):
+        return None  # mostly distinct; the full scan would not pay for itself
+    if not all(isinstance(r, (list, tuple)) for r in sampled):
+        return None
+
+    ids = np.fromiter(map(id, ragged_list), np.int64, n)
+    # return_index gives the FIRST occurrence of each id, and np.unique sorts by id
+    # value, so the table must be built in that same order for `inverse` to index it.
+    uniq, first_idx, inverse = np.unique(ids, return_index=True, return_inverse=True)
+    if len(uniq) > _DEDUP_MAX_DISTINCT or len(uniq) * _DEDUP_MIN_RATIO > n:
+        return None
+
+    rows = [ragged_list[int(i)] for i in first_idx]
+    if not all(isinstance(r, (list, tuple)) for r in rows):
+        return None
+    return rows, inverse
+
+
 def convert_to_padded_gpu_tensor(ragged_list, capacity):
     """Convert ragged list directly to padded GPU tensor (single allocation)."""
+    global LAST_CONVERSION_PATH
+    LAST_CONVERSION_PATH = None
     if not ragged_list:
+        LAST_CONVERSION_PATH = "empty"
         return cp.zeros(capacity, dtype=np.float32)
+
+    # Fast path: the column is a handful of shared row objects repeated. Pad only the
+    # distinct rows and gather on the device, replacing one Python statement per row
+    # with a single take. The recursion converts the small table through the branches
+    # below, so padding, dtype and depth handling stay byte-identical.
+    groups = _identity_groups(ragged_list)
+    if groups is not None:
+        rows, inverse = groups
+        table = convert_to_padded_gpu_tensor(rows, len(rows))
+        LAST_CONVERSION_PATH = "identity_dedup"
+        n = len(ragged_list)
+        _warn_if_huge_padded(capacity, int(np.prod(table.shape[1:])) or 1)
+        fill = cp.nan if table.ndim >= 2 else 0
+        out = cp.full((capacity,) + table.shape[1:], fill, dtype=table.dtype)
+        cp.take(table, cp.asarray(inverse.astype(np.int32)), axis=0, out=out[:n])
+        return out
 
     # Fast path: already-padded depth-2
     if isinstance(ragged_list[0], (list, tuple)):
@@ -217,6 +287,7 @@ def convert_to_padded_gpu_tensor(ragged_list, capacity):
         if len(set(row_lengths)) == 1:
             first_len = len(ragged_list[0])
             if first_len > 0 and not isinstance(ragged_list[0][0], (list, tuple)):
+                LAST_CONVERSION_PATH = "depth2_uniform"
                 _warn_if_huge_padded(capacity, first_len)
                 result = np.full((capacity, first_len), np.nan, dtype=np.float32)
                 result[:len(ragged_list)] = ragged_list
@@ -225,10 +296,12 @@ def convert_to_padded_gpu_tensor(ragged_list, capacity):
     depth = _detect_depth(ragged_list[0])
 
     if depth == 1:
+        LAST_CONVERSION_PATH = "depth1"
         result = np.zeros(capacity, dtype=np.float32)
         result[:len(ragged_list)] = np.array(ragged_list, dtype=np.float32)
         return cp.array(result)
     elif depth == 2:
+        LAST_CONVERSION_PATH = "depth2_ragged"
         max_len = max((len(r) if isinstance(r, (list, tuple, set)) else 1
                        for r in ragged_list), default=0)
         if max_len == 0:
@@ -244,6 +317,7 @@ def convert_to_padded_gpu_tensor(ragged_list, capacity):
         return cp.array(result)
     else:
         # Depth 3+: fall back to awkward, pad on GPU
+        LAST_CONVERSION_PATH = "depth3_awkward"
         awkward_array = ak.from_iter(ragged_list)
         tensor = _convert_awkward(awkward_array, depth)
         padded_shape = (capacity,) + tensor.shape[1:]

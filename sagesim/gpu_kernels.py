@@ -5,6 +5,9 @@ Provides persistent GPU buffer management to eliminate per-tick CPU rebuild cycl
 """
 
 import os
+import time
+
+from sagesim import internal_utils
 
 import numpy as np
 import cupy as cp
@@ -284,6 +287,7 @@ class GPUBufferManager:
 
         # Persistent GPU arrays
         self.property_tensors = []      # List of CuPy arrays, one per property
+        self.property_alloc_stats = []  # per-property {prop_idx, shape, nbytes, seconds}
         self.write_buffers = []         # List of CuPy arrays for double-buffered properties
         self.neighbor_offsets = None    # CuPy int32 (CSR offsets)
         self.neighbor_values = None     # CuPy int32 (CSR values, local indices for kernel)
@@ -323,14 +327,26 @@ class GPUBufferManager:
         """
         self.agent_capacity = agent_capacity
         self.property_tensors = []
+        self.property_alloc_stats = []
 
         for i in range(num_properties):
             if i == 1:
                 # Property 1 uses CSR, not a rectangular tensor
                 self.property_tensors.append(None)
             else:
+                _t0 = time.perf_counter()
                 padded = convert_to_padded_func(combined_lists[i], agent_capacity)
+                _elapsed = time.perf_counter() - _t0
                 self.property_tensors.append(padded)
+                # Per-property cost and footprint. The aggregate 'prop_tensors'
+                # timer hides which column is expensive and how wide padding made it.
+                self.property_alloc_stats.append({
+                    "prop_idx": i,
+                    "shape": tuple(int(d) for d in padded.shape),
+                    "nbytes": int(padded.nbytes),
+                    "seconds": _elapsed,
+                    "path": getattr(internal_utils, "LAST_CONVERSION_PATH", None),
+                })
 
     def allocate_write_buffers(self, sorted_write_indices):
         """Create write buffers as copies of property tensors."""

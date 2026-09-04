@@ -382,6 +382,7 @@ class Model:
         self._threads_per_block = threads_per_block
         self._step_function_file_path = os.path.abspath(step_function_file_path)
         self._verbose_timing = verbose_timing
+        self._setup_timings = {}
         self._agent_slack_factor = agent_slack_factor
         self._csr_slack_factor = csr_slack_factor
         self._min_capacity = min_capacity
@@ -1143,6 +1144,24 @@ class Model:
 
         t_setup_total_end = time.time()
 
+        # Setup sub-step timings. Always recorded (six subtractions); printed only
+        # under verbose_timing. These phases were timed but discarded before, so
+        # which part of setup dominates was not observable.
+        self._setup_timings = {
+            "analysis": t_analysis_end - t_setup_total_start,
+            "sort_by_breed": t_sort_end - t_analysis_end,
+            "tensors": t_tensors_end - t_sort_end,
+            "codegen": t_codegen_end - t_codegen_start,
+            "jit": t_jit_end - t_jit_start,
+            "total": t_setup_total_end - t_setup_total_start,
+        }
+        if self._verbose_timing and worker == 0:
+            print(
+                "[TIMING] setup: "
+                + ", ".join(f"{k}={v:.4f}s" for k, v in self._setup_timings.items()),
+                flush=True,
+            )
+
     # ------------------------------------------------------------------
     # Overridable hooks for subclass-specific GPU kernel extensions
     # ------------------------------------------------------------------
@@ -1492,6 +1511,9 @@ class Model:
 
         if do_time:
             sub_timing['prop_tensors'] = time.time() - _t0
+            sub_timing['gpu_pool_bytes_after_props'] = int(
+                cp.get_default_memory_pool().used_bytes()
+            )
             _t0 = time.time()
 
         # 8. Create write buffers
