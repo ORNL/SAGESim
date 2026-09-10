@@ -1167,10 +1167,17 @@ class Model:
     # ------------------------------------------------------------------
 
     def _get_extra_kernel_config(self) -> dict:
-        """Override to inject extra GPU kernel params and post-step code.
+        """Override to inject extra GPU kernel params and generated code.
         Returns dict with optional keys:
           'extra_kernel_params': list[str]         — names for kernel signature
           'post_breed_step_code': list[tuple]      — [(code_lines, once_per_breed[, only_priority]), ...]
+          'pre_tick_code': list[str]               — lines emitted at the top of every tick, before
+                                                     priority 0, with `thread_id`, `total_threads`
+                                                     and `thread_local_tick` in scope. Indent relative
+                                                     to the tick body with tabs. A line that is exactly
+                                                     `__GRID_BARRIER__` expands to a software grid
+                                                     barrier at that indentation; the branch enclosing
+                                                     it must be uniform across all threads.
         """
         return {}
 
@@ -2628,6 +2635,18 @@ def generate_gpu_func(
     # ================================================================
     tick_body = []
     _extra_seen_breeds = set()  # For once_per_breed dedup of extra post-step code
+
+    # Subclass-injected code that runs at the start of every tick, before priority 0
+    # (e.g. delivering this tick's scheduled external events into agent rows).
+    pre_tick_code = (extra_kernel_config or {}).get('pre_tick_code', [])
+    for raw in pre_tick_code:
+        rel_indent = raw[:len(raw) - len(raw.lstrip())]
+        if raw.strip() == "__GRID_BARRIER__":
+            tick_body += _gen_barrier_code("\t\t" + rel_indent)
+        else:
+            tick_body.append(f"\t\t{raw}")
+    if pre_tick_code:
+        tick_body.append("")
 
     for priority_idx, breed_idx_2_step_func in enumerate(breed_idx_2_step_func_by_priority):
         # Range-bounded persistent thread loop for this priority
