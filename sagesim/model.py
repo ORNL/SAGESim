@@ -29,9 +29,12 @@ from sagesim.agent import AgentFactory, Breed
 from sagesim.space import Space
 from sagesim.internal_utils import convert_to_equal_side_tensor, build_csr_from_ragged, build_csr_values_only, convert_to_padded_gpu_tensor
 from sagesim.gpu_kernels import GPUBufferManager, GPUHashMap, CommunicationManager, is_gpu_aware_mpi, discover_ghost_topology
+from sagesim.columns import ArrayColumn, IndexedColumn
+from sagesim.internal_utils import _identity_groups, _DEDUP_MIN_RATIO
 
 
-def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map, return_arrays=False):
+def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map, return_arrays=False,
+                                 id_keys=None):
     """
     Convert agent IDs in nested arrays to local indices using a hash map.
 
@@ -42,11 +45,19 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map, return_arra
         single row holds the whole ~150M-element flat CSR: a ``.tolist()`` there
         materializes a multi-GB Python list only to be re-arrayed in allocate_csr.
         Non-array rows are unaffected; the default keeps the record path identical.
+    :param id_keys: Optional int64 array of the map's keys in buffer-row order
+        (row i holds agent id ``id_keys[i]``). When given, the lookup table is built
+        from it directly instead of materialising ``list(map.keys())`` /
+        ``list(map.values())`` for every agent.
     :return: Same structure with IDs replaced by local indices (-1 if not found)
     """
     # OPTIMIZATION: Build lookup arrays ONCE instead of for every agent!
-    id_keys = np.array(list(agent_id_to_index_map.keys()), dtype=np.int64)
-    id_values = np.array(list(agent_id_to_index_map.values()), dtype=np.int32)
+    if id_keys is not None:
+        id_keys = np.asarray(id_keys, dtype=np.int64)
+        id_values = np.arange(len(id_keys), dtype=np.int32)
+    else:
+        id_keys = np.array(list(agent_id_to_index_map.keys()), dtype=np.int64)
+        id_values = np.array(list(agent_id_to_index_map.values()), dtype=np.int32)
     min_id = id_keys.min()
     max_id = id_keys.max()
     id_range = max_id - min_id + 1
@@ -253,6 +264,30 @@ def _build_param_to_property_index(param_names: list, num_properties: int) -> di
     return {name: idx for idx, name in enumerate(prop_params)}
 
 
+def _build_param_to_property_index_transformed(param_names: list, num_properties: int,
+                                               interned: set) -> dict:
+    """Map the TRANSFORMED parameter names (CSR pair for property 1, `<p>_table, <p>_codes`
+    pair for every interned property) back to property indices. CSR params map to -1;
+    both halves of an interned pair map to their property index."""
+    n_prop_params = num_properties + 1 + len(interned)
+    prop_params = param_names[-n_prop_params:]
+    mapping = {}
+    pos = 0
+    for prop_idx in range(num_properties):
+        if prop_idx == 1:
+            mapping[prop_params[pos]] = -1
+            mapping[prop_params[pos + 1]] = -1
+            pos += 2
+        elif prop_idx in interned:
+            mapping[prop_params[pos]] = prop_idx
+            mapping[prop_params[pos + 1]] = prop_idx
+            pos += 2
+        else:
+            mapping[prop_params[pos]] = prop_idx
+            pos += 1
+    return mapping
+
+
 def _build_param_to_property_index_csr(param_names: list, num_properties: int) -> dict:
     """
     Build mapping from CSR-TRANSFORMED step function parameter names to property indices.
@@ -288,13 +323,98 @@ def _build_param_to_property_index_csr(param_names: list, num_properties: int) -
     return mapping
 
 
+_INJECTED_PARAMS = ("_seed", "logical_ids")   # added to every kernel by _inject_seed
+
+
+def _function_def_of(func):
+    """(FunctionDef node, parameter names) of a device function, or (None, None)."""
+    try:
+        tree = ast.parse(inspect.getsource(func))
+    except (OSError, TypeError):
+        return None, None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return node, [a.arg for a in node.args.args]
+    return None, None
+
+
+def _resolve_callee(caller, name):
+    """The object a bare call `name(...)` inside `caller` refers to, if it is a function."""
+    module = inspect.getmodule(caller)
+    obj = getattr(module, name, None) if module is not None else None
+    if obj is None:
+        obj = getattr(caller, "__globals__", {}).get(name)
+    return obj if obj is not None and callable(obj) and not isinstance(obj, type) else None
+
+
+def _collect_property_writes(func, param_to_prop, out, visited):
+    """Add to `out` the property indices written by `func` or by any helper it forwards
+    property parameters to (positionally or by keyword), following helpers recursively.
+
+    `param_to_prop` maps this function's parameter names to property indices. A helper
+    receives the mapping of whatever property parameters the caller passes it, so a
+    write like `synapse_params[agent_index][0] = w` inside an STDP kernel reached through
+    a dispatcher is attributed to the dispatcher's property. Only bare-name arguments are
+    followed (that is how these kernels forward tensors)."""
+    func_def, param_names = _function_def_of(func)
+    if func_def is None:
+        return
+
+    def check_target(target):
+        if isinstance(target, ast.Name):
+            if target.id in param_to_prop:
+                out.add(param_to_prop[target.id])
+        elif isinstance(target, ast.Subscript):
+            check_target(target.value)
+
+    for node in ast.walk(func_def):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                check_target(t)
+        elif isinstance(node, ast.AugAssign):
+            check_target(node.target)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == 'set_this_agent_data_from_tensor':
+                if len(node.args) >= 2 and isinstance(node.args[1], ast.Name):
+                    if node.args[1].id in param_to_prop:
+                        out.add(param_to_prop[node.args[1].id])
+                continue
+            forwarded = {}
+            callee = None
+            callee_params = None
+            if any(isinstance(a, ast.Name) and a.id in param_to_prop for a in node.args):
+                callee = _resolve_callee(func, node.func.id)
+                if callee is not None:
+                    _, callee_params = _function_def_of(callee)
+                    if callee_params is None:
+                        callee = None
+            if callee is not None:
+                # Generated dispatchers already carry the framework-injected `_seed` /
+                # `logical_ids` arguments; drop those the callee does not declare so the
+                # remaining arguments line up with its original parameter list.
+                positional = [a for a in node.args
+                              if not (isinstance(a, ast.Name) and a.id in _INJECTED_PARAMS
+                                      and a.id not in callee_params)]
+                for pos, arg in enumerate(positional):
+                    if isinstance(arg, ast.Name) and arg.id in param_to_prop and pos < len(callee_params):
+                        forwarded[callee_params[pos]] = param_to_prop[arg.id]
+            for kw in node.keywords:
+                if isinstance(kw.value, ast.Name) and kw.value.id in param_to_prop and kw.arg:
+                    if callee is None:
+                        callee = _resolve_callee(func, node.func.id)
+                    if callee is not None:
+                        forwarded[kw.arg] = param_to_prop[kw.value.id]
+            if callee is not None and forwarded:
+                key = (id(callee), tuple(sorted(forwarded.items())))
+                if key not in visited:
+                    visited.add(key)
+                    _collect_property_writes(callee, forwarded, out, visited)
+
+
 def analyze_step_function_for_writes(step_func: Callable, num_properties: int,
                                       num_breed_local_params: int = 0) -> Set[int]:
-    """Analyze step function to find which property indices need write buffers."""
-    write_property_indices = set()
-
-    source = inspect.getsource(step_func)
-    tree = ast.parse(source)
+    """Property indices that `step_func` writes -- directly, or inside any device helper
+    it forwards property tensors to (dispatchers, shared update kernels)."""
     signature = inspect.signature(step_func)
     param_names = list(signature.parameters.keys())
 
@@ -304,40 +424,11 @@ def analyze_step_function_for_writes(step_func: Callable, num_properties: int,
     else:
         param_names_for_prop = param_names
 
-    # Build param name → property index mapping (for ORIGINAL user step function)
+    # Build param name -> property index mapping (for ORIGINAL user step function)
     param_to_prop = _build_param_to_property_index(param_names_for_prop, num_properties)
 
-    # Get just the property param names for checking
-    property_params = param_names[-num_properties:]
-
-    def check_target_for_writes(target_node):
-        if isinstance(target_node, ast.Name):
-            # Direct assignment: param_name = value
-            if target_node.id in param_to_prop:
-                prop_idx = param_to_prop[target_node.id]
-                write_property_indices.add(prop_idx)
-        elif isinstance(target_node, ast.Subscript):
-            # Subscript assignment: param_name[...] = value or nested subscripts
-            check_target_for_writes(target_node.value)
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            if (isinstance(node.func, ast.Name) and
-                node.func.id == 'set_this_agent_data_from_tensor'):
-                if len(node.args) >= 2:
-                    tensor_arg = node.args[1]
-                    if isinstance(tensor_arg, ast.Name):
-                        tensor_name = tensor_arg.id
-                        if tensor_name in param_to_prop:
-                            write_property_indices.add(param_to_prop[tensor_name])
-        elif isinstance(node, ast.Assign):
-            # Check for all types of assignments to property parameters
-            for target in node.targets:
-                check_target_for_writes(target)
-        elif isinstance(node, ast.AugAssign):
-            # Check for augmented assignments (+=, -=, *=, etc.)
-            check_target_for_writes(node.target)
-
+    write_property_indices: Set[int] = set()
+    _collect_property_writes(step_func, param_to_prop, write_property_indices, set())
     return write_property_indices
 
 
@@ -388,6 +479,12 @@ class Model:
         self._min_capacity = min_capacity
         self._agent_factory = AgentFactory(space, verbose_timing=verbose_timing)
         self._is_setup = False
+        # Property interning: a property no kernel writes, not exchanged with ghosts, whose
+        # rows are mostly duplicates is held on the device as a table of distinct rows plus
+        # one code per agent (see setup()). Exact; set False to keep every property dense.
+        self.enable_property_interning = True
+        self._interned_property_indices = set()
+        self._intern_cache = {}
         # Globals — each registered global is a separate named tensor
         self._global_tensors = []     # list of numpy arrays, registration order
         self._global_names = {}       # name → index in _global_tensors
@@ -577,9 +674,12 @@ class Model:
                     f"property_columns may not include the built-in '{name}'")
             if name not in af._property_name_2_agent_data_tensor:
                 raise ValueError(f"unknown property '{name}' (register its breed first)")
-            if len(property_columns[name]) != n_local:
+            col = property_columns[name]
+            if isinstance(col, tuple) and len(col) == 2 and isinstance(col[0], np.ndarray):
+                col = col[0]
+            if len(col) != n_local:
                 raise ValueError(
-                    f"property column '{name}' length {len(property_columns[name])} "
+                    f"property column '{name}' length {len(col)} "
                     f"!= n_local {n_local}")
 
         # 1. Space: hand it the prebuilt CSR instead of per-agent containers.
@@ -602,12 +702,25 @@ class Model:
         # neighbors live in the prebuilt CSR, not per-agent lists.
         for prop_name in af._property_name_2_agent_data_tensor:
             if prop_name == "breed":
-                af._property_name_2_agent_data_tensor[prop_name] = breed_list
+                af._property_name_2_agent_data_tensor[prop_name] = (
+                    ArrayColumn(np.asarray(breed_indices, dtype=np.int32))
+                    if isinstance(breed_indices, np.ndarray) else breed_list)
             elif prop_name == "locations":
                 af._property_name_2_agent_data_tensor[prop_name] = []
             elif prop_name in property_columns:
-                af._property_name_2_agent_data_tensor[prop_name] = list(
-                    property_columns[prop_name])
+                col = property_columns[prop_name]
+                # A numpy array (optionally `(values, lengths)`) is kept as a padded
+                # ArrayColumn: the first tick then uploads it in one copy instead of
+                # walking one Python row per agent. Lists behave as before.
+                if isinstance(col, (ArrayColumn, IndexedColumn)):
+                    af._property_name_2_agent_data_tensor[prop_name] = col
+                elif isinstance(col, np.ndarray):
+                    af._property_name_2_agent_data_tensor[prop_name] = ArrayColumn(col)
+                elif (isinstance(col, tuple) and len(col) == 2
+                      and isinstance(col[0], np.ndarray)):
+                    af._property_name_2_agent_data_tensor[prop_name] = ArrayColumn(col[0], col[1])
+                else:
+                    af._property_name_2_agent_data_tensor[prop_name] = list(col)
             else:
                 default = af._property_name_2_defaults[prop_name]
                 af._property_name_2_agent_data_tensor[prop_name] = [
@@ -624,13 +737,18 @@ class Model:
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
         if self._is_setup and hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
             # Fast path: read single agent directly from GPU.
-            # Ownership is resolved from LOCAL membership (id in this rank's GPU
-            # buffer), not from a global _agent2rank — the owner reads and shares
-            # via allgather, so this works under a local-only map.
+            # Ownership is resolved from this rank's OWNED-ONLY map, not from a
+            # global _agent2rank — the owner reads and shares via allgather, so
+            # this works under a local-only map. It must not be resolved from
+            # buf.agent_id_to_index: that map also holds ghost rows, and the
+            # allgather below returns the first claimant in rank order, so a rank
+            # claiming a borrowed id would answer for the true owner with a row
+            # that is one tick stale (neighbor-visible) or all zeros (not
+            # exchanged at all).
             buf = self._gpu_buffers
             prop_idx = self._agent_factory._property_name_2_index[property_name]
 
-            owned = id in buf.agent_id_to_index
+            owned = self._agent_factory._owns_locally(id)
             if owned:
                 buf_idx = buf.agent_id_to_index[id]
                 if prop_idx == 1:
@@ -639,7 +757,7 @@ class Model:
                     end = int(buf.neighbor_offsets[buf_idx + 1].get())
                     result = buf.neighbor_values_ids[start:end].get().tolist()
                 else:
-                    result = buf.property_tensors[prop_idx][buf_idx].get().tolist()
+                    result = buf.row_host(prop_idx, buf_idx)
             else:
                 result = None
 
@@ -688,13 +806,21 @@ class Model:
                 property_name=property_name, agent_id=id)
         buf = self._gpu_buffers
         prop_idx = self._agent_factory._property_name_2_index[property_name]
-        buf_idx = buf.agent_id_to_index[id]  # KeyError if id not local (intended)
+        # agent_id_to_index also holds ghost rows, so membership alone is not
+        # ownership: check the owned-only map first, or a borrowed row would be
+        # returned in place of the documented KeyError.
+        if not self._agent_factory._owns_locally(id):
+            raise KeyError(
+                f"agent {id} is not owned by rank {worker}; "
+                f"get_local_agent_property_value reads owned agents only"
+            )
+        buf_idx = buf.agent_id_to_index[id]
         if prop_idx == 1:
             # CSR/locations: read one agent's neighbor slice
             start = int(buf.neighbor_offsets[buf_idx].get())
             end = int(buf.neighbor_offsets[buf_idx + 1].get())
             return buf.neighbor_values_ids[start:end].get().tolist()
-        return buf.property_tensors[prop_idx][buf_idx].get().tolist()
+        return buf.row_host(prop_idx, buf_idx)
 
     def set_local_agent_property_value(self, id: int, property_name: str, value: Any) -> None:
         """Write a LOCALLY-OWNED agent's property — non-collective, no MPI.
@@ -732,12 +858,13 @@ class Model:
         # Return local data only if requested or if single-rank
         if local or comm.Get_size() == 1:
             if count > 0:
-                return buf.property_tensors[prop_idx][start:start + count].get()
+                return buf.rows(prop_idx, slice(start, start + count)).get()
             return np.empty((0,), dtype=np.float32)
 
         # Multi-rank gather to rank 0
         return self._gatherv_breed_gpu(
-            buf.property_tensors[prop_idx], start, count, comm)
+            buf.rows(prop_idx, slice(None)) if buf.is_interned(prop_idx)
+            else buf.property_tensors[prop_idx], start, count, comm)
 
     def get_breed_agent_ids(self, breed_name, local=False):
         """Download agent IDs for agents of a breed.
@@ -1007,6 +1134,14 @@ class Model:
                 # The write analysis runs on original source which has array+idx per BLA.
                 self._write_property_indices.update(write_indices)
 
+        # Properties any kernel writes, before the double-buffer exclusion: the
+        # interning decision below needs this (a shared table row must never be written).
+        self._kernel_written_property_indices = set(self._write_property_indices)
+        extra_cfg = self._get_extra_kernel_config() or {}
+        for name in extra_cfg.get('writes_properties', []):
+            self._kernel_written_property_indices.add(
+                self._agent_factory._property_name_2_index[name])
+
         # Exclude no_double_buffer properties from write buffer creation
         self._write_property_indices = self._write_property_indices - no_double_buffer_indices
 
@@ -1025,6 +1160,8 @@ class Model:
 
         # Sort write property indices for consistent ordering
         self._write_property_indices = sorted(self._write_property_indices)
+
+        self._decide_property_interning()
 
         t_analysis_end = time.time()
 
@@ -1078,6 +1215,7 @@ class Model:
                             for bla in self._breed_local_arrays
                             if bla['name'] in self._write_bla_names
                         } if self._write_bla_names else None,
+                        interned_property_indices=self._interned_property_indices,
                     )
                 )
         comm.barrier()
@@ -1204,6 +1342,72 @@ class Model:
         """Override to download/process extra GPU data after kernel execution."""
         pass
 
+    def _decide_property_interning(self):
+        """Choose which properties the kernel reads through a table of distinct rows.
+
+        Eligible: index >= 2, written by no kernel (helper-aware analysis plus the
+        subclass's declared injected writes), not neighbor-visible (ghost exchange
+        scatters rows), width > 1, and mostly duplicate rows -- an IndexedColumn, a list
+        column whose rows are shared objects (identity groups), or a dense ArrayColumn that
+        `try_intern` can compress. The form is fixed here because the generated kernel
+        takes `table, codes` parameters for these properties; later rebuilds keep the
+        form even if the table grows."""
+        self._interned_property_indices = set()
+        self._intern_cache = {}
+        if not self.enable_property_interning:
+            return
+        af = self._agent_factory
+        idx_to_name = {v: k for k, v in af._property_name_2_index.items()}
+        for prop_idx in range(af.num_properties):
+            if prop_idx in (0, 1) or prop_idx in self._kernel_written_property_indices:
+                continue
+            name = idx_to_name[prop_idx]
+            if af._property_name_2_neighbor_visible.get(name, True):
+                continue
+            col = af._property_name_2_agent_data_tensor[name]
+            if isinstance(col, IndexedColumn):
+                if col.width > 1:
+                    self._interned_property_indices.add(prop_idx)
+            elif isinstance(col, ArrayColumn):
+                interned = col.try_intern(_DEDUP_MIN_RATIO)
+                if interned is not None:
+                    af._property_name_2_agent_data_tensor[name] = interned
+                    self._interned_property_indices.add(prop_idx)
+            elif isinstance(col, list) and col and isinstance(col[0], (list, tuple)) and len(col[0]) > 1:
+                groups = _identity_groups(col)
+                if groups is not None:
+                    self._intern_cache[prop_idx] = (id(col), groups)
+                    self._interned_property_indices.add(prop_idx)
+        # Every rank runs the same generated kernel, so the decision must agree: a
+        # property is interned only if every rank found it internable.
+        if num_workers > 1:
+            agreed = set.intersection(*[set(x) for x in comm.allgather(sorted(self._interned_property_indices))])
+            self._interned_property_indices = agreed
+
+    def _intern_column(self, prop_idx, column, capacity):
+        """(table_gpu, codes_gpu) for an interned property from whatever the column is."""
+        if isinstance(column, IndexedColumn):
+            return column.to_device_pair(capacity)
+        if isinstance(column, ArrayColumn):
+            interned = column.try_intern(_DEDUP_MIN_RATIO)
+            if interned is None:                       # rows diverged: table == all rows
+                interned = IndexedColumn(np.asarray(column), np.arange(len(column), dtype=np.int32),
+                                         column.lengths[: len(column)])
+            return interned.to_device_pair(capacity)
+        # list column: shared row objects -> distinct rows + inverse
+        cached = self._intern_cache.get(prop_idx)
+        groups = cached[1] if cached is not None and cached[0] == id(column) else _identity_groups(column)
+        if groups is None:
+            rows, inverse = list(column), np.arange(len(column))
+        else:
+            rows, inverse = groups
+        table = convert_to_padded_gpu_tensor(rows, len(rows))
+        if table.ndim == 1:
+            table = table.reshape(-1, 1)
+        codes = cp.zeros(capacity, dtype=cp.int32)
+        codes[: len(column)] = cp.asarray(np.asarray(inverse, dtype=np.int32).ravel())
+        return table, codes
+
     def _sync_gpu_to_agent_factory(self):
         """Download all GPU properties back to AgentFactory storage."""
         buf = self._gpu_buffers
@@ -1213,10 +1417,13 @@ class Model:
         for prop_idx in range(self._agent_factory.num_properties):
             if prop_idx in (0, 1):  # breed (never changes), CSR/locations (skip)
                 continue
-            if buf.property_tensors[prop_idx] is None:
-                continue
+            if buf.property_tensors[prop_idx] is None or buf.is_interned(prop_idx):
+                continue                 # interned: read-only on device, host column authoritative
             prop_name = idx_to_name[prop_idx]
-            gpu_data = buf.property_tensors[prop_idx][:num_local].get().tolist()
+            # The device tensor is already the padded rectangle; keep it as one array
+            # (rows read back padded, exactly as the former .tolist() rows did) rather
+            # than materialising one Python list per agent.
+            gpu_data = ArrayColumn(buf.property_tensors[prop_idx][:num_local].get())
             self._agent_factory._property_name_2_agent_data_tensor[prop_name] = gpu_data
 
     def _regenerate_data_tensors(self):
@@ -1362,13 +1569,24 @@ class Model:
             sub_timing['breed_ranges'] = time.time() - _t0
             _t0 = time.time()
 
-        # 1. Build agent ID list and CPU hash map
-        all_agent_ids_np = np.concatenate([self.__rank_local_agent_ids, ghost_ids])
-        agent_id_to_index = {int(aid): idx for idx, aid in enumerate(all_agent_ids_np)}
+        # 1. Agent id list and the id -> buffer-row map. Local rows come first in
+        # the order of this rank's ownership map, so with no ghosts that map IS the
+        # id -> row dict and is reused as-is (no second 12.5 M-entry dict); ghosts are
+        # appended after the local rows.
+        rank = (comm if comm is not None else MPI.COMM_WORLD).Get_rank()
+        local_map = self._agent_factory._rank2agentid2agentidx.get(rank, {})
+        if num_ghost == 0:
+            all_agent_ids_np = self.__rank_local_agent_ids
+            agent_id_to_index = local_map
+        else:
+            all_agent_ids_np = np.concatenate([self.__rank_local_agent_ids, ghost_ids])
+            agent_id_to_index = dict(local_map)
+            base = len(self.__rank_local_agent_ids)
+            agent_id_to_index.update(
+                (int(aid), base + i) for i, aid in enumerate(ghost_ids.tolist()))
         buf.all_agent_ids_list = all_agent_ids_np
         buf.agent_id_to_index = agent_id_to_index
         buf.num_total_agents = len(all_agent_ids_np)
-        buf.prev_ghost_ids_set = set(ghost_ids)
 
         if do_time:
             sub_timing['id_cpu_dict'] = time.time() - _t0
@@ -1378,19 +1596,21 @@ class Model:
         agent_capacity = max(buf.MIN_CAPACITY,
                              int(buf.num_total_agents * buf.AGENT_SLACK_FACTOR))
 
-        # 3. Upload agent IDs to GPU with slack (pad on CPU, single memcpy)
-        agent_ids_padded = np.full(agent_capacity, -1, dtype=np.float32)
-        agent_ids_padded[:buf.num_total_agents] = all_agent_ids_np.astype(np.float32)
-        buf.agent_ids_gpu = cp.array(agent_ids_padded)
+        # 3. Agent ids on the device, padded with -1 to capacity; the pad and the
+        # int -> float32 conversion happen on the device (no host-side padded copies).
+        buf.agent_ids_gpu = cp.full(agent_capacity, -1, dtype=cp.float32)
+        buf.agent_ids_gpu[:buf.num_total_agents] = cp.asarray(all_agent_ids_np)
 
-        # 3b. Build logical_ids for stable RNG (defaults to agent_ids if not set)
-        logical_ids_padded = agent_ids_padded.copy()
+        # 3b. logical_ids for stable RNG (defaults to agent_ids if not set)
         if self._logical_id_map:
+            logical_ids_padded = buf.agent_ids_gpu.get()
             for aid, lid in self._logical_id_map.items():
                 idx = agent_id_to_index.get(int(aid))
                 if idx is not None:
                     logical_ids_padded[idx] = float(lid)
-        buf.logical_ids_gpu = cp.array(logical_ids_padded)
+            buf.logical_ids_gpu = cp.asarray(logical_ids_padded)
+        else:
+            buf.logical_ids_gpu = buf.agent_ids_gpu.copy()
 
         if do_time:
             sub_timing['id_gpu_upload'] = time.time() - _t1
@@ -1403,16 +1623,6 @@ class Model:
 
         if do_time:
             sub_timing['id_global_data'] = time.time() - _t1
-            _t1 = time.time()
-
-        # 5. Build GPU hash map (reuse all_agent_ids_np instead of converting again)
-        buffer_indices_np = np.arange(len(all_agent_ids_np), dtype=np.int32)
-        hash_capacity = max(buf.MIN_CAPACITY, len(all_agent_ids_np) * 2)
-        buf.hash_map = GPUHashMap(hash_capacity)
-        buf.hash_map.build_from_arrays(all_agent_ids_np, buffer_indices_np)
-
-        if do_time:
-            sub_timing['id_gpu_hashmap'] = time.time() - _t1
             sub_timing['id_hashmap'] = time.time() - _t0
             _t0 = time.time()
 
@@ -1438,7 +1648,8 @@ class Model:
                 ])
                 values_ids_np = np.asarray(prebuilt_values, dtype=np.int64)
                 values_np = convert_agent_ids_to_indices(
-                    [values_ids_np], agent_id_to_index, return_arrays=True)[0]
+                    [values_ids_np], agent_id_to_index, return_arrays=True,
+                    id_keys=all_agent_ids_np)[0]
                 buf.allocate_csr(offsets_np, values_np, values_ids_np, buf.num_total_agents)
                 combined_lists.append(None)
                 continue
@@ -1457,7 +1668,14 @@ class Model:
                     )
                 ghost_data = [placeholder] * num_ghost
 
-            combined = local_data + ghost_data
+            # With no ghosts on a single rank the local column is used as-is:
+            # `local + []` would copy a list of N row references per property for
+            # nothing. (Multi-rank keeps the copy: the width sync below rewrites
+            # rows of `combined` and must not touch the AgentFactory's column.)
+            if num_ghost == 0 and (comm is None or comm.Get_size() == 1):
+                combined = local_data
+            else:
+                combined = local_data + ghost_data
 
             if i == 1:
                 # Build dual CSR: values with agent IDs (for MPI) and local indices (for kernel)
@@ -1482,7 +1700,9 @@ class Model:
                     local_widths[i] = 0  # CSR, skip
                     continue
                 data = combined_lists[i]
-                if data and isinstance(data[0], (list, tuple, np.ndarray)):
+                if isinstance(data, (ArrayColumn, IndexedColumn)) and not data.degraded:
+                    local_widths[i] = data.width
+                elif data and isinstance(data[0], (list, tuple, np.ndarray)):
                     local_widths[i] = max(
                         len(row) if isinstance(row, (list, tuple, np.ndarray)) else 1
                         for row in data
@@ -1494,6 +1714,9 @@ class Model:
                 if i == 1 or global_widths[i] <= 1:
                     continue
                 gw = int(global_widths[i])
+                if isinstance(combined_lists[i], (ArrayColumn, IndexedColumn)) and not combined_lists[i].degraded:
+                    combined_lists[i].pad_width(gw, fill=0.0)
+                    continue
                 for j in range(len(combined_lists[i])):
                     row = combined_lists[i][j]
                     if isinstance(row, (list, tuple)):
@@ -1513,6 +1736,8 @@ class Model:
             combined_lists,
             agent_capacity,
             convert_to_padded_gpu_tensor,
+            interned=self._interned_property_indices,
+            intern_func=self._intern_column,
         )
         buf.agent_capacity = agent_capacity
 
@@ -1594,19 +1819,6 @@ class Model:
         buf.is_initialized = True
 
         return sub_timing if do_time else None
-
-    def _download_local_data_to_cpu(self, num_local_agents):
-        """Download only modified local agent data from GPU to CPU.
-
-        Only downloads properties that the kernel could have written to.
-        Unwritten properties retain their CPU-side values (unchanged by kernel).
-        Property 1 (CSR/locations) is read-only — skip unless topology changed.
-        """
-        buf = self._gpu_buffers
-
-        for prop_idx in buf.sorted_write_indices:
-            self.__rank_local_agent_data_tensors[prop_idx] = \
-                buf.property_tensors[prop_idx][:num_local_agents].get().tolist()
 
     def save(self, app: "Model", fpath: str) -> None:
         """
@@ -1704,6 +1916,8 @@ class Model:
                 rank_local_agents_neighbors,
                 self._agent_factory._agent2rank,
                 worker,
+                num_workers=num_workers,
+                local_ids=self.__rank_local_agent_ids,
             )
             t_after_context = time.time()
 
@@ -1726,7 +1940,9 @@ class Model:
             t_comm_init_start = time.time()
             if num_workers > 1:
                 self._comm_manager = CommunicationManager(
-                    buf, self._agent_factory, worker, num_workers, comm, verbose_timing=self._verbose_timing
+                    buf, self._agent_factory, worker, num_workers, comm,
+                    verbose_timing=self._verbose_timing,
+                    local_ids=self.__rank_local_agent_ids,
                 )
                 self._comm_manager.build_communication_maps()
                 mpi_timing = self._comm_manager.exchange_ghost_data()
@@ -1770,7 +1986,7 @@ class Model:
                     all_args.append(buf.neighbor_offsets)
                     all_args.append(buf.neighbor_values)
                 else:
-                    all_args.append(buf.property_tensors[i])
+                    all_args.extend(buf.kernel_args_for(i))   # dense: [tensor]; interned: [table, codes]
             all_args = all_args + buf.write_buffers
             self._cached_all_args = all_args
         all_args = self._cached_all_args
@@ -2123,7 +2339,7 @@ class _CSRBodyTransformer(ast.NodeTransformer):
         return node
 
 
-def _find_forwarded_location_funcs(step_func, num_properties):
+def _find_forwarded_location_funcs(step_func, num_properties, n_globals=1):
     """Find device functions called from step_func that receive the locations parameter.
 
     When a step function forwards 'locations' to a helper function (e.g., a dispatcher
@@ -2146,10 +2362,11 @@ def _find_forwarded_location_funcs(step_func, num_properties):
         return []
 
     param_names = [arg.arg for arg in func_def.args.args]
-    if len(param_names) < 6:
+    loc_idx = 2 + n_globals + 1 + 1          # tick, agent_index, globals..., agent_ids, breeds, LOCATIONS
+    if len(param_names) <= loc_idx:
         return []
 
-    locations_param = param_names[5]  # Property 1
+    locations_param = param_names[loc_idx]  # Property 1
 
     # Find all calls that pass locations as a bare argument
     called_funcs = set()
@@ -2230,11 +2447,119 @@ def _auto_transform_csr(source: str, num_properties: int, n_globals: int = 1) ->
     return ast.unparse(tree)
 
 
-def _inject_seed(source: str) -> str:
+class _TableBodyTransformer(ast.NodeTransformer):
+    """Rewrite reads of an interned property parameter `p`:
+    `p[e]` -> `p_table[p_codes[e]]`, and a bare `p` passed to a call -> `p_table, p_codes`."""
+
+    def __init__(self, param_name):
+        self.p = param_name
+        self.p_table = f"{param_name}_table"
+        self.p_codes = f"{param_name}_codes"
+
+    def visit_Subscript(self, node):
+        if isinstance(node.value, ast.Name) and node.value.id == self.p:
+            inner = ast.Subscript(value=ast.Name(id=self.p_codes, ctx=ast.Load()),
+                                  slice=self.visit(node.slice), ctx=ast.Load())
+            return ast.copy_location(
+                ast.Subscript(value=ast.Name(id=self.p_table, ctx=ast.Load()),
+                              slice=inner, ctx=node.ctx), node)
+        return self.generic_visit(node)
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        new_args = []
+        for arg in node.args:
+            if isinstance(arg, ast.Name) and arg.id == self.p:
+                new_args.append(ast.Name(id=self.p_table, ctx=ast.Load()))
+                new_args.append(ast.Name(id=self.p_codes, ctx=ast.Load()))
+            else:
+                new_args.append(arg)
+        node.args = new_args
+        return node
+
+
+def _auto_transform_tables(source: str, interned_param_names) -> str:
+    """Apply the table/codes rewrite to a function for each parameter name in
+    `interned_param_names` (names are stable across the CSR transform, so this runs
+    after it and before _inject_seed)."""
+    if not interned_param_names:
+        return source
+    tree = ast.parse(source)
+    func_def = next((n for n in ast.walk(tree)
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+    if func_def is None:
+        return source
+    for name in interned_param_names:
+        for i, arg in enumerate(func_def.args.args):
+            if arg.arg == name:
+                func_def.args.args[i] = ast.arg(arg=f"{name}_table")
+                func_def.args.args.insert(i + 1, ast.arg(arg=f"{name}_codes"))
+                break
+        else:
+            continue
+        tree = _TableBodyTransformer(name).visit(tree)
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree)
+
+
+def _collect_forwarded_property_helpers(func, name_to_prop, out, visited):
+    """Recursively find device helpers that `func` passes property parameters of
+    interest to (bare-name positional or keyword arguments), recording for each helper
+    the mapping {its parameter name: property index}. Same call-matching rules as the
+    write analysis (framework-injected `_seed`/`logical_ids` arguments are ignored when
+    the callee does not declare them)."""
+    func_def, _ = _function_def_of(func)
+    if func_def is None:
+        return
+    for node in ast.walk(func_def):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        if node.func.id == 'set_this_agent_data_from_tensor':
+            continue
+        if not any(isinstance(a, ast.Name) and a.id in name_to_prop for a in node.args) and \
+           not any(isinstance(k.value, ast.Name) and k.value.id in name_to_prop for k in node.keywords):
+            continue
+        callee = _resolve_callee(func, node.func.id)
+        if callee is None:
+            continue
+        _, callee_params = _function_def_of(callee)
+        if callee_params is None:
+            continue
+        positional = [a for a in node.args
+                      if not (isinstance(a, ast.Name) and a.id in _INJECTED_PARAMS
+                              and a.id not in callee_params)]
+        forwarded = {}
+        for pos, arg in enumerate(positional):
+            if isinstance(arg, ast.Name) and arg.id in name_to_prop and pos < len(callee_params):
+                forwarded[callee_params[pos]] = name_to_prop[arg.id]
+        for kw in node.keywords:
+            if isinstance(kw.value, ast.Name) and kw.value.id in name_to_prop and kw.arg:
+                forwarded[kw.arg] = name_to_prop[kw.value.id]
+        if not forwarded:
+            continue
+        name = getattr(callee, "__name__", node.func.id)
+        prev = out.get(name)
+        if prev is not None and prev[1] != forwarded:
+            raise RuntimeError(
+                f"helper '{name}' receives interned property tensors at different parameters "
+                f"from different call sites ({prev[1]} vs {forwarded}); disable interning "
+                f"(Model.enable_property_interning = False) or make the call sites consistent.")
+        out[name] = (callee, forwarded)
+        key = (id(callee), tuple(sorted(forwarded.items())))
+        if key not in visited:
+            visited.add(key)
+            _collect_forwarded_property_helpers(callee, forwarded, out, visited)
+
+
+def _inject_seed(source: str, transformed_callees=()) -> str:
     """Inject _seed param and prepend _seed to rand_* calls in a function source.
 
     Also replaces `agent_index` with `agent_ids[agent_index]` in rand_* calls
     so the PRNG keys on the global agent ID (rank-agnostic determinism).
+
+    `transformed_callees` names device helpers whose definitions receive the same
+    treatment; calls to them are given the `_seed` / `logical_ids` arguments at the
+    matching positions unless the call already passes them (generated dispatchers do).
     """
     tree = ast.parse(source)
     func_def = None
@@ -2244,6 +2569,17 @@ def _inject_seed(source: str) -> str:
             break
     if func_def is None:
         return source
+    transformed_callees = set(transformed_callees)
+    for node in ast.walk(func_def):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in transformed_callees):
+            names = [a.id if isinstance(a, ast.Name) else None for a in node.args]
+            if '_seed' not in names and len(node.args) >= 2:
+                node.args.insert(2, ast.Name(id='_seed', ctx=ast.Load()))
+                names.insert(2, '_seed')
+            if 'logical_ids' not in names:
+                pos = names.index('agent_ids') + 1 if 'agent_ids' in names else min(4, len(node.args))
+                node.args.insert(pos, ast.Name(id='logical_ids', ctx=ast.Load()))
     # Insert _seed param at position 2 (after tick, agent_index) — skip if already present
     existing_params = {arg.arg for arg in func_def.args.args}
     if '_seed' not in existing_params:
@@ -2350,6 +2686,7 @@ def generate_gpu_func(
     breed_local_names: list = None,
     write_bla_names: set = None,
     write_bla_shapes: dict = None,
+    interned_property_indices: Set[int] = None,
 ) -> str:
     """
     Generate GPU function string with double buffering support for race condition prevention.
@@ -2412,6 +2749,12 @@ def generate_gpu_func(
 
     """
     
+    interned = set(interned_property_indices or ())
+    helper_names_by_step = {}
+
+    def helper_names_of(step_func):
+        return helper_names_by_step.get(getattr(step_func, "__name__", ""), set())
+
     def generate_modified_step_func_code(step_func: Callable, write_indices: Set[int], num_properties: int,
                                          write_bla_names_set: set = None) -> str:
         """Generate modified step function code with CSR transformation and write buffer parameters.
@@ -2426,8 +2769,18 @@ def generate_gpu_func(
         # and transforms body access patterns (loops, indexing, sentinel checks)
         source = _auto_transform_csr(source, num_properties, n_globals)
 
-        # Phase 1b: Add _seed param and inject into rand_* calls
-        source = _inject_seed(source)
+        # Phase 1a: interned properties -> `<p>_table, <p>_codes` (reads become
+        # `p_table[p_codes[i]]`). Names are stable across the CSR pass.
+        if interned:
+            orig_params = list(inspect.signature(step_func).parameters.keys())
+            n_bla_orig = len(breed_local_names or []) * 2
+            orig_prop_params = (orig_params[:-n_bla_orig] if n_bla_orig else orig_params)[-num_properties:]
+            source = _auto_transform_tables(
+                source, [orig_prop_params[i] for i in sorted(interned) if i < len(orig_prop_params)])
+
+        # Phase 1b: Add _seed param and inject into rand_* calls; calls to helpers that
+        # are themselves transformed (below) get the injected arguments too.
+        source = _inject_seed(source, transformed_callees=helper_names_of(step_func))
 
         # Phase 2: Double buffering
         # Parse the CSR-transformed source
@@ -2450,8 +2803,9 @@ def generate_gpu_func(
             param_names_for_prop = param_names[:-n_bla]
         else:
             param_names_for_prop = param_names
-        param_to_prop = _build_param_to_property_index_csr(param_names_for_prop, num_properties)
-        n_prop_params = num_properties + 1
+        param_to_prop = _build_param_to_property_index_transformed(
+            param_names_for_prop, num_properties, interned)
+        n_prop_params = num_properties + 1 + len(interned)
         property_params = param_names_for_prop[-n_prop_params:]
 
         # Create mapping from property parameter names to write parameter names
@@ -2570,6 +2924,9 @@ def generate_gpu_func(
         if i == 1:
             read_args.append("neighbor_offsets")
             read_args.append("neighbor_values")
+        elif i in interned:
+            read_args.append(f"a{i}_table")
+            read_args.append(f"a{i}_codes")
         else:
             read_args.append(f"a{i}")
 
@@ -2595,6 +2952,19 @@ def generate_gpu_func(
             step_func_name = getattr(breed_step_func_impl, "__name__", repr(callable))
             modified_step_func_name = f"{step_func_name}_double_buffer"
 
+            # Helpers that receive the forwarded locations parameter (dispatcher pattern)
+            # and helpers that receive interned property tensors (found recursively).
+            csr_helpers = dict(_find_forwarded_location_funcs(breed_step_func_impl, n_properties, n_globals))
+            table_helpers = {}
+            if interned:
+                orig_params = list(inspect.signature(breed_step_func_impl).parameters.keys())
+                n_bla_orig = len(breed_local_names or []) * 2
+                orig_prop_params = (orig_params[:-n_bla_orig] if n_bla_orig else orig_params)[-n_properties:]
+                name_to_prop = {orig_prop_params[i]: i for i in sorted(interned) if i < len(orig_prop_params)}
+                _collect_forwarded_property_helpers(breed_step_func_impl, name_to_prop, table_helpers, set())
+            helper_names = set(csr_helpers) | set(table_helpers) | transformed_helpers
+            helper_names_by_step[step_func_name] = helper_names
+
             # Generate modified step function
             modified_step_func_code = generate_modified_step_func_code(
                 breed_step_func_impl, write_property_indices, n_properties,
@@ -2605,16 +2975,19 @@ def generate_gpu_func(
             )
             modified_step_functions.append(modified_step_func_code)
 
-            # Transform helper functions that receive forwarded locations parameter
-            # (e.g., dispatcher pattern where step func calls other device functions)
-            forwarded_funcs = _find_forwarded_location_funcs(breed_step_func_impl, n_properties)
-            for helper_name, helper_obj in forwarded_funcs:
-                if helper_name not in transformed_helpers:
-                    helper_source = inspect.getsource(helper_obj)
-                    transformed_helper = _auto_transform_csr(helper_source, n_properties, n_globals)
-                    transformed_helper = _inject_seed(transformed_helper)
-                    modified_step_functions.append(transformed_helper)
-                    transformed_helpers.add(helper_name)
+            for helper_name in list(csr_helpers) + [h for h in table_helpers if h not in csr_helpers]:
+                if helper_name in transformed_helpers:
+                    continue
+                helper_obj = csr_helpers.get(helper_name) or table_helpers[helper_name][0]
+                helper_source = inspect.getsource(helper_obj)
+                if helper_name in csr_helpers:
+                    helper_source = _auto_transform_csr(helper_source, n_properties, n_globals)
+                if helper_name in table_helpers:
+                    helper_source = _auto_transform_tables(
+                        helper_source, list(table_helpers[helper_name][1].keys()))
+                helper_source = _inject_seed(helper_source, transformed_callees=helper_names)
+                modified_step_functions.append(helper_source)
+                transformed_helpers.add(helper_name)
 
             module_fpath = Path(module_fpath).absolute()
             module_name = module_fpath.stem

@@ -35,28 +35,38 @@ def is_gpu_aware_mpi():
     return False
 
 
-def _resolve_neighbor_ranks(neighbor_ids, agent2rank):
+def _resolve_neighbor_ranks(neighbor_ids, agent2rank, local_ids=None, my_rank=-1):
     """Resolve the owner rank of each id in ``neighbor_ids`` (boundary-scoped).
 
     Returns an int32 array the same length as ``neighbor_ids``; entries whose id is
-    not in ``agent2rank`` are -1. Work and memory are O(distinct neighbor ids), NOT
-    O(max agent id) — only the ids that actually appear get looked up. This is what
-    keeps per-rank tick-1 cost proportional to the partition boundary instead of the
-    global agent population (see plan: boundary-scoped ghost lookup).
+    not in ``agent2rank`` are -1. Only the distinct neighbor ids are resolved, and
+    when ``local_ids`` (this rank's own agent ids) is given, ids found there are
+    assigned ``my_rank`` with a vectorised membership test, so the Python dict
+    lookup runs only over ids owned elsewhere -- the partition boundary. Without
+    ``local_ids`` every distinct id goes through the dict, which for a network whose
+    agents are each other's neighbours (synapses of a soma) is the whole population.
     """
     ranks = np.full(len(neighbor_ids), -1, dtype=np.int32)
     if len(neighbor_ids) == 0:
         return ranks
-    # Only the distinct neighbor ids need resolving — bounded by the boundary size.
     uniq = np.unique(neighbor_ids)
-    uniq_ranks = np.fromiter((agent2rank.get(int(a), -1) for a in uniq),
-                             dtype=np.int32, count=len(uniq))
+    uniq_ranks = np.full(len(uniq), -1, dtype=np.int32)
+    remote = np.arange(len(uniq))
+    if local_ids is not None and len(local_ids) > 0:
+        is_local = np.isin(uniq, np.asarray(local_ids, dtype=np.int64), assume_unique=True)
+        uniq_ranks[is_local] = my_rank
+        remote = np.flatnonzero(~is_local)
+    if len(remote) > 0:
+        uniq_ranks[remote] = np.fromiter(
+            (agent2rank.get(int(a), -1) for a in uniq[remote]),
+            dtype=np.int32, count=len(remote))
     # Map each neighbor id back to its rank via the sorted unique ids (vectorized).
     pos = np.searchsorted(uniq, neighbor_ids)
     return uniq_ranks[pos]
 
 
-def discover_ghost_topology(all_neighbors, agent2rank, my_rank):
+def discover_ghost_topology(all_neighbors, agent2rank, my_rank, num_workers=None,
+                            local_ids=None):
     """Discover ghost agent IDs from local neighbor lists (CPU-only, no MPI).
 
     Vectorized scan of neighbor arrays to identify agents belonging to other
@@ -66,14 +76,18 @@ def discover_ghost_topology(all_neighbors, agent2rank, my_rank):
     :param all_neighbors: Ragged list of neighbor arrays (one per local agent)
     :param agent2rank: Dict mapping agent_id -> rank
     :param my_rank: This rank's ID
+    :param num_workers: Number of ranks; with one rank there can be no ghosts and
+        the scan is skipped entirely.
+    :param local_ids: This rank's own agent ids (int64 array); lets the rank of
+        locally owned neighbours be settled without a per-id dict lookup.
     :return: Sorted list of unique ghost agent IDs
     """
-    if not all_neighbors:
+    if num_workers == 1 or not all_neighbors:
         return np.array([], dtype=np.int64)
 
     # Flatten ragged neighbor lists into one array
     if isinstance(all_neighbors[0], np.ndarray):
-        flat = np.concatenate(all_neighbors)
+        flat = all_neighbors[0] if len(all_neighbors) == 1 else np.concatenate(all_neighbors)
     else:
         flat = np.array(
             [nid for sublist in all_neighbors for nid in sublist],
@@ -84,14 +98,17 @@ def discover_ghost_topology(all_neighbors, agent2rank, my_rank):
         return np.array([], dtype=np.int64)
 
     # Filter invalid entries (NaN padding, negative sentinels)
-    valid_mask = ~np.isnan(flat) & (flat >= 0)
+    if flat.dtype.kind == 'f':
+        valid_mask = ~np.isnan(flat) & (flat >= 0)
+    else:
+        valid_mask = flat >= 0
     neighbor_ids = flat[valid_mask].astype(np.int64)
 
     if len(neighbor_ids) == 0:
         return np.array([], dtype=np.int64)
 
-    # Resolve owner rank per neighbor (boundary-scoped: O(distinct neighbor ids)).
-    neighbor_ranks = _resolve_neighbor_ranks(neighbor_ids, agent2rank)
+    # Resolve owner rank per neighbor (boundary-scoped: O(distinct remote ids)).
+    neighbor_ranks = _resolve_neighbor_ranks(neighbor_ids, agent2rank, local_ids, my_rank)
 
     # Keep only cross-rank neighbors
     cross_mask = (neighbor_ranks != my_rank) & (neighbor_ranks >= 0)
@@ -272,6 +289,36 @@ class GPUHashMap:
         self._cpu_values = None
 
 
+class TableProperty:
+    """Device form of an interned property: `table` (k, w) float32 rows and `codes`
+    (capacity,) int32; row i is `table[codes[i]]`. Kernels receive the two arrays and
+    the codegen rewrites their reads; host code goes through GPUBufferManager.row/rows."""
+
+    def __init__(self, table, codes):
+        self.table = table
+        self.codes = codes
+
+    @property
+    def shape(self):
+        return (int(self.codes.shape[0]), int(self.table.shape[1]))
+
+    @property
+    def ndim(self):
+        return 2
+
+    @property
+    def dtype(self):
+        return self.table.dtype
+
+    @property
+    def nbytes(self):
+        return int(self.table.nbytes + self.codes.nbytes)
+
+    def rows(self, sel):
+        """Dense rows for an index/slice/array selection (a device gather)."""
+        return cp.take(self.table, self.codes[sel], axis=0)
+
+
 class GPUBufferManager:
     """Manages persistent GPU buffers for GPU-resident data.
 
@@ -317,36 +364,67 @@ class GPUBufferManager:
         self.breed_ranges = {}     # breed_id -> (start, count)
 
     def allocate_property_tensors(self, num_properties, combined_lists, agent_capacity,
-                                  convert_to_padded_func):
+                                  convert_to_padded_func, interned=None, intern_func=None):
         """Allocate property tensor GPU arrays with slack capacity.
 
         :param num_properties: Number of agent properties
         :param combined_lists: List of combined (local+ghost) property data
         :param agent_capacity: Pre-allocated capacity (>= num_total_agents)
         :param convert_to_padded_func: Function to convert ragged lists directly to padded GPU tensors
+        :param interned: property indices stored as TableProperty (table + codes)
+        :param intern_func: (prop_idx, column, capacity) -> (table_gpu, codes_gpu) for those
         """
         self.agent_capacity = agent_capacity
         self.property_tensors = []
         self.property_alloc_stats = []
+        interned = set(interned or ())
 
         for i in range(num_properties):
             if i == 1:
                 # Property 1 uses CSR, not a rectangular tensor
                 self.property_tensors.append(None)
+                continue
+            _t0 = time.perf_counter()
+            if i in interned:
+                table, codes = intern_func(i, combined_lists[i], agent_capacity)
+                padded = TableProperty(table, codes)
+                path = "table_codes"
             else:
-                _t0 = time.perf_counter()
                 padded = convert_to_padded_func(combined_lists[i], agent_capacity)
-                _elapsed = time.perf_counter() - _t0
-                self.property_tensors.append(padded)
-                # Per-property cost and footprint. The aggregate 'prop_tensors'
-                # timer hides which column is expensive and how wide padding made it.
-                self.property_alloc_stats.append({
-                    "prop_idx": i,
-                    "shape": tuple(int(d) for d in padded.shape),
-                    "nbytes": int(padded.nbytes),
-                    "seconds": _elapsed,
-                    "path": getattr(internal_utils, "LAST_CONVERSION_PATH", None),
-                })
+                path = getattr(internal_utils, "LAST_CONVERSION_PATH", None)
+            _elapsed = time.perf_counter() - _t0
+            self.property_tensors.append(padded)
+            # Per-property cost and footprint. The aggregate 'prop_tensors'
+            # timer hides which column is expensive and how wide padding made it.
+            self.property_alloc_stats.append({
+                "prop_idx": i,
+                "shape": tuple(int(d) for d in padded.shape),
+                "nbytes": int(padded.nbytes),
+                "seconds": _elapsed,
+                "path": path,
+            })
+
+    # -- representation-agnostic host access to property rows --------------------
+
+    def is_interned(self, prop_idx):
+        return isinstance(self.property_tensors[prop_idx], TableProperty)
+
+    def rows(self, prop_idx, sel):
+        """Dense device rows of property `prop_idx` for an index/slice/array selection."""
+        t = self.property_tensors[prop_idx]
+        return t.rows(sel) if isinstance(t, TableProperty) else t[sel]
+
+    def row_host(self, prop_idx, buf_idx):
+        """One agent's row as a Python list (the read-back the getters return)."""
+        t = self.property_tensors[prop_idx]
+        if isinstance(t, TableProperty):
+            return t.table[int(t.codes[buf_idx])].get().tolist()
+        return t[buf_idx].get().tolist()
+
+    def kernel_args_for(self, prop_idx):
+        """The launch argument(s) a property contributes, in signature order."""
+        t = self.property_tensors[prop_idx]
+        return [t.table, t.codes] if isinstance(t, TableProperty) else [t]
 
     def allocate_write_buffers(self, sorted_write_indices):
         """Create write buffers as copies of property tensors."""
@@ -367,21 +445,18 @@ class GPUBufferManager:
         total_edges = len(values_np)
         self.csr_values_capacity = max(self.MIN_CAPACITY, int(total_edges * self.CSR_SLACK_FACTOR))
 
-        # Offsets: size is num_agents + 1, pre-allocate with slack
+        # Allocate the padded arrays on the device and copy the data in; padding
+        # (zeros for offsets, -1 for values) is written by the device, so no padded
+        # host copies of the ~edges-sized arrays are made.
         offsets_capacity = max(self.MIN_CAPACITY, int(num_total_agents * self.AGENT_SLACK_FACTOR)) + 1
-        padded_offsets = np.zeros(offsets_capacity, dtype=np.int32)
-        padded_offsets[:len(offsets_np)] = offsets_np
-        self.neighbor_offsets = cp.array(padded_offsets)
+        self.neighbor_offsets = cp.zeros(offsets_capacity, dtype=cp.int32)
+        self.neighbor_offsets[:len(offsets_np)] = cp.asarray(np.asarray(offsets_np, dtype=np.int32))
 
-        # Values (local indices): pre-allocate with slack
-        padded_values = np.full(self.csr_values_capacity, -1, dtype=np.int32)
-        padded_values[:total_edges] = values_np
-        self.neighbor_values = cp.array(padded_values)
+        self.neighbor_values = cp.full(self.csr_values_capacity, -1, dtype=cp.int32)
+        self.neighbor_values[:total_edges] = cp.asarray(np.asarray(values_np, dtype=np.int32))
 
-        # Values (agent IDs): pre-allocate with slack
-        padded_values_ids = np.full(self.csr_values_capacity, -1, dtype=np.int64)
-        padded_values_ids[:total_edges] = values_ids_np
-        self.neighbor_values_ids = cp.array(padded_values_ids)
+        self.neighbor_values_ids = cp.full(self.csr_values_capacity, -1, dtype=cp.int64)
+        self.neighbor_values_ids[:total_edges] = cp.asarray(np.asarray(values_ids_np, dtype=np.int64))
 
     def ensure_agent_capacity(self, needed):
         """Grow property tensors if needed > current capacity. Uses 2x doubling."""
@@ -391,6 +466,11 @@ class GPUBufferManager:
         new_capacity = max(needed, self.agent_capacity * 2)
         for i, tensor in enumerate(self.property_tensors):
             if tensor is None:
+                continue
+            if isinstance(tensor, TableProperty):
+                new_codes = cp.zeros(new_capacity, dtype=cp.int32)
+                new_codes[:self.agent_capacity] = tensor.codes
+                self.property_tensors[i] = TableProperty(tensor.table, new_codes)
                 continue
             if tensor.ndim == 1:
                 new_tensor = cp.zeros(new_capacity, dtype=tensor.dtype)
@@ -492,13 +572,15 @@ class CommunicationManager:
     One contiguous message per peer rank, no pickle.
     """
 
-    def __init__(self, buf, agent_factory, my_rank, num_workers, comm, verbose_timing=False):
+    def __init__(self, buf, agent_factory, my_rank, num_workers, comm, verbose_timing=False,
+                 local_ids=None):
         self.buf = buf
         self.agent_factory = agent_factory
         self.my_rank = my_rank
         self.num_workers = num_workers
         self.comm = comm
         self._verbose_timing = verbose_timing
+        self._local_ids = local_ids          # this rank's agent ids, for the boundary-scoped rank lookup
 
         # Per-dest-rank: CuPy int32 arrays of local buffer indices to pack
         self.send_indices_gpu = {}
@@ -617,7 +699,7 @@ class CommunicationManager:
         if has_cross_rank_work:
             # Resolve owner rank per neighbor (boundary-scoped: O(distinct neighbor ids)).
             neighbor_ranks = _resolve_neighbor_ranks(
-                neighbor_ids, self.agent_factory._agent2rank)
+                neighbor_ids, self.agent_factory._agent2rank, self._local_ids, self.my_rank)
 
             # Filter to cross-rank neighbors
             cross_mask = (neighbor_ranks != self.my_rank) & (neighbor_ranks >= 0)

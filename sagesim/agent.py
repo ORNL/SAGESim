@@ -10,10 +10,8 @@ import numpy as np
 from mpi4py import MPI
 
 from sagesim.breed import Breed
-from sagesim.internal_utils import (
-    compress_tensor,
-)
 from sagesim.space import Space
+from sagesim.columns import ArrayColumn, IndexedColumn
 
 
 comm = MPI.COMM_WORLD
@@ -327,8 +325,14 @@ class AgentFactory:
         # separately-stored CSR untouched — a silent miswiring. The order is
         # already what this method would produce, so verify (cheap) and skip.
         if self._agents_prebreed_sorted:
-            ordered = [breed_data[old_mapping[aid]] for aid in agent_ids]
-            if any(ordered[i] > ordered[i + 1] for i in range(n - 1)):
+            if isinstance(breed_data, ArrayColumn) and not breed_data.degraded:
+                # rows are in ownership-map order: one vectorised monotonicity check
+                arr = np.asarray(breed_data)
+                unsorted = bool(np.any(np.diff(arr) < 0))
+            else:
+                ordered = [breed_data[old_mapping[aid]] for aid in agent_ids]
+                unsorted = any(ordered[i] > ordered[i + 1] for i in range(n - 1))
+            if unsorted:
                 raise RuntimeError(
                     "build_from_local_columns set _agents_prebreed_sorted but the "
                     "local agents are not in non-decreasing breed order; the "
@@ -346,6 +350,9 @@ class AgentFactory:
         # Reorder all property data lists
         for prop_name in self._property_name_2_agent_data_tensor:
             old_list = self._property_name_2_agent_data_tensor[prop_name]
+            if isinstance(old_list, (ArrayColumn, IndexedColumn)):
+                old_list.permute(sort_perm)          # in place, keeps the object
+                continue
             self._property_name_2_agent_data_tensor[prop_name] = [
                 old_list[sort_perm[i]] for i in range(n)
             ]
@@ -384,13 +391,9 @@ class AgentFactory:
             subcontextidx = self._rank2agentid2agentidx.get(worker).get(agent_id)
             property_idx = self._property_name_2_index[property_name]
             adt = regularized_agent_data_tensors[property_idx]
-            value = (
-                compress_tensor(adt[subcontextidx], min_axis=0)
-                if type(adt[subcontextidx]) == Iterable
-                else adt[subcontextidx]
-            )
-
+            # (An old `compress_tensor` branch guarded by `type(x) == Iterable` lived
+            # here; that test is never true, so the value was always passed through.)
             self._property_name_2_agent_data_tensor[property_name][
                 subcontextidx
-            ] = value
+            ] = adt[subcontextidx]
 

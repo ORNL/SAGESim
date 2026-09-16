@@ -261,6 +261,18 @@ def convert_to_padded_gpu_tensor(ragged_list, capacity):
     """Convert ragged list directly to padded GPU tensor (single allocation)."""
     global LAST_CONVERSION_PATH
     LAST_CONVERSION_PATH = None
+    # A column already held as a padded array (bulk load or GPU->host sync) is one
+    # allocation plus one copy; nothing below applies to it.
+    from sagesim.columns import ArrayColumn, IndexedColumn
+    if isinstance(ragged_list, ArrayColumn) and not ragged_list.degraded:
+        LAST_CONVERSION_PATH = "array_column"
+        _warn_if_huge_padded(capacity, int(np.prod(ragged_list.values.shape[1:])) or 1)
+        return ragged_list.to_device(capacity)
+    if isinstance(ragged_list, IndexedColumn):
+        # not interned for this property (e.g. a kernel writes it): expand table[codes]
+        LAST_CONVERSION_PATH = "indexed_dense"
+        _warn_if_huge_padded(capacity, ragged_list.width)
+        return ragged_list.to_device(capacity)
     if not ragged_list:
         LAST_CONVERSION_PATH = "empty"
         return cp.zeros(capacity, dtype=np.float32)

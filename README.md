@@ -189,10 +189,19 @@ pip install ".[test]"
 
 pytest                 # full suite
 pytest -m benchmark    # timing benchmarks, deselected by default
+
+tests/run_mpi_tests.sh        # multi-rank, ranks 1 2 3 4
+tests/run_mpi_tests.sh 2 4    # only those rank counts
 ```
 
 Every test executes GPU kernels, so the suite skips itself entirely when no device is visible
 rather than failing.
+
+`pytest` runs single-rank only. The `mpi`-marked files run there too, but self-skip their
+multi-rank cases, so a green `pytest` says nothing about correctness above one rank — run
+`tests/run_mpi_tests.sh` before tagging a release. It needs only one GPU (ranks share it via
+`--oversubscribe`) and sweeps rank counts, because the partition changes with the rank count and
+some failures appear at only one of them.
 
 ## Documentation
 

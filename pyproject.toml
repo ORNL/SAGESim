@@ -43,6 +43,7 @@ testpaths = ["tests"]
 norecursedirs = ["build", "scaling_tests", "docs", "examples"]
 markers = [
     "benchmark: timing benchmark, deselected by default (run with `-m benchmark`)",
+    "mpi: exercises more than one rank. NOT deselected: these files also run under a single rank and self-skip their multi-rank cases. Sweep rank counts with tests/run_mpi_tests.sh",
 ]
 addopts = "-m 'not benchmark'"
 
