@@ -1408,8 +1408,14 @@ class Model:
         codes[: len(column)] = cp.asarray(np.asarray(inverse, dtype=np.int32).ravel())
         return table, codes
 
-    def _sync_gpu_to_agent_factory(self):
-        """Download all GPU properties back to AgentFactory storage."""
+    def _sync_gpu_to_agent_factory(self, only=None):
+        """Download GPU properties back to AgentFactory storage.
+
+        :param only: Property names to download, or None for all of them. A caller that
+            is going to restore a column from its own source -- initial conditions, a
+            checkpoint, a generator -- pays a full device->host copy per column for data
+            it is about to overwrite, which at large agent counts dominates reset().
+        """
         buf = self._gpu_buffers
         num_local = buf.num_local_agents
         idx_to_name = {v: k for k, v in self._agent_factory._property_name_2_index.items()}
@@ -1420,6 +1426,8 @@ class Model:
             if buf.property_tensors[prop_idx] is None or buf.is_interned(prop_idx):
                 continue                 # interned: read-only on device, host column authoritative
             prop_name = idx_to_name[prop_idx]
+            if only is not None and prop_name not in only:
+                continue
             # The device tensor is already the padded rectangle; keep it as one array
             # (rows read back padded, exactly as the former .tolist() rows did) rather
             # than materialising one Python list per agent.
@@ -1432,13 +1440,27 @@ class Model:
             self._agent_factory._generate_agent_data_tensors()
         )
 
-    def reset(self) -> None:
+    def reset(self, sync_properties=None) -> None:
+        """Return the model to tick 0 and release the device buffers.
+
+        :param sync_properties: Which property columns to read back from the device
+            before the buffers are freed. None (the default) reads back every written
+            property, as before. A collection of names reads back only those; an empty
+            collection skips the readback entirely.
+
+            The readback exists so a caller can see what the kernel produced. A caller
+            that restores a column from its own source pays a device->host copy per
+            column for data it immediately overwrites -- and since nothing but this
+            readback writes the host columns, they still hold whatever the last build
+            produced, which for a reset-to-initial-state is already the answer.
+        """
         self.tick = 0
         self._globals_dirty = True  # re-upload on next _build_gpu_buffers
 
         # Sync GPU state back to AgentFactory before freeing
-        if hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
-            self._sync_gpu_to_agent_factory()
+        if (sync_properties is None or len(sync_properties)) and \
+                hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
+            self._sync_gpu_to_agent_factory(only=sync_properties)
 
         self._regenerate_data_tensors()
 
