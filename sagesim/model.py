@@ -15,6 +15,7 @@ import importlib
 import pickle
 import math
 import heapq
+import hashlib
 import warnings
 import time
 
@@ -30,6 +31,7 @@ from sagesim.space import Space
 from sagesim.internal_utils import convert_to_equal_side_tensor, build_csr_from_ragged, build_csr_values_only, convert_to_padded_gpu_tensor
 from sagesim.gpu_kernels import GPUBufferManager, GPUHashMap, CommunicationManager, is_gpu_aware_mpi, discover_ghost_topology
 from sagesim.columns import ArrayColumn, IndexedColumn
+from sagesim._generated_module import write_step_module
 from sagesim.internal_utils import _identity_groups, _DEDUP_MIN_RATIO
 
 
@@ -1190,35 +1192,29 @@ class Model:
                 property_ndims[prop_idx] = 0  # scalar
 
         t_codegen_start = time.time()
-        if worker == 0:
-            # Delete stale bytecode cache before writing new source — prevents
-            # a previous process's .pyc from being loaded instead of the fresh .py
-            _pyc = importlib.util.cache_from_source(self._step_function_file_path)
-            if os.path.exists(_pyc):
-                os.remove(_pyc)
-            with open(self._step_function_file_path, "w", encoding="utf-8") as f:
-                f.write(
-                    generate_gpu_func(
-                        len(self._global_tensors),
-                        self._agent_factory.num_properties,
-                        self._breed_idx_2_step_func_by_priority,
-                        self._write_property_indices,
-                        property_ndims,
-                        extra_kernel_config=self._get_extra_kernel_config(),
-                        skip_priority_barriers=self._skip_priority_barriers,
-                        priority_values=self._priority_values,
-                        global_scalar_flags=[t.size == 1 for t in self._global_tensors],
-                        breed_local_names=[bla['name'] for bla in self._breed_local_arrays],
-                        write_bla_names=self._write_bla_names,
-                        write_bla_shapes={
-                            bla['name']: bla['shape_per_agent']
-                            for bla in self._breed_local_arrays
-                            if bla['name'] in self._write_bla_names
-                        } if self._write_bla_names else None,
-                        interned_property_indices=self._interned_property_indices,
-                    )
-                )
-        comm.barrier()
+        self._generated_step_function_file_path = write_step_module(
+            lambda: generate_gpu_func(
+                len(self._global_tensors),
+                self._agent_factory.num_properties,
+                self._breed_idx_2_step_func_by_priority,
+                self._write_property_indices,
+                property_ndims,
+                extra_kernel_config=self._get_extra_kernel_config(),
+                skip_priority_barriers=self._skip_priority_barriers,
+                priority_values=self._priority_values,
+                global_scalar_flags=[t.size == 1 for t in self._global_tensors],
+                breed_local_names=[bla['name'] for bla in self._breed_local_arrays],
+                write_bla_names=self._write_bla_names,
+                write_bla_shapes={
+                    bla['name']: bla['shape_per_agent']
+                    for bla in self._breed_local_arrays
+                    if bla['name'] in self._write_bla_names
+                } if self._write_bla_names else None,
+                interned_property_indices=self._interned_property_indices,
+            ),
+            self._step_function_file_path,
+            comm,
+        )
         t_codegen_end = time.time()
 
         # Import and cache the step function once during setup
@@ -1238,13 +1234,15 @@ class Model:
             warnings.filterwarnings("ignore", category=DeprecationWarning)
             warnings.filterwarnings("ignore", category=FutureWarning)
             warnings.filterwarnings("ignore", message=".*numba.*", category=Warning)
-            abs_path = self._step_function_file_path  # Already absolute from __init__
-            module_name = os.path.splitext(os.path.basename(abs_path))[0]
+            abs_path = self._generated_step_function_file_path
             # Reuse existing module if source unchanged — avoids CuPy JIT
             # recompilation which can produce non-deterministic CUDA binaries
             # (NVRTC compiles by function object identity, not source content).
-            with open(abs_path, 'r') as f:
-                source_hash = hash(f.read())
+            with open(abs_path, 'rb') as f:
+                source_hash = hashlib.sha256(f.read()).hexdigest()
+            # Preserve JIT reuse independently of the unique source filename.
+            namespace = hashlib.sha256(str(Path(abs_path).parent).encode()).hexdigest()
+            module_name = f"_sagesim_step_{namespace}_{source_hash}"
             existing = sys.modules.get(module_name)
             if existing is not None and getattr(existing, '_source_hash', None) == source_hash:
                 step_func_module = existing

@@ -99,7 +99,7 @@ def test_no_hook_generates_no_pre_tick_code():
     m._prepare_kernel_extras = lambda n, s: ()
     m.create_agent()
     m.setup()
-    src = Path("step_func_code_pretick.py").read_text()
+    src = Path(m._generated_step_function_file_path).read_text()
     body = src.split("thread_local_tick = int(global_tick) + tick", 1)[1]
     first_stmt = next(l for l in body.splitlines() if l.strip())
     assert first_stmt.strip() == "agent_index = thread_id", first_stmt

@@ -132,7 +132,7 @@ def test_interned_kernel_matches_dense_and_reference(how):
     assert interned.get_agent_property_value(4, "params") == TABLE[1].tolist()
     assert interned.get_breed_data("Param", "params")[:3].tolist() == TABLE.tolist()
     # the generated kernel really takes table + codes for params
-    src = Path(f"step_func_code_intern_i_{how}.py").read_text()
+    src = Path(interned._generated_step_function_file_path).read_text()
     assert "a2_table" in src and "a2_codes" in src and "params_table[params_codes[" in src
 
 

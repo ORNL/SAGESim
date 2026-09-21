@@ -134,6 +134,14 @@ if __name__ == "__main__":
 Agents must exist before `setup()` — it inspects the registered agent data to determine each
 property's shape.
 
+Each `setup()` creates a unique `step_func_code_*.py` source file using `tempfile`
+in MPI rank zero's current working directory. All ranks must share access to that
+directory; rank zero broadcasts the completed file's path before import. A custom
+`step_function_file_path` supplies the filename stem only, including for models
+loaded from older pickles. The actual path is available as
+`model._generated_step_function_file_path`. Source files remain on disk for CuPy's
+lazy compilation and can be removed after the simulation processes have exited.
+
 ### 4. Read the Results
 
 Continuing inside the same `__main__` block:
