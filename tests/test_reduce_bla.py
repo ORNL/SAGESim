@@ -113,13 +113,14 @@ class InboxModel(Model):
         self.register_breed_local_array(
             "inbox", self.receivers if n_receiver_breeds > 1 else self.receivers[0], **kwargs)
 
-    def build(self, weights_per_receiver, bystanders=0):
+    def build(self, weights_per_receiver, bystanders=0, cross_rank=False):
         """weights_per_receiver: list (one per receiver) of lists of sender weights.
 
-        Senders are created on their receiver's rank: a deposit only reaches a LOCAL
-        row (a ghost target is dropped until the reduce-back exchange exists), so a
-        model that pushes must place depositors with their targets, as SuperNeuroABM's
-        post-owns placement does. Receivers themselves are round-robin.
+        Senders are created on their receiver's rank (cross_rank=False): a deposit into
+        a LOCAL row needs no exchange. With cross_rank=True every sender lives on the
+        next rank, so each deposit lands in a ghost row and reaches the receiver only
+        through the reduce-back-to-owner exchange (neighbor_visible=True). Receivers
+        themselves are round-robin.
         """
         receiver_ids = []
         for r, weights in enumerate(weights_per_receiver):
@@ -127,8 +128,9 @@ class InboxModel(Model):
             rid = self.create_agent_of_breed(breed, total=0.0)
             receiver_ids.append(rid)
             home = self._agent_factory._agent2rank[rid]
+            where = (home + 1) % _size() if cross_rank else home
             for w in weights:
-                sid = self.create_agent_of_breed(self.sender, rank=home, weight=float(w))
+                sid = self.create_agent_of_breed(self.sender, rank=where, weight=float(w))
                 self.get_space().connect_agents(sid, rid, directed=True)
         self.bystander_ids = [self.create_agent_of_breed(self.bystander, total=0.0)
                               for _ in range(bystanders)]
@@ -140,12 +142,16 @@ def _totals(model, receiver_ids):
     return np.array([model.get_agent_property_value(r, "total") for r in receiver_ids])
 
 
-def _single_rank():
+def _size():
     try:
         from mpi4py import MPI
-        return MPI.COMM_WORLD.Get_size() == 1
+        return MPI.COMM_WORLD.Get_size()
     except ImportError:
-        return True
+        return 1
+
+
+def _single_rank():
+    return _size() == 1
 
 
 class TestReduceInbox:
@@ -218,11 +224,61 @@ class TestReduceInbox:
         np.testing.assert_allclose(_totals(m, rids), [2 * n])
 
 
+class TestCrossRankDeposits:
+    """Depositors on another rank than their receiver: the deposits land in a ghost row
+    and the reduce-back-to-owner exchange sums them into the owner's row. At one rank
+    the "next rank" is the same rank, so these degrade to the local cases."""
+
+    def test_remote_senders_reach_owner(self):
+        weights = [[1.0, 2.0, 3.5], [10.0], [0.25] * 40]
+        m = InboxModel(neighbor_visible=True)
+        rids = m.build(weights, cross_rank=True)
+        m.setup()
+        T = 7
+        m.simulate(ticks=T)
+        np.testing.assert_allclose(_totals(m, rids), (T - 1) * np.array([sum(w) for w in weights]),
+                                   rtol=1e-6)
+
+    def test_local_and_remote_senders_add_up(self):
+        """Half the senders beside the receiver, half on the next rank: one total."""
+        m = InboxModel(neighbor_visible=True)
+        rid = m.create_agent_of_breed(m.receivers[0], total=0.0)
+        home = m._agent_factory._agent2rank[rid]
+        for w, where in ((1.0, home), (2.0, (home + 1) % _size()), (4.0, home), (8.0, (home + 1) % _size())):
+            sid = m.create_agent_of_breed(m.sender, rank=where, weight=w)
+            m.get_space().connect_agents(sid, rid, directed=True)
+        m.setup()
+        m.simulate(ticks=5)
+        np.testing.assert_allclose(_totals(m, [rid]), [4 * 15.0])
+
+    def test_two_receiver_breeds_visible(self):
+        """A multi-breed array may be neighbor_visible; ghosts of either breed get rows."""
+        weights = [[1.0, 2.0], [5.0], [0.5, 0.5, 0.5], [3.0]]
+        m = InboxModel(n_receiver_breeds=2, neighbor_visible=True)
+        rids = m.build(weights, cross_rank=True)
+        m.setup()
+        m.simulate(ticks=5)
+        np.testing.assert_allclose(_totals(m, rids), 4 * np.array([3.0, 5.0, 1.5, 3.0]))
+
+    def test_chunked_launches_match(self):
+        weights = [[1.0, 2.0], [4.0, 0.5, 0.5]]
+        m1 = InboxModel(neighbor_visible=True); r1 = m1.build(weights, cross_rank=True); m1.setup()
+        m2 = InboxModel(neighbor_visible=True); r2 = m2.build(weights, cross_rank=True); m2.setup()
+        m1.simulate(ticks=6)
+        for _ in range(6):
+            m2.simulate(ticks=1)
+        np.testing.assert_allclose(_totals(m1, r1), _totals(m2, r2))
+        np.testing.assert_allclose(_totals(m1, r1), 5 * np.array([3.0, 5.0]))
+
+
 class TestReduceValidation:
 
-    def test_neighbor_visible_rejected(self):
-        with pytest.raises(NotImplementedError):
-            InboxModel(neighbor_visible=True)
+    def test_neighbor_visible_accepted(self):
+        m = InboxModel(neighbor_visible=True)
+        rids = m.build([[1.0, 2.0]])
+        m.setup()
+        m.simulate(ticks=3)
+        np.testing.assert_allclose(_totals(m, rids), [2 * 3.0])
 
     def test_bad_reduce_op(self):
         with pytest.raises(ValueError):

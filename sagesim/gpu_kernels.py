@@ -678,7 +678,11 @@ class CommunicationManager:
         # collective Alltoall / Isend / Irecv calls below.
         has_cross_rank_work = True
 
-        if self.total_stride == 0 or num_local == 0:
+        # A neighbor-visible breed-local array is exchanged like a visible property, so
+        # a model with only such an array (no visible property) still has ghost work.
+        _has_visible_bla = any(info is not None
+                               for info in getattr(buf, 'breed_local_ghost_info', []))
+        if (self.total_stride == 0 and not _has_visible_bla) or num_local == 0:
             has_cross_rank_work = False
 
         # ---- Identify which remote agents this rank needs ----
@@ -841,7 +845,10 @@ class CommunicationManager:
         self._bla_extra_send_size = {}
         self._bla_extra_recv_size = {}
 
-        if bla_ghost_infos and has_cross_rank_work:
+        # Built whenever this rank takes part in any exchange: it may hold no ghost
+        # itself (has_cross_rank_work False) and still be asked for its agents by
+        # another rank (send side of a plain array, receive side of a reduce array).
+        if bla_ghost_infos and (self.send_indices_gpu or self.recv_indices_gpu):
             # Buffer_index → breed_id lookup (CPU)
             buf_breeds = np.array(
                 [agent2breed.get(int(aid), -1)
@@ -853,7 +860,8 @@ class CommunicationManager:
                     self._bla_configs.append(None)
                     continue
 
-                breed_id = info['breed_id']
+                breed_ids = np.array(list(info.get('breed_ids') or [info['breed_id']]),
+                                     dtype=np.int32)
                 stride = 1
                 for s in info['shape_per_agent']:
                     stride *= s
@@ -867,7 +875,7 @@ class CommunicationManager:
 
                 for dest_rank in self.send_indices_gpu:
                     cpu_indices = self.send_indices_gpu[dest_rank].get().astype(np.int32)
-                    mask = buf_breeds[cpu_indices] == breed_id
+                    mask = np.isin(buf_breeds[cpu_indices], breed_ids)
                     filtered = cpu_indices[mask]
                     bla_rows = bla_idx_map[filtered]
                     bla_send_counts[dest_rank] = len(bla_rows)
@@ -875,19 +883,26 @@ class CommunicationManager:
 
                 for src_rank in self.recv_indices_gpu:
                     cpu_indices = self.recv_indices_gpu[src_rank].get().astype(np.int32)
-                    mask = buf_breeds[cpu_indices] == breed_id
+                    mask = np.isin(buf_breeds[cpu_indices], breed_ids)
                     filtered = cpu_indices[mask]
                     bla_rows = bla_idx_map[filtered]
                     bla_recv_counts[src_rank] = len(bla_rows)
                     bla_recv_rows_per_peer[src_rank] = bla_rows
 
                 self._bla_configs.append({
+                    'bla_i': bla_i,
                     'stride': stride,
+                    'shape_per_agent': tuple(info['shape_per_agent']),
+                    'reduce': bool(info.get('reduce')),
                     'send_counts': bla_send_counts,
                     'recv_counts': bla_recv_counts,
                     'bla_send_rows_per_peer': bla_send_rows_per_peer,
                     'bla_recv_rows_per_peer': bla_recv_rows_per_peer,
                 })
+                if info.get('reduce'):
+                    # exchanged the other way round (ghost rows summed back into the
+                    # owner's row, see _reverse_exchange): not part of the forward buffers
+                    continue
 
                 for r in self.send_counts:
                     self._bla_extra_send_size[r] = (
@@ -967,6 +982,8 @@ class CommunicationManager:
             for bla_i, cfg in enumerate(self._bla_configs):
                 if cfg is None:
                     continue
+                cfg['batched_send_rows_per_peer'] = dict(cfg['bla_send_rows_per_peer'])
+                cfg['batched_recv_rows_per_peer'] = dict(cfg['bla_recv_rows_per_peer'])
                 # Batched send rows
                 send_parts = [cfg['bla_send_rows_per_peer'].get(r, np.array([], dtype=np.int32))
                               for r in self._send_peer_order]
@@ -1003,7 +1020,118 @@ class CommunicationManager:
                 del cfg['bla_send_rows_per_peer']
                 del cfg['bla_recv_rows_per_peer']
 
+        self._build_reverse_maps()
         self._is_initialized = True
+
+    # ---- Reduce-back-to-owner exchange for reduce breed-local arrays ----
+    #
+    # A reduce array's ghost rows receive deposits from local agents (atomic adds into
+    # the write buffer, drained into the read buffer by the in-kernel write-back) but
+    # nobody reads them here: their owner does. So, in the opposite direction of the
+    # ordinary exchange, every rank sends the ghost rows it holds to the owner rank
+    # (the forward "need_from" relation, reused), and the owner adds what arrives into
+    # its own rows before its agents read them. The peer lists are the forward ones
+    # with the roles swapped: I send to the ranks I receive ghosts from, I receive from
+    # the ranks that hold ghosts of my agents.
+
+    def _build_reverse_maps(self):
+        self._rev_cfgs = [cfg for cfg in self._bla_configs if cfg is not None and cfg['reduce']]
+        self._rev_send_peers = list(self._recv_peer_order)
+        self._rev_recv_peers = list(self._send_peer_order)
+        self._rev_send_size = {r: 0 for r in self._rev_send_peers}
+        self._rev_recv_size = {r: 0 for r in self._rev_recv_peers}
+        for cfg in self._rev_cfgs:
+            stride = cfg['stride']
+            # ghost rows, grouped by owner peer in _rev_send_peers order
+            parts = [cfg['batched_recv_rows_per_peer'].get(r, np.array([], dtype=np.int32))
+                     for r in self._rev_send_peers]
+            cfg['rev_send_rows'] = cp.array(np.concatenate(parts) if parts else np.array([], dtype=np.int32),
+                                            dtype=cp.int32)
+            cfg['rev_send_counts'] = {r: int(cfg['recv_counts'].get(r, 0)) for r in self._rev_send_peers}
+            # my own rows that each ghost-holding peer deposits into
+            cfg['rev_recv_rows'] = {r: cp.array(cfg['batched_send_rows_per_peer'].get(r, np.array([], dtype=np.int32)),
+                                                dtype=cp.int32)
+                                    for r in self._rev_recv_peers}
+            cfg['rev_recv_counts'] = {r: int(cfg['send_counts'].get(r, 0)) for r in self._rev_recv_peers}
+            for r in self._rev_send_peers:
+                self._rev_send_size[r] += cfg['rev_send_counts'][r] * stride
+            for r in self._rev_recv_peers:
+                self._rev_recv_size[r] += cfg['rev_recv_counts'][r] * stride
+            del cfg['batched_recv_rows_per_peer'], cfg['batched_send_rows_per_peer']
+        self._rev_send_bufs_gpu, self._rev_send_bufs_cpu = {}, {}
+        self._rev_recv_bufs_gpu, self._rev_recv_bufs_cpu = {}, {}
+        for r, size in self._rev_send_size.items():
+            if size:
+                self._rev_send_bufs_gpu[r] = cp.empty(size, dtype=cp.float32)
+                if not self._gpu_aware_mpi:
+                    self._rev_send_bufs_cpu[r] = np.empty(size, dtype=np.float32)
+        for r, size in self._rev_recv_size.items():
+            if size:
+                if self._gpu_aware_mpi:
+                    self._rev_recv_bufs_gpu[r] = cp.empty(size, dtype=cp.float32)
+                else:
+                    self._rev_recv_bufs_cpu[r] = np.empty(size, dtype=np.float32)
+        self._rev_initialized = bool(self._rev_send_bufs_gpu or self._rev_recv_bufs_gpu
+                                     or self._rev_recv_bufs_cpu)
+
+    def _reverse_exchange(self):
+        """Ghost rows of every reduce array -> their owner, added into the owner's row."""
+        if not getattr(self, '_rev_initialized', False):
+            return
+        buf = self.buf
+        # pack: one gather per array over all its ghost rows, split per owner peer
+        offsets = {r: 0 for r in self._rev_send_peers}
+        for cfg in self._rev_cfgs:
+            rows = cfg['rev_send_rows']
+            if len(rows) == 0:
+                continue
+            stride = cfg['stride']
+            gathered = buf.device_breed_locals[cfg['bla_i']][rows].ravel()
+            start = 0
+            for r in self._rev_send_peers:
+                m = cfg['rev_send_counts'][r]
+                if m == 0:
+                    continue
+                off = offsets[r]
+                self._rev_send_bufs_gpu[r][off:off + m * stride] = \
+                    gathered[start * stride:(start + m) * stride]
+                offsets[r] = off + m * stride
+                start += m
+        requests = []
+        if self._gpu_aware_mpi:
+            if self._rev_send_bufs_gpu:
+                cp.cuda.get_current_stream().synchronize()
+            for r, sbuf in self._rev_send_bufs_gpu.items():
+                requests.append(self.comm.Isend([sbuf, MPI.FLOAT], dest=r, tag=2))
+            for r, rbuf in self._rev_recv_bufs_gpu.items():
+                requests.append(self.comm.Irecv([rbuf, MPI.FLOAT], source=r, tag=2))
+        else:
+            for r, sbuf in self._rev_send_bufs_gpu.items():
+                self._rev_send_bufs_cpu[r][:] = sbuf.get()
+                requests.append(self.comm.Isend([self._rev_send_bufs_cpu[r], MPI.FLOAT], dest=r, tag=2))
+            for r, rbuf in self._rev_recv_bufs_cpu.items():
+                requests.append(self.comm.Irecv([rbuf, MPI.FLOAT], source=r, tag=2))
+        if requests:
+            MPI.Request.Waitall(requests)
+        # unpack: add each peer's deposits into my rows (rows are unique within a peer,
+        # peers are applied one after another, so the order is fixed and the sum exact
+        # up to float rounding in that order)
+        for r in self._rev_recv_peers:
+            if self._rev_recv_size.get(r, 0) == 0:
+                continue
+            data = (self._rev_recv_bufs_gpu[r] if self._gpu_aware_mpi
+                    else cp.asarray(self._rev_recv_bufs_cpu[r]))
+            off = 0
+            for cfg in self._rev_cfgs:
+                m = cfg['rev_recv_counts'][r]
+                if m == 0:
+                    continue
+                stride = cfg['stride']
+                chunk = data[off:off + m * stride].reshape(m, *cfg['shape_per_agent'])
+                arr = buf.device_breed_locals[cfg['bla_i']]
+                rows = cfg['rev_recv_rows'][r]
+                arr[rows] = arr[rows] + chunk
+                off += m * stride
 
     def _batched_gpu_pack(self):
         """Pack all peers' data with ONE gather per property, then split for MPI.
@@ -1039,7 +1167,7 @@ class CommunicationManager:
         # Pack breed-local array data (appended after property data)
         if self._bla_initialized:
             for bla_i, cfg in enumerate(self._bla_configs):
-                if cfg is None:
+                if cfg is None or cfg['reduce']:
                     continue
                 batched_rows = cfg['batched_send_rows']
                 if len(batched_rows) == 0:
@@ -1198,7 +1326,7 @@ class CommunicationManager:
                                 for r in self._recv_peer_order}
 
             for bla_i, cfg in enumerate(self._bla_configs):
-                if cfg is None:
+                if cfg is None or cfg['reduce']:
                     continue
                 batched_rows = cfg['batched_recv_rows']
                 if len(batched_rows) == 0:
@@ -1261,6 +1389,13 @@ class CommunicationManager:
         self._batched_gpu_unpack()
         if self._verbose_timing:
             timing_data['mpi_gpu_unpack'] = time.perf_counter() - t_unpack_start
+
+        # Reduce arrays go the other way: ghost rows' deposits back to their owner
+        if self._verbose_timing:
+            t_rev_start = time.perf_counter()
+        self._reverse_exchange()
+        if self._verbose_timing:
+            timing_data['mpi_reverse'] = time.perf_counter() - t_rev_start
 
             # Communication volume metrics (property + BLA data)
             timing_data['mpi_send_bytes'] = sum(

@@ -1092,7 +1092,11 @@ class Model:
             breed: The breed this array belongs to, or a list of breeds that share it
                 (rows are the local agents of all of them). Determines row count.
             shape_per_agent: Column shape per agent (e.g. (50, 2) for 3D, (100,) for 2D).
-            neighbor_visible: If True, ghost agents get rows and data is exchanged via MPI.
+            neighbor_visible: If True, ghost agents get rows and data is exchanged via MPI:
+                owner -> ghost copies for a plain array; for a reduce array the other
+                way round, ghost rows' deposits are summed back into the owner's row
+                (reduce-back-to-owner), so an agent may deposit into a neighbour that
+                lives on another rank and partitioning never changes the result.
             reduce: None, or "sum" to make the array a reduce inbox: a step function of
                 ANY breed that declares the array may add into another agent's row with
                 `deposit_to_agent(name, name_idx, target_agent_index, slot, value)`.
@@ -1101,7 +1105,10 @@ class Model:
                 reads the tick's total next tick and depositors never share a buffer
                 with readers. Always double-buffered. A pushed value must be the
                 sender's final value for the tick: a later priority that still changes
-                the state it was computed from is not reflected.
+                the state it was computed from is not reflected. Deposits into a ghost
+                row need neighbor_visible=True (otherwise the ghost has no row and the
+                deposit is dropped) and, as every ghost exchange, one launch per tick
+                (simulate(..., update_data_ticks=1)).
         """
         breeds = list(breed) if isinstance(breed, (list, tuple)) else [breed]
         # An empty breed list is allowed: a placeholder array nobody owns (every index
@@ -1109,17 +1116,9 @@ class Model:
         # test `idx_map[agent_index] >= 0` to know whether the array applies to them.
         if reduce not in (None, "sum"):
             raise ValueError(f"breed-local array '{name}': reduce must be None or 'sum', got {reduce!r}")
-        if reduce is not None:
-            if neighbor_visible:
-                raise NotImplementedError(
-                    f"breed-local array '{name}': a reduce array cannot be neighbor_visible yet; "
-                    "depositing into a ghost row needs a reduce-back-to-owner exchange")
-            if len(shape_per_agent) != 1:
-                raise NotImplementedError(
-                    f"breed-local array '{name}': reduce arrays take a 1-D shape_per_agent")
-        if len(breeds) > 1 and neighbor_visible:
+        if reduce is not None and len(shape_per_agent) != 1:
             raise NotImplementedError(
-                f"breed-local array '{name}': a multi-breed array cannot be neighbor_visible yet")
+                f"breed-local array '{name}': reduce arrays take a 1-D shape_per_agent")
         idx = len(self._breed_local_arrays)
         self._breed_local_arrays.append({
             'name': name,
@@ -2064,7 +2063,10 @@ class Model:
                 ghost_breed_ids = np.array(
                     [agent2breed.get(int(gid), -1) for gid in ghost_ids],
                     dtype=np.int32)
-                ghost_breed_mask = np.isin(ghost_breed_ids, breed_ids)
+                # A ghost of unknown breed (-1: a loader-built partition learns remote
+                # breeds only when the communication maps are built) gets a row too;
+                # the exchange maps filter by the true breed, so a spare row is unused.
+                ghost_breed_mask = np.isin(ghost_breed_ids, breed_ids) | (ghost_breed_ids < 0)
                 ghost_rows = int(ghost_breed_mask.sum())
 
             total_rows = max(count + ghost_rows, 1)
@@ -2090,9 +2092,12 @@ class Model:
             if bla['neighbor_visible']:
                 buf.breed_local_ghost_info.append({
                     'breed_id': breed_id,
+                    'breed_ids': breed_ids,
                     'local_rows': count,
                     'ghost_rows': ghost_rows,
                     'shape_per_agent': bla['shape_per_agent'],
+                    # reduce arrays are exchanged ghost -> owner (summed), not owner -> ghost
+                    'reduce': bool(bla.get('reduce')),
                 })
             else:
                 buf.breed_local_ghost_info.append(None)

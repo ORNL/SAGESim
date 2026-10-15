@@ -99,6 +99,29 @@ breed.register_property("health", default=100, neighbor_visible=True)           
 
 This reduces MPI bandwidth when agents have properties that neighbors never read.
 
+### Breed-local arrays and the two directions of ghost exchange
+
+A breed-local array (`model.register_breed_local_array(name, breed, shape_per_agent,
+neighbor_visible=..., reduce=...)`) is a per-agent GPU array outside the property
+tensors; a step function takes it by name together with its index map
+(`name, name_idx`). With `neighbor_visible=True` it is exchanged like a visible
+property, but the direction depends on its kind:
+
+| kind | who writes a row | exchange each tick |
+|---|---|---|
+| plain (`reduce=None`) | the owning agent | owner → ghost copies, like a property |
+| reduce inbox (`reduce="sum"`) | *other* agents, with `sagesim.utils.deposit_to_agent(name, name_idx, target_index, slot, value)` (an atomic add into the write buffer; the end-of-tick write-back copies it to the read buffer and clears it) | ghost → owner: the deposits that landed in a ghost row are sent to the owner rank and **added** into its row before its agent reads it (reduce-back-to-owner) |
+
+So an agent may deposit into a neighbour that lives on another rank, and the result
+does not depend on how the agents are partitioned. The reverse exchange reuses the
+forward request maps with the roles swapped (a rank sends its ghost rows to the ranks
+it requests ghosts from, and receives into the rows other ranks requested from it), so
+it adds one message per peer and no new topology discovery. Like every ghost exchange
+it needs one kernel launch per tick (`simulate(ticks, sync_workers_every_n_ticks=1)`).
+The add order is fixed (local total first, then peers in rank order), but the atomic
+adds inside a rank are not, so a reduce inbox is reproducible only up to float
+rounding order (see SuperNeuroABM's `docs/EVENT_DRIVEN_NOTES.md`, section 8).
+
 ---
 
 ## Phase 2: Data Preparation (CPU → GPU)
