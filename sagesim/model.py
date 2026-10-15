@@ -815,6 +815,7 @@ class Model:
         af._agents_prebreed_sorted = True
 
     def get_agent_property_value(self, id: int, property_name: str) -> Any:
+        self._flush_pending_reset()
         if self._is_setup and hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
             # Fast path: read single agent directly from GPU.
             # Ownership is resolved from this rank's OWNED-ONLY map, not from a
@@ -861,12 +862,29 @@ class Model:
         )
 
     def set_agent_property_value(self, id: int, property_name: str, value: Any) -> None:
+        self._ensure_host_current()
         self._agent_factory.set_agent_property_value(
             property_name=property_name, agent_id=id, value=value
         )
-        # GPU buffers are now stale — force rebuild on next tick
+        self._host_columns_changed()
+
+    def _ensure_host_current(self) -> None:
+        """Before a host write: if the device holds state the host has not seen (a
+        launch since the last build, reset or flush), download the written properties
+        so the write lands on current data. One device->host copy per run, paid at the
+        first host write after it; nothing if the two already agree."""
+        if (hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized
+                and getattr(self, '_device_dirty', False)):
+            self._sync_gpu_to_agent_factory()
+            self._regenerate_data_tensors()
+            self._device_dirty = False
+
+    def _host_columns_changed(self) -> None:
+        """A host column was written while device buffers exist: refresh them in place
+        from the host columns before the next launch or device read (the host is
+        authoritative now; _ensure_host_current made it current first)."""
         if hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
-            self._gpu_buffers.is_initialized = False
+            self._gpu_buffers.pending_reset = True
             self._cached_all_args = None
 
     def get_local_agent_property_value(self, id: int, property_name: str) -> Any:
@@ -907,12 +925,10 @@ class Model:
 
         Counterpart to get_local_agent_property_value. Caller must own ``id``.
         """
+        self._ensure_host_current()
         self._agent_factory.set_local_agent_property_value(
             property_name=property_name, agent_id=id, value=value)
-        # GPU buffers are now stale — force rebuild on next tick
-        if hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
-            self._gpu_buffers.is_initialized = False
-            self._cached_all_args = None
+        self._host_columns_changed()
 
     def get_space(self) -> Space:
         return self._agent_factory._space
@@ -1162,6 +1178,7 @@ class Model:
 
     def get_breed_local_array(self, name: str) -> np.ndarray:
         """Download a breed-local array from GPU to CPU."""
+        self._flush_pending_reset()
         idx = next(i for i, b in enumerate(self._breed_local_arrays) if b['name'] == name)
         return self._gpu_buffers.device_breed_locals[idx].get()
 
@@ -1677,24 +1694,33 @@ class Model:
             self._agent_factory._generate_agent_data_tensors()
         )
 
-    def reset(self, sync_properties=None) -> None:
-        """Return the model to tick 0 and release the device buffers.
+    def reset(self, sync_properties=None, release_buffers=True) -> None:
+        """Return the model to tick 0.
 
         :param sync_properties: Which property columns to read back from the device
-            before the buffers are freed. None (the default) reads back every written
-            property, as before. A collection of names reads back only those; an empty
-            collection skips the readback entirely.
+            first. None (the default) reads back every written property, as before. A
+            collection of names reads back only those; an empty collection skips the
+            readback entirely.
 
             The readback exists so a caller can see what the kernel produced. A caller
             that restores a column from its own source pays a device->host copy per
             column for data it immediately overwrites -- and since nothing but this
             readback writes the host columns, they still hold whatever the last build
             produced, which for a reset-to-initial-state is already the answer.
+        :param release_buffers: True (the default) frees the device buffers; the next
+            simulate() rebuilds them from the host columns (index map, CSR, interning,
+            uploads). False keeps them and marks them for an in-place refresh instead:
+            the host property columns are uploaded over the local rows, breed-local
+            arrays are zeroed and event wake state cleared, by _flush_pending_reset()
+            -- before the next launch, before the next device read, or when a subclass
+            that rewrites the host columns after this call asks for it. Same result,
+            none of the rebuild: a model that resets once per sample (classification,
+            per-trial experiments) pays a few column uploads instead of a build.
         """
         self.tick = 0
-        self._globals_dirty = True  # re-upload on next _build_gpu_buffers
+        self._globals_dirty = True  # re-upload on next launch
 
-        # Sync GPU state back to AgentFactory before freeing
+        # Sync GPU state back to AgentFactory first
         if (sync_properties is None or len(sync_properties)) and \
                 hasattr(self, '_gpu_buffers') and self._gpu_buffers.is_initialized:
             self._sync_gpu_to_agent_factory(only=sync_properties)
@@ -1702,10 +1728,56 @@ class Model:
         self._regenerate_data_tensors()
 
         if hasattr(self, '_gpu_buffers'):
-            self._gpu_buffers.free()
-            self._gpu_buffers = GPUBufferManager(
-                self._agent_slack_factor, self._csr_slack_factor, self._min_capacity)
+            if not release_buffers and self._gpu_buffers.is_initialized:
+                self._gpu_buffers.pending_reset = True
+            else:
+                self._gpu_buffers.free()
+                self._gpu_buffers = GPUBufferManager(
+                    self._agent_slack_factor, self._csr_slack_factor, self._min_capacity)
+                self._device_dirty = False
         self._cached_all_args = None
+
+    def _flush_pending_reset(self) -> None:
+        """Apply a reset(release_buffers=False) to the live device buffers: upload the
+        host property columns over the local rows (and their write buffers), zero every
+        breed-local array (a reduce inbox starts empty) and clear the event wake state.
+        Interned properties are left alone (read-only on the device, the host column is
+        authoritative and unchanged). Ghost rows are refreshed by the next exchange."""
+        buf = getattr(self, '_gpu_buffers', None)
+        if buf is None or not buf.is_initialized or not getattr(buf, 'pending_reset', False):
+            return
+        n = buf.num_local_agents
+        columns = self.__rank_local_agent_data_tensors
+        if n:
+            write_slot = {pidx: j for j, pidx in enumerate(buf.sorted_write_indices)}
+            for i in range(self._agent_factory.num_properties):
+                tensor = buf.property_tensors[i] if i < len(buf.property_tensors) else None
+                if i == 1 or tensor is None or buf.is_interned(i) or i >= len(columns):
+                    continue
+                dev = convert_to_padded_gpu_tensor(columns[i], n, width=tuple(tensor.shape[1:]))
+                if dev.ndim != tensor.ndim:
+                    dev = dev.reshape((n, *tensor.shape[1:]))
+                if dev.shape[1:] == tensor.shape[1:]:
+                    tensor[:n] = dev[:n]
+                else:
+                    # a narrower local column (width agreed across ranks): pad with 0
+                    tensor[:n] = 0
+                    sel = (slice(0, n),) + tuple(slice(0, d) for d in dev.shape[1:])
+                    tensor[sel] = dev[:n]
+                j = write_slot.get(i)
+                if j is not None and j < len(buf.write_buffers) and buf.write_buffers[j] is not None:
+                    buf.write_buffers[j][:n] = tensor[:n]
+        for arr in getattr(buf, 'device_breed_locals', []):
+            arr.fill(0)
+        for wb in getattr(buf, 'device_breed_local_write_bufs', []):
+            if wb is not None:
+                wb.fill(0)
+        for stamps in getattr(buf, 'wake_stamps', {}).values():
+            stamps.fill(-1)
+        for counts in getattr(buf, 'wake_counts', {}).values():
+            counts.fill(0)
+        buf.pending_reset = False
+        self._device_dirty = False      # host and device agree again
 
 
     def simulate(
@@ -2295,6 +2367,7 @@ class Model:
         else:
             # --- SUBSEQUENT TICK: reuse existing GPU buffers ---
             t_before_context = time.time()
+            self._flush_pending_reset()
 
             if num_workers > 1 and hasattr(self, '_comm_manager') and self._comm_manager.is_initialized:
                 mpi_timing = self._comm_manager.exchange_ghost_data()
@@ -2313,6 +2386,7 @@ class Model:
 
         # ============================================================
         # GPU KERNEL EXECUTION (fused: all ticks + priorities in one launch)
+        self._device_dirty = True       # from here on the device holds state the host has not seen
         # ============================================================
 
         # Build all_args from persistent GPU buffers (cached across ticks)

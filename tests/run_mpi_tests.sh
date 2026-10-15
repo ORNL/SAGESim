@@ -28,6 +28,7 @@ FILES=(
     tests/test_reduce_bla.py
     tests/test_empty_rank.py
     tests/test_wake_list.py
+    tests/test_reset_in_place.py
 )
 
 printf '%-34s' "test"
