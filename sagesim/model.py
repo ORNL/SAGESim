@@ -58,9 +58,13 @@ def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map, return_arra
     else:
         id_keys = np.array(list(agent_id_to_index_map.keys()), dtype=np.int64)
         id_values = np.array(list(agent_id_to_index_map.values()), dtype=np.int32)
-    min_id = id_keys.min()
-    max_id = id_keys.max()
-    id_range = max_id - min_id + 1
+    if len(id_keys) == 0:
+        # empty rank: nothing to look up, every id is "not found"
+        min_id, max_id, id_range = 0, -1, 0
+    else:
+        min_id = id_keys.min()
+        max_id = id_keys.max()
+        id_range = max_id - min_id + 1
 
     # Use dense array if not too sparse (< 3x overhead)
     use_dense = id_range < len(agent_id_to_index_map) * 3
@@ -432,9 +436,79 @@ def analyze_step_function_for_writes(step_func: Callable, num_properties: int,
     return write_property_indices
 
 
+def _forwarded_bla_args(func, node, names):
+    """For a bare call `node` inside `func`: (callee, {callee param: caller name}) for the
+    arguments that are bare names in `names`, or (None, {}) if nothing is forwarded or
+    the callee cannot be resolved to a device function."""
+    if not any(isinstance(a, ast.Name) and a.id in names for a in node.args):
+        return None, {}
+    callee = _resolve_callee(func, node.func.id)
+    if callee is None:
+        return None, {}
+    _, callee_params = _function_def_of(callee)
+    if callee_params is None:
+        return None, {}
+    # Generated dispatchers already carry the injected `_seed` / `logical_ids`;
+    # drop those the callee does not declare so positions line up.
+    positional = [a for a in node.args
+                  if not (isinstance(a, ast.Name) and a.id in _INJECTED_PARAMS
+                          and a.id not in callee_params)]
+    forwarded = {}
+    for pos, arg in enumerate(positional):
+        if isinstance(arg, ast.Name) and arg.id in names and pos < len(callee_params):
+            forwarded[callee_params[pos]] = arg.id
+    return callee, forwarded
+
+
+def _deposited_params(func, names, visited):
+    """Subset of `names` (parameter names of `func` that name reduce arrays) that `func`
+    deposits into with `deposit_to_agent`, directly or inside a helper it forwards
+    them to (followed recursively, like property writes)."""
+    func_def, _params = _function_def_of(func)
+    if func_def is None or not names:
+        return set()
+    out = set()
+    for node in ast.walk(func_def):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        if node.func.id == 'deposit_to_agent':
+            if node.args and isinstance(node.args[0], ast.Name) and node.args[0].id in names:
+                out.add(node.args[0].id)
+            continue
+        callee, forwarded = _forwarded_bla_args(func, node, names)
+        if callee is None or not forwarded:
+            continue
+        key = (id(callee), tuple(sorted(forwarded)))
+        if key in visited:
+            continue
+        visited.add(key)
+        for p in _deposited_params(callee, set(forwarded), visited):
+            out.add(forwarded[p])
+    return out
+
+
+def _bla_depositing_helpers(func, names):
+    """Names of the helpers `func` calls that deposit into one of `names` forwarded to
+    them. Their call sites must pass the array's write buffer."""
+    func_def, _params = _function_def_of(func)
+    if func_def is None or not names:
+        return set()
+    out = set()
+    for node in ast.walk(func_def):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        if node.func.id == 'deposit_to_agent':
+            continue
+        callee, forwarded = _forwarded_bla_args(func, node, names)
+        if callee is not None and forwarded and _deposited_params(callee, set(forwarded), set()):
+            out.add(node.func.id)
+    return out
+
+
 def analyze_step_function_for_bla_writes(step_func: Callable,
                                           bla_names: List[str]) -> Set[str]:
-    """Analyze step function to find which breed-local array names are written to."""
+    """Analyze step function to find which breed-local array names are written to,
+    by assignment or by a `deposit_to_agent` reached directly or through a helper."""
     written_bla_names = set()
     source = inspect.getsource(step_func)
     tree = ast.parse(source)
@@ -454,6 +528,9 @@ def analyze_step_function_for_bla_writes(step_func: Callable,
                 check_target(target)
         elif isinstance(node, ast.AugAssign):
             check_target(node.target)
+
+    # Deposits (reduce inboxes) are writes into the array's write buffer.
+    written_bla_names |= _deposited_params(step_func, bla_name_set, set())
 
     return written_bla_names
 
@@ -496,6 +573,9 @@ class Model:
         self._write_property_indices = set()  # Cache for write property indices
         # Breed-local arrays — separate per-breed GPU tensors (not padded across breeds)
         self._breed_local_arrays = []  # list of dicts: {name, breed, shape_per_agent, neighbor_visible}
+        self._wake_event_property = None  # Model.configure_wake
+        self._wake_config = {}            # priority value -> {"roles": set, "breeds": set}
+        self._wake_eligibility = {}       # priority value -> fn(rows, agent_ids) -> bool mask
         # following may be set later in setup if distributed execution
 
     @property
@@ -994,11 +1074,12 @@ class Model:
         return {name: self._global_tensors[idx]
                 for name, idx in self._global_names.items()}
 
-    def register_breed_local_array(self, name: str, breed: Breed, shape_per_agent: tuple,
-                                    neighbor_visible: bool = False) -> int:
+    def register_breed_local_array(self, name: str, breed, shape_per_agent: tuple,
+                                    neighbor_visible: bool = False,
+                                    reduce: Optional[str] = None) -> int:
         """Register a named per-breed GPU array accessible from step functions.
 
-        Allocates one row per local agent of the given breed (+ ghost agents if
+        Allocates one row per local agent of the given breed(s) (+ ghost agents if
         neighbor_visible=True). The framework builds an index map so step functions
         can access the array via: array[idx_map[agent_index]].
 
@@ -1008,18 +1089,77 @@ class Model:
 
         Args:
             name: Parameter name in step function signatures.
-            breed: The breed this array belongs to. Determines row count.
+            breed: The breed this array belongs to, or a list of breeds that share it
+                (rows are the local agents of all of them). Determines row count.
             shape_per_agent: Column shape per agent (e.g. (50, 2) for 3D, (100,) for 2D).
             neighbor_visible: If True, ghost agents get rows and data is exchanged via MPI.
+            reduce: None, or "sum" to make the array a reduce inbox: a step function of
+                ANY breed that declares the array may add into another agent's row with
+                `deposit_to_agent(name, name_idx, target_agent_index, slot, value)`.
+                Deposits are atomic adds into the write buffer; the end-of-tick
+                write-back copies it to the read buffer and clears it, so the owner
+                reads the tick's total next tick and depositors never share a buffer
+                with readers. Always double-buffered. A pushed value must be the
+                sender's final value for the tick: a later priority that still changes
+                the state it was computed from is not reflected.
         """
+        breeds = list(breed) if isinstance(breed, (list, tuple)) else [breed]
+        # An empty breed list is allowed: a placeholder array nobody owns (every index
+        # map entry is -1), so kernels can keep one signature across model variants and
+        # test `idx_map[agent_index] >= 0` to know whether the array applies to them.
+        if reduce not in (None, "sum"):
+            raise ValueError(f"breed-local array '{name}': reduce must be None or 'sum', got {reduce!r}")
+        if reduce is not None:
+            if neighbor_visible:
+                raise NotImplementedError(
+                    f"breed-local array '{name}': a reduce array cannot be neighbor_visible yet; "
+                    "depositing into a ghost row needs a reduce-back-to-owner exchange")
+            if len(shape_per_agent) != 1:
+                raise NotImplementedError(
+                    f"breed-local array '{name}': reduce arrays take a 1-D shape_per_agent")
+        if len(breeds) > 1 and neighbor_visible:
+            raise NotImplementedError(
+                f"breed-local array '{name}': a multi-breed array cannot be neighbor_visible yet")
         idx = len(self._breed_local_arrays)
         self._breed_local_arrays.append({
             'name': name,
-            'breed': breed,
+            'breed': breeds[0] if breeds else None,
+            'breeds': breeds,
             'shape_per_agent': shape_per_agent,
             'neighbor_visible': neighbor_visible,
+            'reduce': reduce,
         })
         return idx
+
+    def configure_wake(self, event_property: str) -> None:
+        """Enable event-woken step functions (Breed.register_step_func(wake_on_roles=...)).
+
+        `event_property` is a width-2 property every breed registers: an agent raises an
+        event at tick t by writing a value > 0 into slot `t % 2` of its own row. At the
+        start of tick t+1 the framework scans the rows that some woken agent lists as a
+        neighbour in a declared role, and appends every such dependant to that
+        priority's wake queue; the priority's loop then runs over the queue instead of
+        the whole index range. An agent queued twice (two roles raised) runs once. Ghost
+        rows take part through the usual property exchange, so an event on another rank
+        wakes its dependants here with the same one-tick delay as a local one.
+
+        Cost per tick: O(emitters + woken agents) instead of O(agents) for that
+        priority; the queue is allocated for the worst case (every dependant woken).
+        """
+        self._wake_event_property = str(event_property)
+
+    def set_wake_eligibility(self, priority: int, fn) -> None:
+        """Restrict which agents of a woken priority can be woken by neighbour events.
+
+        `fn(rows, agent_ids) -> bool array` is evaluated once per buffer build over the
+        local agents of the breeds woken at `priority` (`rows` are their buffer rows,
+        `agent_ids` their global ids, same order). Agents it rejects are left out of the
+        reverse adjacency, so an event never queues them: use it when only some agents of
+        a breed have anything to do at that priority (SuperNeuroABM: only synapses that
+        carry a learning rule are woken for the learning-rule phase). Explicit wakes
+        from injected code are not filtered.
+        """
+        self._wake_eligibility[int(priority)] = fn
 
     def get_breed_local_array(self, name: str) -> np.ndarray:
         """Download a breed-local array from GPU to CPU."""
@@ -1122,14 +1262,63 @@ class Model:
             else:
                 pass
 
+        # Breed-local arrays: which ones each step function takes (None = all of them),
+        # keyed by step function name because the generated code is too. Reduce arrays
+        # (inboxes) are always double-buffered and drained by the write-back.
+        bla_names = [bla['name'] for bla in self._breed_local_arrays]
+        self._reduce_bla_names = {bla['name'] for bla in self._breed_local_arrays
+                                  if bla.get('reduce')}
+        self._bla_names_by_step = {}
+        for breed in self._agent_factory.breeds:
+            for priority, (func, _path) in breed.step_funcs.items():
+                declared = breed.step_func_blas.get(priority)
+                if declared is None:
+                    names = list(bla_names)
+                else:
+                    unknown = [n for n in declared if n not in bla_names]
+                    if unknown:
+                        raise ValueError(
+                            f"step function {func.__name__} of breed {breed.name} declares "
+                            f"unknown breed-local arrays {unknown}; registered: {bla_names}")
+                    names = list(declared)
+                self._bla_names_by_step[func.__name__] = names
+
+        # Event-woken priorities (Breed.register_step_func(wake_on_roles=...)): a priority
+        # is woken as a whole -- every breed stepping at it declares roles -- and its loop
+        # runs over a wake queue filled from the event property (configure_wake).
+        self._wake_config = {}
+        for breed in self._agent_factory.breeds:
+            for priority, roles in breed.step_func_wake_roles.items():
+                if roles is None:
+                    continue
+                cfg = self._wake_config.setdefault(priority, {"roles": set(), "breeds": set()})
+                cfg["roles"].update(int(r) for r in roles)
+                cfg["breeds"].add(breed._breedidx)
+        if self._wake_config:
+            if not self._wake_event_property:
+                raise ValueError("step functions declare wake_on_roles but the model has no "
+                                 "event property: call configure_wake(event_property=...) first")
+            if self._wake_event_property not in self._agent_factory._property_name_2_index:
+                raise ValueError(f"configure_wake: unknown property {self._wake_event_property!r}")
+            self._wake_event_prop_idx = self._agent_factory._property_name_2_index[self._wake_event_property]
+            for breed in self._agent_factory.breeds:
+                for priority, (func, _path) in breed.step_funcs.items():
+                    if priority in self._wake_config and breed.step_func_wake_roles.get(priority) is None:
+                        raise ValueError(
+                            f"priority {priority}: breed {breed.name} ({func.__name__}) is clocked "
+                            "while another breed at the same priority is event-woken; a priority "
+                            "is all or nothing")
+
         # Determine and cache write property indices once during setup
         self._write_property_indices = set()
         for breed_idx_2_step_func in self._breed_idx_2_step_func_by_priority:
             for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
                 breed_step_func_impl, module_fpath = breed_step_func_info
+                n_step_blas = len(self._bla_names_by_step.get(
+                    breed_step_func_impl.__name__, bla_names))
                 write_indices = analyze_step_function_for_writes(
                     breed_step_func_impl, self._agent_factory.num_properties,
-                    num_breed_local_params=len(self._breed_local_arrays) * 2)
+                    num_breed_local_params=n_step_blas * 2)
                 # Note: num_breed_local_params=N*2 is for the ORIGINAL step func (before DB transform).
                 # The write analysis runs on original source which has array+idx per BLA.
                 self._write_property_indices.update(write_indices)
@@ -1141,14 +1330,21 @@ class Model:
         for name in extra_cfg.get('writes_properties', []):
             self._kernel_written_property_indices.add(
                 self._agent_factory._property_name_2_index[name])
+        if self._wake_config:
+            # the wake expansion reads it as a dense [row][slot] tensor
+            self._kernel_written_property_indices.add(self._wake_event_prop_idx)
 
         # Exclude no_double_buffer properties from write buffer creation
         self._write_property_indices = self._write_property_indices - no_double_buffer_indices
 
         # Determine which breed-local arrays need write buffers
-        bla_names = [bla['name'] for bla in self._breed_local_arrays]
         no_double_buffer_bla_names = no_double_buffer_prop_names & set(bla_names)
-        self._write_bla_names = set()
+        undrainable = self._reduce_bla_names & no_double_buffer_bla_names
+        if undrainable:
+            raise ValueError(
+                f"reduce breed-local arrays {sorted(undrainable)} are always double-buffered; "
+                "remove them from no_double_buffer")
+        self._write_bla_names = set(self._reduce_bla_names)
         for breed_idx_2_step_func in self._breed_idx_2_step_func_by_priority:
             for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
                 breed_step_func_impl, module_fpath = breed_step_func_info
@@ -1190,34 +1386,60 @@ class Model:
                 property_ndims[prop_idx] = 0  # scalar
 
         t_codegen_start = time.time()
+        # Every rank builds the text (deterministic: the interning decision is agreed
+        # across ranks) so every rank knows the file name; rank 0 writes it.
+        source_text = generate_gpu_func(
+            len(self._global_tensors),
+            self._agent_factory.num_properties,
+            self._breed_idx_2_step_func_by_priority,
+            self._write_property_indices,
+            property_ndims,
+            extra_kernel_config=self._get_extra_kernel_config(),
+            skip_priority_barriers=self._skip_priority_barriers,
+            priority_values=self._priority_values,
+            global_scalar_flags=[t.size == 1 for t in self._global_tensors],
+            breed_local_names=[bla['name'] for bla in self._breed_local_arrays],
+            write_bla_names=self._write_bla_names,
+            write_bla_shapes={
+                bla['name']: bla['shape_per_agent']
+                for bla in self._breed_local_arrays
+                if bla['name'] in self._write_bla_names
+            } if self._write_bla_names else None,
+            interned_property_indices=self._interned_property_indices,
+            bla_names_by_step=self._bla_names_by_step,
+            reduce_bla_names=self._reduce_bla_names,
+            wake_config=self._wake_config,
+            wake_event_prop_idx=getattr(self, "_wake_event_prop_idx", None),
+        )
+        # One file (and module) per distinct generated text. CuPy JIT-compiles a kernel
+        # at its first launch from its function's source lines, so two models whose
+        # generated code differs must never share a file: setting both up before
+        # running either would compile the first from the second's text at the
+        # first's line numbers. Identical text maps to the same file and module, which
+        # the import below reuses.
+        import hashlib
+        digest = hashlib.sha1(source_text.encode("utf-8")).hexdigest()[:12]
+        base, ext = os.path.splitext(self._step_function_file_path)
+        gen_path = f"{base}_{digest}{ext}"
+        # Rank 0's text is canonical, as before: the helper discovery that feeds
+        # codegen is not guaranteed identical on every rank (observed: a transformed
+        # learning-rule helper present on rank 0 only), so every rank imports the file
+        # rank 0 names and writes rather than one named after its own text.
+        gen_path = comm.bcast(gen_path, root=0)
         if worker == 0:
             # Delete stale bytecode cache before writing new source — prevents
             # a previous process's .pyc from being loaded instead of the fresh .py
-            _pyc = importlib.util.cache_from_source(self._step_function_file_path)
+            _pyc = importlib.util.cache_from_source(gen_path)
             if os.path.exists(_pyc):
                 os.remove(_pyc)
-            with open(self._step_function_file_path, "w", encoding="utf-8") as f:
-                f.write(
-                    generate_gpu_func(
-                        len(self._global_tensors),
-                        self._agent_factory.num_properties,
-                        self._breed_idx_2_step_func_by_priority,
-                        self._write_property_indices,
-                        property_ndims,
-                        extra_kernel_config=self._get_extra_kernel_config(),
-                        skip_priority_barriers=self._skip_priority_barriers,
-                        priority_values=self._priority_values,
-                        global_scalar_flags=[t.size == 1 for t in self._global_tensors],
-                        breed_local_names=[bla['name'] for bla in self._breed_local_arrays],
-                        write_bla_names=self._write_bla_names,
-                        write_bla_shapes={
-                            bla['name']: bla['shape_per_agent']
-                            for bla in self._breed_local_arrays
-                            if bla['name'] in self._write_bla_names
-                        } if self._write_bla_names else None,
-                        interned_property_indices=self._interned_property_indices,
-                    )
-                )
+            current = None
+            if os.path.exists(gen_path):
+                with open(gen_path, "r", encoding="utf-8") as f:
+                    current = f.read()
+            if current != source_text:
+                with open(gen_path, "w", encoding="utf-8") as f:
+                    f.write(source_text)
+        self._generated_step_file = gen_path
         comm.barrier()
         t_codegen_end = time.time()
 
@@ -1238,7 +1460,7 @@ class Model:
             warnings.filterwarnings("ignore", category=DeprecationWarning)
             warnings.filterwarnings("ignore", category=FutureWarning)
             warnings.filterwarnings("ignore", message=".*numba.*", category=Warning)
-            abs_path = self._step_function_file_path  # Already absolute from __init__
+            abs_path = self._generated_step_file  # absolute; name carries the content hash
             module_name = os.path.splitext(os.path.basename(abs_path))[0]
             # Reuse existing module if source unchanged — avoids CuPy JIT
             # recompilation which can produce non-deterministic CUDA binaries
@@ -1251,6 +1473,11 @@ class Model:
             else:
                 sys.modules.pop(module_name, None)
                 importlib.invalidate_caches()
+                # linecache keeps loader-sourced files with mtime=None, which
+                # checkcache never invalidates: inspect.getsource (hence the JIT) would
+                # read the previous generation's text at the new line numbers.
+                import linecache
+                linecache.cache.pop(abs_path, None)
                 spec = importlib.util.spec_from_file_location(module_name, abs_path)
                 step_func_module = importlib.util.module_from_spec(spec)
                 step_func_module._source_hash = source_hash
@@ -1318,6 +1545,17 @@ class Model:
                                                      it must be uniform across all threads.
         """
         return {}
+
+    def _build_wake_launch_args(self, buf):
+        """Kernel launch args for event wake-lists, matching _gen_wake_kernel_params."""
+        if not self._wake_config:
+            return []
+        args = []
+        for priority in sorted(self._wake_config):
+            args += [buf.wake_stamps[priority], buf.wake_queues[priority], buf.wake_counts[priority],
+                     buf.wake_emitters[priority], cp.int32(buf.wake_emitters[priority].size),
+                     buf.wake_rev_offsets[priority], buf.wake_rev_values[priority]]
+        return args
 
     def _build_bla_launch_args(self, buf):
         """Build kernel launch args for breed-local arrays.
@@ -1714,6 +1952,7 @@ class Model:
 
         # 6b. Synchronize property widths across ranks (MPI_MAX) so all
         # ranks allocate tensors with identical shapes for ghost exchange.
+        global_shapes = None
         if comm is not None and comm.Get_size() > 1:
             num_props = self._agent_factory.num_properties
             local_widths = np.ones(num_props, dtype=np.int32)
@@ -1731,6 +1970,27 @@ class Model:
                     )
             global_widths = np.empty_like(local_widths)
             comm.Allreduce(local_widths, global_widths, op=MPI.MAX)
+            # The full trailing shape (2-D or 3-D rows) too: a rank with no agents
+            # must allocate exactly the shapes the shared kernel was compiled for.
+            local_shapes = np.zeros((num_props, 2), dtype=np.int64)
+            for i in range(num_props):
+                if i == 1:
+                    continue
+                data = combined_lists[i]
+                tail = ()
+                if isinstance(data, ArrayColumn) and not data.degraded:
+                    tail = tuple(data.values.shape[1:])
+                elif isinstance(data, IndexedColumn):
+                    tail = (data.width,)
+                elif data and isinstance(data[0], (list, tuple, np.ndarray)):
+                    row = data[0]
+                    inner = row[0] if len(row) else None
+                    tail = ((len(row), len(inner)) if isinstance(inner, (list, tuple, np.ndarray))
+                            else (len(row),))
+                for k, d in enumerate(tail[:2]):
+                    local_shapes[i, k] = int(d)
+            global_shapes = np.empty_like(local_shapes)
+            comm.Allreduce(local_shapes, global_shapes, op=MPI.MAX)
             # Pad rows to global max width where needed
             for i in range(num_props):
                 if i == 1 or global_widths[i] <= 1:
@@ -1760,6 +2020,7 @@ class Model:
             convert_to_padded_gpu_tensor,
             interned=self._interned_property_indices,
             intern_func=self._intern_column,
+            empty_shapes=global_shapes,
         )
         buf.agent_capacity = agent_capacity
 
@@ -1790,8 +2051,12 @@ class Model:
         agent2breed = self._agent_factory._agent2breed
 
         for bla in self._breed_local_arrays:
-            breed_id = bla['breed']._breedidx
-            start, count = breed_ranges.get(breed_id, (0, 0))
+            # Rows: the local agents of every breed the array spans, in breed order
+            # (none for a placeholder array: every index map entry stays -1).
+            breed_ids = [b._breedidx for b in bla.get('breeds', [bla['breed']]) if b is not None]
+            breed_id = breed_ids[0] if breed_ids else -1
+            ranges = [(bid, *breed_ranges.get(bid, (0, 0))) for bid in breed_ids]
+            count = sum(c for _bid, _start, c in ranges)
 
             ghost_rows = 0
             ghost_breed_mask = None
@@ -1799,7 +2064,7 @@ class Model:
                 ghost_breed_ids = np.array(
                     [agent2breed.get(int(gid), -1) for gid in ghost_ids],
                     dtype=np.int32)
-                ghost_breed_mask = (ghost_breed_ids == breed_id)
+                ghost_breed_mask = np.isin(ghost_breed_ids, breed_ids)
                 ghost_rows = int(ghost_breed_mask.sum())
 
             total_rows = max(count + ghost_rows, 1)
@@ -1808,8 +2073,11 @@ class Model:
 
             # Vectorized index map: buffer_index → row in breed-local array
             idx_map = np.full(agent_capacity, -1, dtype=np.int32)
-            if count > 0:
-                idx_map[start:start + count] = np.arange(count, dtype=np.int32)
+            row0 = 0
+            for _bid, start, c in ranges:
+                if c > 0:
+                    idx_map[start:start + c] = np.arange(row0, row0 + c, dtype=np.int32)
+                    row0 += c
 
             if ghost_breed_mask is not None and ghost_rows > 0:
                 ghost_offsets = np.where(ghost_breed_mask)[0]
@@ -1837,6 +2105,48 @@ class Model:
                     buf.device_breed_locals[i].copy())
             else:
                 buf.device_breed_local_write_bufs.append(None)
+
+        # 12. Event wake-lists: per woken priority the reverse adjacency (emitter row ->
+        # dependants through the declared roles, over local AND ghost emitter rows), a
+        # queue sized for the worst case, and one shared "last woken tick" stamp.
+        buf.wake_queues, buf.wake_counts, buf.wake_stamps = {}, {}, {}
+        buf.wake_emitters, buf.wake_rev_offsets, buf.wake_rev_values = {}, {}, {}
+        if self._wake_config:
+            offsets_h = buf.neighbor_offsets.get().astype(np.int64)
+            values_h = buf.neighbor_values.get().astype(np.int64)
+            for priority, cfg in self._wake_config.items():
+                # one stamp per woken priority: the same row may legitimately run at
+                # several woken priorities in one tick (e.g. delivery, then its rule)
+                buf.wake_stamps[priority] = cp.full(agent_capacity, -1, dtype=cp.int32)
+                rows = [np.arange(s, s + c, dtype=np.int64)
+                        for s, c in (breed_ranges.get(bid, (0, 0)) for bid in cfg["breeds"]) if c]
+                rows = np.concatenate(rows) if rows else np.zeros(0, np.int64)
+                n_breed_rows = int(len(rows))   # explicit wakes may target any of them
+                eligible = self._wake_eligibility.get(priority)
+                if eligible is not None and len(rows):
+                    keep = np.asarray(eligible(rows, self.__rank_local_agent_ids[rows]), dtype=bool)
+                    rows = rows[keep]
+                srcs, deps = [], []
+                for r in sorted(cfg["roles"]):
+                    start = offsets_h[rows] + r
+                    ok = start < offsets_h[rows + 1]
+                    nb = values_h[start[ok]]
+                    keep = nb >= 0
+                    srcs.append(nb[keep])
+                    deps.append(rows[ok][keep])
+                srcs = np.concatenate(srcs) if srcs else np.zeros(0, np.int64)
+                deps = np.concatenate(deps) if deps else np.zeros(0, np.int64)
+                order = np.argsort(srcs, kind="stable")
+                srcs, deps = srcs[order], deps[order]
+                emitters, first = np.unique(srcs, return_index=True)
+                rev_offsets = np.append(first, len(srcs)).astype(np.int32)
+                buf.wake_emitters[priority] = cp.asarray(emitters.astype(np.int32))
+                buf.wake_rev_offsets[priority] = cp.asarray(rev_offsets)
+                buf.wake_rev_values[priority] = cp.asarray(deps.astype(np.int32))
+                # every role wake plus one explicit wake per agent of the woken breeds
+                # (explicit wakes are not filtered by eligibility), never fewer than 1
+                buf.wake_queues[priority] = cp.zeros(int(len(deps) + n_breed_rows) + 1, dtype=cp.int32)
+                buf.wake_counts[priority] = cp.zeros(1, dtype=cp.int32)
 
         buf.is_initialized = True
 
@@ -1908,7 +2218,9 @@ class Model:
 
         num_local_agents = len(self.__rank_local_agent_ids)
         threadsperblock = 128
-        blockspergrid = int(math.ceil(num_local_agents / threadsperblock))
+        # at least one block: an empty rank still launches (its loops run zero
+        # iterations) so the grid barrier and the collectives line up across ranks
+        blockspergrid = max(1, int(math.ceil(num_local_agents / threadsperblock)))
 
         buf = self._gpu_buffers
 
@@ -2074,6 +2386,8 @@ class Model:
         # Reset barrier counter and launch fused kernel
         t_kernel_launch_start = time.time()
         buf.barrier_counter[0] = 0
+        for _wc in buf.wake_counts.values():   # the kernel resets them at every tick end
+            _wc[0] = 0
         # Re-upload globals if dirty (changed since last upload)
         if self._globals_dirty:
             buf.device_globals = [cp.asarray(t) for t in self._global_tensors]
@@ -2093,6 +2407,7 @@ class Model:
             cp.int32(effective_blocks),
             *extra_kernel_args,
             *self._build_bla_launch_args(buf),
+            *self._build_wake_launch_args(buf),
         )
         if self._verbose_timing:
             t_kernel_launch_end = time.time()
@@ -2131,9 +2446,12 @@ class Model:
         for i, prop_idx in enumerate(buf.sorted_write_indices):
             buf.property_tensors[prop_idx][:num_local_agents] = \
                 buf.write_buffers[i][:num_local_agents]
-        # Write-back for double-buffered breed-local arrays
+        # Write-back for double-buffered breed-local arrays. Reduce inboxes are
+        # skipped: the kernel already copied and drained them, and copying the
+        # drained write buffer here would zero the read buffer.
+        reduce_blas = getattr(self, '_reduce_bla_names', set())
         for i, wb in enumerate(buf.device_breed_local_write_bufs):
-            if wb is not None:
+            if wb is not None and self._breed_local_arrays[i]['name'] not in reduce_blas:
                 n = buf.device_breed_locals[i].shape[0]
                 buf.device_breed_locals[i][:n] = wb[:n]
         if self._verbose_timing:
@@ -2679,6 +2997,18 @@ def _gen_bla_kernel_params(breed_local_names, write_bla_names):
     return params
 
 
+def _gen_wake_kernel_params(wake_config):
+    """Kernel parameters for event wake-lists, per woken priority (by priority value):
+    stamp, queue, count, emitters, n_emitters, rev_offsets, rev_values."""
+    if not wake_config:
+        return []
+    params = []
+    for p in sorted(wake_config):
+        params += [f"wake_stamp_{p},", f"wake_queue_{p},", f"wake_count_{p},", f"wake_emitters_{p},",
+                   f"n_wake_emitters_{p},", f"wake_rev_offsets_{p},", f"wake_rev_values_{p},"]
+    return params
+
+
 def _gen_bla_step_func_args(breed_local_names, write_bla_names):
     """Generate step function call args for breed-local arrays.
 
@@ -2709,9 +3039,23 @@ def generate_gpu_func(
     write_bla_names: set = None,
     write_bla_shapes: dict = None,
     interned_property_indices: Set[int] = None,
+    bla_names_by_step: dict = None,
+    reduce_bla_names: set = None,
+    wake_config: dict = None,
+    wake_event_prop_idx: int = None,
 ) -> str:
     """
     Generate GPU function string with double buffering support for race condition prevention.
+
+    `wake_config` (priority value -> {"roles", "breeds"}) marks event-woken priorities:
+    at tick start their queues are filled from the event property `a{wake_event_prop_idx}`
+    (slot (tick-1) % 2 of every emitter row) through the reverse adjacency, their loops
+    run over the queue (each row at most once per tick, via `wake_stamp`), and the queue
+    counts are reset at tick end.
+
+    `bla_names_by_step` maps a step function name to the breed-local arrays its
+    signature takes (default: all of `breed_local_names`); `reduce_bla_names` are the
+    inboxes whose write buffer the end-of-tick write-back drains after copying.
     
     This function now includes double buffering to prevent race conditions from shared mutable 
     agent data tensors across agents in the same rank. It:
@@ -2778,13 +3122,19 @@ def generate_gpu_func(
         return helper_names_by_step.get(getattr(step_func, "__name__", ""), set())
 
     def generate_modified_step_func_code(step_func: Callable, write_indices: Set[int], num_properties: int,
-                                         write_bla_names_set: set = None) -> str:
+                                         write_bla_names_set: set = None,
+                                         step_bla_names: list = None) -> str:
         """Generate modified step function code with CSR transformation and write buffer parameters.
 
         Phase 1: Auto-transform locations parameter to CSR (neighbor_offsets, neighbor_values)
         Phase 2: Add double buffering for writable properties
+
+        `step_bla_names`: the breed-local arrays this step function's signature takes
+        (two trailing params each); defaults to all registered arrays.
         """
         source = inspect.getsource(step_func)
+        if step_bla_names is None:
+            step_bla_names = list(breed_local_names or [])
 
         # Phase 1: CSR auto-transformation
         # Replaces locations param with neighbor_offsets, neighbor_values
@@ -2795,7 +3145,7 @@ def generate_gpu_func(
         # `p_table[p_codes[i]]`). Names are stable across the CSR pass.
         if interned:
             orig_params = list(inspect.signature(step_func).parameters.keys())
-            n_bla_orig = len(breed_local_names or []) * 2
+            n_bla_orig = len(step_bla_names) * 2
             orig_prop_params = (orig_params[:-n_bla_orig] if n_bla_orig else orig_params)[-num_properties:]
             source = _auto_transform_tables(
                 source, [orig_prop_params[i] for i in sorted(interned) if i < len(orig_prop_params)])
@@ -2818,7 +3168,7 @@ def generate_gpu_func(
         # Build CSR-aware mapping (function now has num_properties + 1 property-like params)
         # Breed-local array params (array + idx_map each) are appended after properties,
         # so we must strip them before the property-index mapping.
-        n_bla = len(breed_local_names or []) * 2  # 2 params per BLA: array + idx_map
+        n_bla = len(step_bla_names) * 2  # 2 params per BLA this step takes: array + idx_map
         if n_bla > 0:
             # Strip breed-local params from end so _build_param_to_property_index_csr
             # sees property params at the tail as expected
@@ -2844,6 +3194,9 @@ def generate_gpu_func(
                 if param_name in write_bla_names_set:
                     bla_write_params[param_name] = f"write_{param_name}"
             param_to_write_param.update(bla_write_params)
+        # Helpers that deposit into a reduce array forwarded to them get its write buffer
+        depositing_helpers = (_bla_depositing_helpers(step_func, set(bla_write_params))
+                              if bla_write_params else set())
 
         if not param_to_write_param:
             return source  # No double buffering needed
@@ -2872,6 +3225,17 @@ def generate_gpu_func(
                     tensor_arg = node.args[1]
                     if isinstance(tensor_arg, ast.Name) and tensor_arg.id in param_to_write_param:
                         node.args[1] = ast.Name(id=param_to_write_param[tensor_arg.id], ctx=ast.Load())
+                # deposit_to_agent(<reduce array>, ...) adds into the write buffer
+                elif (isinstance(node.func, ast.Name) and
+                      node.func.id == 'deposit_to_agent' and node.args and
+                      isinstance(node.args[0], ast.Name) and
+                      node.args[0].id in bla_write_params):
+                    node.args[0] = ast.Name(id=bla_write_params[node.args[0].id], ctx=ast.Load())
+                # ... and so does a helper that deposits into the array forwarded to it
+                elif isinstance(node.func, ast.Name) and node.func.id in depositing_helpers:
+                    for i, a in enumerate(node.args):
+                        if isinstance(a, ast.Name) and a.id in bla_write_params:
+                            node.args[i] = ast.Name(id=bla_write_params[a.id], ctx=ast.Load())
 
             elif isinstance(node, ast.Assign):
                 # Replace in all types of assignments to param_name
@@ -2973,6 +3337,8 @@ def generate_gpu_func(
             breed_step_func_impl, module_fpath = breed_step_func_info
             step_func_name = getattr(breed_step_func_impl, "__name__", repr(callable))
             modified_step_func_name = f"{step_func_name}_double_buffer"
+            step_bla_names = list((bla_names_by_step or {}).get(
+                step_func_name, breed_local_names or []))
 
             # Helpers that receive the forwarded locations parameter (dispatcher pattern)
             # and helpers that receive interned property tensors (found recursively).
@@ -2980,7 +3346,7 @@ def generate_gpu_func(
             table_helpers = {}
             if interned:
                 orig_params = list(inspect.signature(breed_step_func_impl).parameters.keys())
-                n_bla_orig = len(breed_local_names or []) * 2
+                n_bla_orig = len(step_bla_names) * 2
                 orig_prop_params = (orig_params[:-n_bla_orig] if n_bla_orig else orig_params)[-n_properties:]
                 name_to_prop = {orig_prop_params[i]: i for i in sorted(interned) if i < len(orig_prop_params)}
                 _collect_forwarded_property_helpers(breed_step_func_impl, name_to_prop, table_helpers, set())
@@ -2990,7 +3356,7 @@ def generate_gpu_func(
             # Generate modified step function
             modified_step_func_code = generate_modified_step_func_code(
                 breed_step_func_impl, write_property_indices, n_properties,
-                write_bla_names_set=write_bla_names)
+                write_bla_names_set=write_bla_names, step_bla_names=step_bla_names)
             modified_step_func_code = modified_step_func_code.replace(
                 f"def {step_func_name}(",
                 f"def {modified_step_func_name}("
@@ -3043,35 +3409,88 @@ def generate_gpu_func(
     if pre_tick_code:
         tick_body.append("")
 
-    for priority_idx, breed_idx_2_step_func in enumerate(breed_idx_2_step_func_by_priority):
-        # Range-bounded persistent thread loop for this priority
-        p = priority_idx
-        tick_body.append(f"\t\tagent_index = thread_id")
-        tick_body.append(f"\t\twhile agent_index < priority_{p}_count:")
-        tick_body.append(f"\t\t\t_real_idx = int(agent_index) + int(priority_{p}_start)")
-        tick_body.append(f"\t\t\tbreed_id = a0[_real_idx]")
+    # Event wake expansion, block-cooperative: blocks stride over emitter rows; for a
+    # row whose event slot of the previous tick is raised, thread 0 reserves a queue
+    # segment with one atomic and publishes it through shared memory, then the whole
+    # block copies the row's dependants (one thread per emitter copying ~1,000 entries
+    # serially cost ~1 ms/tick on Brunel; a block does it in a few strides).
+    wake_config = wake_config or {}
+    if wake_config:
+        ev = f"a{wake_event_prop_idx}"
+        for p in sorted(wake_config):
+            tick_body += [
+                f"\t\t_we = jit.blockIdx.x",
+                f"\t\twhile _we < int(n_wake_emitters_{p}):",
+                f"\t\t\tif jit.threadIdx.x == 0:",
+                f"\t\t\t\t_wsh[0] = -1",
+                f"\t\t\t\t_wrow = int(wake_emitters_{p}[_we])",
+                f"\t\t\t\tif {ev}[_wrow][(thread_local_tick + 1) % 2] > 0.0:",
+                f"\t\t\t\t\t_wa0 = int(wake_rev_offsets_{p}[_we])",
+                f"\t\t\t\t\t_wb0 = int(wake_rev_offsets_{p}[_we + 1])",
+                f"\t\t\t\t\t_wsh[1] = _wa0",
+                f"\t\t\t\t\t_wsh[2] = _wb0",
+                f"\t\t\t\t\t_wsh[0] = jit.atomic_add(wake_count_{p}, 0, _wb0 - _wa0)",
+                f"\t\t\tjit.syncthreads()",
+                f"\t\t\tif _wsh[0] >= 0:",
+                f"\t\t\t\t_wj = int(_wsh[1]) + jit.threadIdx.x",
+                f"\t\t\t\twhile _wj < int(_wsh[2]):",
+                f"\t\t\t\t\twake_queue_{p}[int(_wsh[0]) + (_wj - int(_wsh[1]))] = wake_rev_values_{p}[_wj]",
+                f"\t\t\t\t\t_wj = _wj + jit.blockDim.x",
+                f"\t\t\tjit.syncthreads()",
+                f"\t\t\t_we = _we + jit.gridDim.x",
+            ]
+        tick_body.append("")
+        # The queue is consumed only at the first woken priority; every earlier
+        # priority ends with a grid barrier, so the expansion needs one of its own only
+        # when the first priority of the tick is itself woken.
+        first_woken = (priority_values and priority_values[0] in wake_config)
+        if first_woken or not priority_values:
+            tick_body += _gen_barrier_code("\t\t")
 
+    for priority_idx, breed_idx_2_step_func in enumerate(breed_idx_2_step_func_by_priority):
+        p = priority_idx
+        p_value = priority_values[priority_idx] if priority_values else None
+        woken = p_value in wake_config
+        if woken:
+            # Queue loop: the rows woken for this tick, each at most once (stamp)
+            tick_body.append(f"\t\t_wq = thread_id")
+            tick_body.append(f"\t\twhile _wq < int(wake_count_{p_value}[0]):")
+            tick_body.append(f"\t\t\t_real_idx = int(wake_queue_{p_value}[_wq])")
+            tick_body.append(f"\t\t\tif jit.atomic_exch(wake_stamp_{p_value}, _real_idx, thread_local_tick) != thread_local_tick:")
+            tick_body.append(f"\t\t\t\tbreed_id = a0[_real_idx]")
+            extra = "\t"
+        else:
+            # Range-bounded persistent thread loop for this priority
+            tick_body.append(f"\t\tagent_index = thread_id")
+            tick_body.append(f"\t\twhile agent_index < priority_{p}_count:")
+            tick_body.append(f"\t\t\t_real_idx = int(agent_index) + int(priority_{p}_start)")
+            tick_body.append(f"\t\t\tbreed_id = a0[_real_idx]")
+            extra = ""
+
+        dispatch = []
         for breedidx, breed_step_func_info in breed_idx_2_step_func.items():
             breed_step_func_impl, module_fpath = breed_step_func_info
             step_func_name = getattr(breed_step_func_impl, "__name__", repr(callable))
             modified_step_func_name = f"{step_func_name}_double_buffer"
 
-            tick_body.append(f"\t\t\tif breed_id == {breedidx}:")
-            tick_body.append(f"\t\t\t\t{modified_step_func_name}(")
-            tick_body.append("\t\t\t\t\tthread_local_tick,")
-            tick_body.append("\t\t\t\t\t_real_idx,")
-            tick_body.append("\t\t\t\t\t_seed,")
+            dispatch.append(f"\t\t\tif breed_id == {breedidx}:")
+            dispatch.append(f"\t\t\t\t{modified_step_func_name}(")
+            dispatch.append("\t\t\t\t\tthread_local_tick,")
+            dispatch.append("\t\t\t\t\t_real_idx,")
+            dispatch.append("\t\t\t\t\t_seed,")
             if global_args:
-                tick_body.append(f"\t\t\t\t\t{','.join(step_func_global_args)},")
-            tick_body.append("\t\t\t\t\tagent_ids,")
-            tick_body.append("\t\t\t\t\tlogical_ids,")
+                dispatch.append(f"\t\t\t\t\t{','.join(step_func_global_args)},")
+            dispatch.append("\t\t\t\t\tagent_ids,")
+            dispatch.append("\t\t\t\t\tlogical_ids,")
             # Property args (read + write buffers)
-            tick_body.append(f"\t\t\t\t\t{','.join(args)},")
-            # Breed-local arrays and their index maps (with write buffers for double-buffered BLAs)
-            if breed_local_names:
-                bla_args = _gen_bla_step_func_args(breed_local_names, write_bla_names)
-                tick_body.append(f"\t\t\t\t\t{','.join(bla_args)},")
-            tick_body.append("\t\t\t\t)")
+            dispatch.append(f"\t\t\t\t\t{','.join(args)},")
+            # Breed-local arrays this step function declares, with their index maps
+            # (and write buffers for double-buffered ones)
+            step_bla_names = (bla_names_by_step or {}).get(step_func_name, breed_local_names)
+            if step_bla_names:
+                bla_args = _gen_bla_step_func_args(step_bla_names, write_bla_names)
+                dispatch.append(f"\t\t\t\t\t{','.join(bla_args)},")
+            dispatch.append("\t\t\t\t)")
 
             # Inject extra post-step code from subclass config
             if extra_kernel_config:
@@ -3083,11 +3502,15 @@ def generate_gpu_func(
                     if once_per_breed and breedidx in _extra_seen_breeds:
                         continue
                     for line in code_lines:
-                        tick_body.append(f"\t\t\t\t{line}")
+                        dispatch.append(f"\t\t\t\t{line}")
                     if once_per_breed:
                         _extra_seen_breeds.add(breedidx)
+        tick_body += [extra + line for line in dispatch]
 
-        tick_body.append("\t\t\tagent_index = agent_index + total_threads")
+        if woken:
+            tick_body.append(f"\t\t\t_wq = _wq + total_threads")
+        else:
+            tick_body.append("\t\t\tagent_index = agent_index + total_threads")
 
         # Grid barrier after this priority
         is_last_priority = (priority_idx == len(breed_idx_2_step_func_by_priority) - 1)
@@ -3125,23 +3548,39 @@ def generate_gpu_func(
 
             tick_body.append("\t\t\tagent_index = agent_index + total_threads")
 
-        # Breed-local array write-back
+        # Breed-local array write-back; a reduce inbox is drained after the copy so
+        # next tick's deposits start from zero
         for bla_name in writeback_blas:
             shape = write_bla_shapes[bla_name]
+            drain = bla_name in (reduce_bla_names or set())
             tick_body.append("")
             tick_body.append(f"\t\t_bla_row = thread_id")
             tick_body.append(f"\t\twhile _bla_row < {bla_name}_nrows:")
             if len(shape) == 1:
                 tick_body.append(f"\t\t\tfor _bla_j in range({shape[0]}):")
                 tick_body.append(f"\t\t\t\t{bla_name}[_bla_row][_bla_j] = write_{bla_name}[_bla_row][_bla_j]")
+                if drain:
+                    tick_body.append(f"\t\t\t\twrite_{bla_name}[_bla_row][_bla_j] = 0.0")
             elif len(shape) == 2:
                 tick_body.append(f"\t\t\tfor _bla_j in range({shape[0]}):")
                 tick_body.append(f"\t\t\t\tfor _bla_k in range({shape[1]}):")
                 tick_body.append(f"\t\t\t\t\t{bla_name}[_bla_row][_bla_j][_bla_k] = write_{bla_name}[_bla_row][_bla_j][_bla_k]")
             tick_body.append(f"\t\t\t_bla_row = _bla_row + total_threads")
 
+        # Wake queues are consumed (every priority ended with a barrier); empty them
+        # for the next tick's expansion under the write-back barrier.
+        if wake_config:
+            tick_body.append("\t\tif thread_id == 0:")
+            for p in sorted(wake_config):
+                tick_body.append(f"\t\t\twake_count_{p}[0] = 0")
         # Single barrier after all write-backs
         tick_body.append("")
+        tick_body += _gen_barrier_code("\t\t")
+    elif wake_config:
+        # No write-back phase: the reset needs its own barrier
+        tick_body.append("\t\tif thread_id == 0:")
+        for p in sorted(wake_config):
+            tick_body.append(f"\t\t\twake_count_{p}[0] = 0")
         tick_body += _gen_barrier_code("\t\t")
 
     joined_tick_body = "\n".join(tick_body)
@@ -3158,6 +3597,8 @@ def generate_gpu_func(
     func = [
         "# Auto-generated fused GPU kernel with grid barriers",
         "# All priorities and ticks in a single kernel launch",
+        "import numpy as _np",
+        "from cupyx import jit",
         "",
         step_sources,
         "",
@@ -3179,10 +3620,13 @@ def generate_gpu_func(
         "num_blocks_param,",
         *[f"{p}," for p in (extra_kernel_config or {}).get('extra_kernel_params', [])],
         *_gen_bla_kernel_params(breed_local_names, write_bla_names),
+        *_gen_wake_kernel_params(wake_config),
         "):",
         "\tthread_id = jit.blockIdx.x * jit.blockDim.x + jit.threadIdx.x",
         "\ttotal_threads = jit.gridDim.x * jit.blockDim.x",
         "\tbarrier_id = 0",
+        # per-block scratch for the wake expansion: [queue base, rev start, rev end]
+        "\t_wsh = jit.shared_memory(_np.int32, 4)" if wake_config else "",
         "",
         "\tfor tick in range(sync_workers_every_n_ticks):",
         "\t\tthread_local_tick = int(global_tick) + tick",

@@ -348,6 +348,13 @@ class GPUBufferManager:
         self.seed_gpu = None            # CuPy int32 scalar for framework-managed seed
         self.hash_map = None            # GPUHashMap instance
         self.barrier_counter = None     # CuPy uint32[1] for fused-kernel grid barrier
+        # Event wake-lists (Model.configure_wake), keyed by priority value
+        self.wake_stamps = {}           # priority -> CuPy int32[capacity]: last tick each row ran there (-1 never)
+        self.wake_queues = {}           # priority -> CuPy int32 queue of buffer rows to step
+        self.wake_counts = {}           # priority -> CuPy int32[1] queue length
+        self.wake_emitters = {}         # priority -> CuPy int32 rows whose events wake someone
+        self.wake_rev_offsets = {}      # priority -> CuPy int32 CSR offsets over wake_emitters
+        self.wake_rev_values = {}       # priority -> CuPy int32 dependants (rows of woken breeds)
 
         # Capacity tracking
         self.agent_capacity = 0         # Max agents property tensors can hold
@@ -364,7 +371,8 @@ class GPUBufferManager:
         self.breed_ranges = {}     # breed_id -> (start, count)
 
     def allocate_property_tensors(self, num_properties, combined_lists, agent_capacity,
-                                  convert_to_padded_func, interned=None, intern_func=None):
+                                  convert_to_padded_func, interned=None, intern_func=None,
+                                  empty_shapes=None):
         """Allocate property tensor GPU arrays with slack capacity.
 
         :param num_properties: Number of agent properties
@@ -373,6 +381,9 @@ class GPUBufferManager:
         :param convert_to_padded_func: Function to convert ragged lists directly to padded GPU tensors
         :param interned: property indices stored as TableProperty (table + codes)
         :param intern_func: (prop_idx, column, capacity) -> (table_gpu, codes_gpu) for those
+        :param empty_shapes: per-property trailing shapes (rows x 2 dims, 0 = absent)
+            agreed across ranks in multi-rank runs, so a rank with no agents allocates
+            the shapes the shared kernel expects
         """
         self.agent_capacity = agent_capacity
         self.property_tensors = []
@@ -390,7 +401,11 @@ class GPUBufferManager:
                 padded = TableProperty(table, codes)
                 path = "table_codes"
             else:
-                padded = convert_to_padded_func(combined_lists[i], agent_capacity)
+                if empty_shapes is not None and not combined_lists[i]:
+                    padded = convert_to_padded_func(combined_lists[i], agent_capacity,
+                                                    width=tuple(int(d) for d in empty_shapes[i]))
+                else:
+                    padded = convert_to_padded_func(combined_lists[i], agent_capacity)
                 path = getattr(internal_utils, "LAST_CONVERSION_PATH", None)
             _elapsed = time.perf_counter() - _t0
             self.property_tensors.append(padded)

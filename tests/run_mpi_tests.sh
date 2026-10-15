@@ -25,6 +25,9 @@ read -r -a RANKS <<< "${RANKS[*]}"
 FILES=(
     tests/test_worker_sync.py
     tests/test_ghost_readback.py
+    tests/test_reduce_bla.py
+    tests/test_empty_rank.py
+    tests/test_wake_list.py
 )
 
 printf '%-34s' "test"

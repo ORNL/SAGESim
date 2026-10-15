@@ -57,6 +57,32 @@ def get_neighbor(agent_index, i, neighbor_offsets, neighbor_values):
     return neighbor_values[neighbor_offsets[agent_index] + i]
 
 
+# ─── Reduce inbox (push interaction) ───────────────────────────────────
+
+@jit.rawkernel(device="cuda")
+def deposit_to_agent(array, idx_map, target_agent_index, slot, value):
+    """
+    Add `value` into slot `slot` of another agent's row of a reduce breed-local array
+    (one registered with reduce="sum"). This is the only sanctioned way for an agent
+    to affect another agent's data: an atomic add into the array's write buffer, which
+    the framework copies to the read buffer and clears at the end of the tick. The
+    target reads its row next tick; readers and depositors never touch the same buffer.
+
+    Usage in a step function that declares the array:
+        deposit_to_agent(inbox, inbox_idx, neighbor_index, 0, contribution)
+
+    The generated code rewrites the first argument to the write buffer; pass the array
+    by its parameter name. A target without a row in this array (an agent of another
+    breed, or a ghost of a non-neighbor_visible array) is ignored.
+    """
+    target = int(target_agent_index)
+    if target < 0:          # "no neighbour" sentinel: nowhere to deposit
+        return
+    row = idx_map[target]
+    if row >= 0:
+        jit.atomic_add(array, (int(row), int(slot)), value)
+
+
 # ─── Legacy Utility Functions ──────────────────────────────────────────
 
 @jit.rawkernel(device="cuda")

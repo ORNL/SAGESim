@@ -257,8 +257,13 @@ def _identity_groups(ragged_list):
     return rows, inverse
 
 
-def convert_to_padded_gpu_tensor(ragged_list, capacity):
-    """Convert ragged list directly to padded GPU tensor (single allocation)."""
+def convert_to_padded_gpu_tensor(ragged_list, capacity, width=None):
+    """Convert ragged list directly to padded GPU tensor (single allocation).
+
+    `width`: the property's row width agreed across ranks. Only an empty column
+    needs it (a rank with no agents still has to allocate the 2-D shape the kernel
+    was compiled for); non-empty columns carry their own width.
+    """
     global LAST_CONVERSION_PATH
     LAST_CONVERSION_PATH = None
     # A column already held as a padded array (bulk load or GPU->host sync) is one
@@ -275,6 +280,12 @@ def convert_to_padded_gpu_tensor(ragged_list, capacity):
         return ragged_list.to_device(capacity)
     if not ragged_list:
         LAST_CONVERSION_PATH = "empty"
+        # `width` is the agreed trailing shape: () for scalar rows (1-D tensor, as the
+        # scalar path below builds), (w,) for list rows even when w == 1 (the padded
+        # path builds (capacity, w)), (slots, w) for history buffers.
+        dims = () if width is None else tuple(int(d) for d in np.atleast_1d(width) if int(d) > 0)
+        if dims:
+            return cp.zeros((capacity, *dims), dtype=np.float32)
         return cp.zeros(capacity, dtype=np.float32)
 
     # Fast path: the column is a handful of shared row objects repeated. Pad only the

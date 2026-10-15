@@ -48,7 +48,10 @@ class AgentFactory:
         self._neighbor_visible_indices: List[int] = []  # Cached list of neighbor-visible property indices
         self._agent2rank = {}  # global
         self._agent2breed = {}  # global: agent_id -> breed_id (populated by all ranks)
-        self._rank2agentid2agentidx = {}  # global
+        # global; every rank gets an entry up front so a rank that ends up with no
+        # agents (post-owns placement of a tiny network on many ranks, or a sparse
+        # partition) still takes part in every collective instead of raising KeyError
+        self._rank2agentid2agentidx = {r: OrderedDict() for r in range(num_workers)}
 
         self._current_rank = 0
         # Set by the columnar bulk build (Model.build_from_local_columns), which
