@@ -122,6 +122,18 @@ The add order is fixed (local total first, then peers in rank order), but the at
 adds inside a rank are not, so a reduce inbox is reproducible only up to float
 rounding order (see SuperNeuroABM's `docs/EVENT_DRIVEN_NOTES.md`, section 8).
 
+**One buffer per direction, however many peers.** Pack, unpack and the reverse exchange
+each cost a fixed number of device operations per tick: every field (visible property or
+breed-local array) is gathered with one `take` into its segment of a *field-major*
+device buffer, that buffer is permuted once into a *peer-major* one whose per-peer
+slices are the messages, and (without GPU-aware MPI) copied once into a pinned host
+buffer that `Isend` reads; the receive side mirrors it with one `set`, one inverse
+permutation and one scatter per field. The permutation is planned at setup
+(`plan_exchange_layout`), and a reduce array's deposits from several peers into one
+row are summed by a segmented kernel in peer order, bitwise what adding each peer's
+chunk in turn gave. Before this (2026-10-15) the exchange did O(peers x fields) slice
+copies and two device syncs per peer per tick, about 1 ms per peer on a laptop.
+
 ---
 
 ## Phase 2: Data Preparation (CPU → GPU)

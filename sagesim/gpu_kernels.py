@@ -11,6 +11,7 @@ from sagesim import internal_utils
 
 import numpy as np
 import cupy as cp
+import cupyx
 from mpi4py import MPI
 
 
@@ -33,6 +34,70 @@ def is_gpu_aware_mpi():
     if os.environ.get('SAGESIM_GPU_AWARE_MPI', '0') == '1':
         return True
     return False
+
+
+def plan_exchange_layout(fields, peer_order):
+    """Two orders of one flat buffer that carries several fields to several peers.
+
+    ``fields`` is ``[(width, {peer: rows}), ...]`` in field order and ``peer_order`` the
+    peers in message order. Field-major puts a field's rows for every peer together,
+    peers in message order: what one gather per field over the concatenated row
+    indices produces. Peer-major puts a peer's fields together, fields in field order:
+    what one contiguous message per peer needs. Returns
+    ``(total, field_offsets, peer_offsets, peer_sizes, perm)`` with
+    ``field_offsets[f] = (offset, rows)`` in the field-major buffer, ``peer_offsets[r]``
+    and ``peer_sizes[r]`` in the peer-major one, and ``perm`` (int32) such that
+    ``peer_major = field_major[perm]`` and ``field_major = peer_major[argsort(perm)]``.
+    """
+    field_offsets, peer_offsets, peer_sizes = [], {}, {}
+    pos = 0
+    for width, counts in fields:
+        rows = sum(int(counts.get(r, 0)) for r in peer_order)
+        field_offsets.append((pos, rows))
+        pos += rows * width
+    total = pos
+    pos = 0
+    for r in peer_order:
+        peer_offsets[r] = pos
+        peer_sizes[r] = sum(int(c.get(r, 0)) * w for w, c in fields)
+        pos += peer_sizes[r]
+    perm = np.empty(total, dtype=np.int32)
+    cursor = [off for off, _ in field_offsets]      # next free position of each field (field-major)
+    pos = 0                                         # next free position (peer-major)
+    for r in peer_order:
+        for f, (width, counts) in enumerate(fields):
+            n = int(counts.get(r, 0)) * width
+            perm[pos:pos + n] = np.arange(cursor[f], cursor[f] + n, dtype=np.int32)
+            cursor[f] += n
+            pos += n
+    return total, field_offsets, peer_offsets, peer_sizes, perm
+
+
+_segmented_add_kernel = None
+
+
+def _segmented_add():
+    """Kernel: arr[rows[u]] += contrib[offsets[u]:offsets[u+1]] summed in that order,
+    starting from the row's current value -- the same float operations in the same
+    order as adding each peer's chunk to the row in turn, so a reduce exchange gives
+    bitwise the same sum however many peers deposit into one row. `arr` and `contrib`
+    are (rows, stride) C-contiguous float32; launched with size = len(rows) * stride."""
+    global _segmented_add_kernel
+    if _segmented_add_kernel is None:
+        _segmented_add_kernel = cp.ElementwiseKernel(
+            'raw float32 contrib, raw int32 offsets, raw int32 rows, int32 stride',
+            'raw float32 arr',
+            '''
+            const int u = i / stride, j = i - u * stride;
+            const long long dst = (long long) rows[u] * stride + j;
+            float s = arr[dst];
+            for (int k = offsets[u]; k < offsets[u + 1]; ++k) {
+                s += contrib[(long long) k * stride + j];
+            }
+            arr[dst] = s;
+            ''',
+            'sagesim_segmented_add')
+    return _segmented_add_kernel
 
 
 def _resolve_neighbor_ranks(neighbor_ids, agent2rank, local_ids=None, my_rank=-1):
@@ -610,19 +675,19 @@ class CommunicationManager:
         self.property_widths = {}
         self.total_stride = 0
 
-        # Pre-allocated buffers (one per peer rank)
-        self.send_bufs_cpu = {}
-        self.recv_bufs_cpu = {}
-        self.send_bufs_gpu = {}
-        self.recv_bufs_gpu = {}  # GPU recv buffers for GPU-aware MPI path
+        # One buffer per direction for every peer (see _plan_buffers): a field-major
+        # device copy that one gather per field fills, a peer-major copy that is the
+        # concatenation of every peer's message, the permutation between them and,
+        # without GPU-aware MPI, a pinned host copy of the peer-major one. The tick
+        # then costs a fixed number of device operations however many peers there are.
+        self._fwd = None      # {'send': plan, 'recv': plan} for visible properties + plain BLAs
+        self._rev = None      # the same for reduce BLAs, roles swapped
 
         # Batched index arrays (concatenated across all peers)
         self._batched_send_indices_gpu = None  # CuPy int32, all send indices
         self._batched_recv_indices_gpu = None  # CuPy int32, all recv indices
         self._send_peer_order = []             # ordered list of dest ranks
         self._recv_peer_order = []             # ordered list of src ranks
-        self._send_splits = []                 # cumulative split points for send
-        self._recv_splits = []                 # cumulative split points for recv
 
         # Write-buffer ghost index (concatenated recv indices for write props)
         self._write_prop_mask = []  # indices into buf.sorted_write_indices that are visible
@@ -915,53 +980,15 @@ class CommunicationManager:
 
         self._bla_initialized = any(c is not None for c in self._bla_configs)
 
-        # 7. Pre-allocate send/recv CPU and GPU buffers (includes BLA data)
-        self.send_bufs_cpu = {}
-        self.send_bufs_gpu = {}
-        self.recv_bufs_cpu = {}
-        self.recv_bufs_gpu = {}
-
-        for dest_rank, count in self.send_counts.items():
-            size = count * self.total_stride + self._bla_extra_send_size.get(dest_rank, 0)
-            self.send_bufs_gpu[dest_rank] = cp.empty(size, dtype=cp.float32)
-            if not self._gpu_aware_mpi:
-                self.send_bufs_cpu[dest_rank] = np.empty(size, dtype=np.float32)
-
-        for src_rank, count in self.recv_counts.items():
-            size = count * self.total_stride + self._bla_extra_recv_size.get(src_rank, 0)
-            if self._gpu_aware_mpi:
-                self.recv_bufs_gpu[src_rank] = cp.empty(size, dtype=cp.float32)
-            else:
-                self.recv_bufs_cpu[src_rank] = np.empty(size, dtype=np.float32)
-
-        # ---- Build batched (concatenated) index arrays ----
-        # Send: concatenate all per-peer send indices into one array
+        # ---- Build batched (concatenated) index arrays, peers in message order ----
         self._send_peer_order = sorted(self.send_indices_gpu.keys())
         send_parts = [self.send_indices_gpu[r] for r in self._send_peer_order]
-        if send_parts:
-            self._batched_send_indices_gpu = cp.concatenate(send_parts)
-            cumulative = 0
-            self._send_splits = []
-            for r in self._send_peer_order:
-                cumulative += self.send_counts[r]
-                self._send_splits.append(cumulative)
-        else:
-            self._batched_send_indices_gpu = cp.array([], dtype=cp.int32)
-            self._send_splits = []
-
-        # Recv: concatenate all per-peer recv indices into one array
+        self._batched_send_indices_gpu = (cp.concatenate(send_parts) if send_parts
+                                          else cp.array([], dtype=cp.int32))
         self._recv_peer_order = sorted(self.recv_indices_gpu.keys())
         recv_parts = [self.recv_indices_gpu[r] for r in self._recv_peer_order]
-        if recv_parts:
-            self._batched_recv_indices_gpu = cp.concatenate(recv_parts)
-            cumulative = 0
-            self._recv_splits = []
-            for r in self._recv_peer_order:
-                cumulative += self.recv_counts[r]
-                self._recv_splits.append(cumulative)
-        else:
-            self._batched_recv_indices_gpu = cp.array([], dtype=cp.int32)
-            self._recv_splits = []
+        self._batched_recv_indices_gpu = (cp.concatenate(recv_parts) if recv_parts
+                                          else cp.array([], dtype=cp.int32))
 
         # Pre-compute which write-buffer indices are also visible (for ghost sync)
         visible_set = set(self.property_widths.keys())
@@ -970,58 +997,116 @@ class CommunicationManager:
             if prop_idx in visible_set
         ]
 
-        # Pre-compute cumulative width offsets per property (for unpack slicing)
-        self._prop_cum_widths = {}
-        cum = 0
-        for prop_idx in self.visible_prop_indices:
-            self._prop_cum_widths[prop_idx] = cum
-            cum += self.property_widths[prop_idx]
-
-        # Build batched BLA index arrays (for ONE gather/scatter per BLA)
+        # Batched BLA row arrays (one gather / scatter per BLA), peers in message order
         if self._bla_initialized:
             for bla_i, cfg in enumerate(self._bla_configs):
                 if cfg is None:
                     continue
                 cfg['batched_send_rows_per_peer'] = dict(cfg['bla_send_rows_per_peer'])
                 cfg['batched_recv_rows_per_peer'] = dict(cfg['bla_recv_rows_per_peer'])
-                # Batched send rows
                 send_parts = [cfg['bla_send_rows_per_peer'].get(r, np.array([], dtype=np.int32))
                               for r in self._send_peer_order]
-                if any(len(p) > 0 for p in send_parts):
-                    cfg['batched_send_rows'] = cp.array(
-                        np.concatenate(send_parts), dtype=cp.int32)
-                    send_splits = []
-                    c = 0
-                    for r in self._send_peer_order:
-                        c += cfg['send_counts'].get(r, 0)
-                        send_splits.append(c)
-                    cfg['send_splits'] = send_splits
-                else:
-                    cfg['batched_send_rows'] = cp.array([], dtype=cp.int32)
-                    cfg['send_splits'] = []
-
-                # Batched recv rows
+                cfg['batched_send_rows'] = cp.array(
+                    np.concatenate(send_parts) if send_parts else np.array([], dtype=np.int32),
+                    dtype=cp.int32)
                 recv_parts = [cfg['bla_recv_rows_per_peer'].get(r, np.array([], dtype=np.int32))
                               for r in self._recv_peer_order]
-                if any(len(p) > 0 for p in recv_parts):
-                    cfg['batched_recv_rows'] = cp.array(
-                        np.concatenate(recv_parts), dtype=cp.int32)
-                    recv_splits = []
-                    c = 0
-                    for r in self._recv_peer_order:
-                        c += cfg['recv_counts'].get(r, 0)
-                        recv_splits.append(c)
-                    cfg['recv_splits'] = recv_splits
-                else:
-                    cfg['batched_recv_rows'] = cp.array([], dtype=cp.int32)
-                    cfg['recv_splits'] = []
-
-                # Remove temporary per-peer dicts (no longer needed)
+                cfg['batched_recv_rows'] = cp.array(
+                    np.concatenate(recv_parts) if recv_parts else np.array([], dtype=np.int32),
+                    dtype=cp.int32)
                 del cfg['bla_send_rows_per_peer']
                 del cfg['bla_recv_rows_per_peer']
 
+        self._plan_forward_buffers()
         self._build_reverse_maps()
         self._is_initialized = True
+
+    # ---- One buffer per direction, two orders of it ----
+    #
+    # Per tick the exchange used to do one gather per field and then, per peer, a
+    # slice copy per field, a device-to-host copy, and on the way back per peer and per
+    # field a slice, a concatenate and a scatter: O(peers x fields) small device
+    # operations and 2 x peers device syncs, about 1 ms per peer on a laptop (notes in
+    # SuperNeuroABM's EVENT_DRIVEN_NOTES section 16). Now the fields are gathered into
+    # ONE field-major buffer (one `take` per field, into a view), permuted ONCE into a
+    # peer-major buffer whose per-peer slices are the messages, copied to the host ONCE
+    # (without GPU-aware MPI); the receive side mirrors it. The permutation is planned
+    # at setup (plan_exchange_layout).
+
+    def _plan_forward_buffers(self):
+        """Forward direction: visible properties (every peer's rows), then plain
+        breed-local arrays, in the order the per-peer messages used to carry them."""
+        buf = self.buf
+        fields, send_counts, recv_counts = [], [], []
+        for prop_idx in self.visible_prop_indices:
+            tensor = buf.property_tensors[prop_idx]
+            if tensor is None:
+                continue
+            tail = tuple(tensor.shape[1:])
+            fields.append(('prop', prop_idx, int(np.prod(tail)) if tail else 1, tail))
+            send_counts.append(dict(self.send_counts))
+            recv_counts.append(dict(self.recv_counts))
+        for bla_i, cfg in enumerate(self._bla_configs):
+            if cfg is None or cfg['reduce']:
+                continue
+            fields.append(('bla', bla_i, cfg['stride'], tuple(cfg['shape_per_agent'])))
+            send_counts.append(dict(cfg['send_counts']))
+            recv_counts.append(dict(cfg['recv_counts']))
+        self._fwd = {'send': self._plan_buffers(fields, send_counts, self._send_peer_order),
+                     'recv': self._plan_buffers(fields, recv_counts, self._recv_peer_order)}
+
+    def _plan_buffers(self, fields, counts, peer_order):
+        """Buffers and index plan for one direction. `fields[i]` is (kind, key, width,
+        shape_tail) with per-peer row counts `counts[i]`; the plan carries the two device
+        buffers, the permutation both ways, the per-peer message slices of the
+        peer-major buffer and, without GPU-aware MPI, a pinned host copy."""
+        total, field_off, peer_off, peer_size, perm = plan_exchange_layout(
+            [(f[2], c) for f, c in zip(fields, counts)], peer_order)
+        return {
+            'total': total, 'peer_off': peer_off, 'peer_size': peer_size,
+            'fields': [(kind, key, width, tail, off, rows)
+                       for (kind, key, width, tail), (off, rows) in zip(fields, field_off)],
+            'A': cp.empty(total, dtype=cp.float32),                       # field-major
+            'B': cp.empty(total, dtype=cp.float32),                       # peer-major
+            'perm': cp.asarray(perm),                                     # B = A[perm]
+            'inv': cp.asarray(np.argsort(perm, kind='stable').astype(np.int32)),   # A = B[inv]
+            'host': None if self._gpu_aware_mpi else cupyx.empty_pinned((total,), dtype=np.float32),
+        }
+
+    def _field_source(self, kind, key):
+        buf = self.buf
+        return buf.property_tensors[key] if kind == 'prop' else buf.device_breed_locals[key]
+
+    @staticmethod
+    def _gather_fields(plan, source_of, rows_of):
+        """plan['A'][field segment] = source[rows] for every field: one `take` into a view."""
+        A = plan['A']
+        for kind, key, width, tail, off, rows in plan['fields']:
+            if rows == 0:
+                continue
+            out = A[off:off + rows * width]
+            if tail:
+                out = out.reshape((rows,) + tail)
+            cp.take(source_of(kind, key), rows_of(kind, key), axis=0, out=out)
+
+    @staticmethod
+    def _scatter_fields(plan, target_of, rows_of):
+        """target[rows] = plan['A'][field segment] for every field: one scatter each."""
+        A = plan['A']
+        for kind, key, width, tail, off, rows in plan['fields']:
+            if rows == 0:
+                continue
+            seg = A[off:off + rows * width]
+            if tail:
+                seg = seg.reshape((rows,) + tail)
+            target_of(kind, key)[rows_of(kind, key)] = seg
+
+    @staticmethod
+    def _message(plan, r):
+        """The slice of the peer-major buffer (device, or its host copy) that is peer r's message."""
+        buf = plan['B'] if plan['host'] is None else plan['host']
+        off = plan['peer_off'][r]
+        return buf[off:off + plan['peer_size'][r]]
 
     # ---- Reduce-back-to-owner exchange for reduce breed-local arrays ----
     #
@@ -1038,227 +1123,119 @@ class CommunicationManager:
         self._rev_cfgs = [cfg for cfg in self._bla_configs if cfg is not None and cfg['reduce']]
         self._rev_send_peers = list(self._recv_peer_order)
         self._rev_recv_peers = list(self._send_peer_order)
-        self._rev_send_size = {r: 0 for r in self._rev_send_peers}
-        self._rev_recv_size = {r: 0 for r in self._rev_recv_peers}
+        fields, send_counts, recv_counts = [], [], []
         for cfg in self._rev_cfgs:
             stride = cfg['stride']
-            # ghost rows, grouped by owner peer in _rev_send_peers order
+            # ghost rows this rank holds, grouped by owner peer in _rev_send_peers order
             parts = [cfg['batched_recv_rows_per_peer'].get(r, np.array([], dtype=np.int32))
                      for r in self._rev_send_peers]
             cfg['rev_send_rows'] = cp.array(np.concatenate(parts) if parts else np.array([], dtype=np.int32),
                                             dtype=cp.int32)
             cfg['rev_send_counts'] = {r: int(cfg['recv_counts'].get(r, 0)) for r in self._rev_send_peers}
-            # my own rows that each ghost-holding peer deposits into
-            cfg['rev_recv_rows'] = {r: cp.array(cfg['batched_send_rows_per_peer'].get(r, np.array([], dtype=np.int32)),
-                                                dtype=cp.int32)
-                                    for r in self._rev_recv_peers}
+            # my own rows the peers deposit into, peer by peer in _rev_recv_peers order; a
+            # row may be deposited into by several peers, so the add is a segmented sum
+            # over its contributions in that order (bitwise what adding each peer's chunk
+            # in turn gave): stable sort of the rows, one segment per distinct row
+            rows_parts = [np.asarray(cfg['batched_send_rows_per_peer'].get(r, np.array([], dtype=np.int32)),
+                                     dtype=np.int32) for r in self._rev_recv_peers]
+            rows = np.concatenate(rows_parts) if rows_parts else np.array([], dtype=np.int32)
             cfg['rev_recv_counts'] = {r: int(cfg['send_counts'].get(r, 0)) for r in self._rev_recv_peers}
-            for r in self._rev_send_peers:
-                self._rev_send_size[r] += cfg['rev_send_counts'][r] * stride
-            for r in self._rev_recv_peers:
-                self._rev_recv_size[r] += cfg['rev_recv_counts'][r] * stride
+            order = np.argsort(rows, kind='stable')
+            uniq, counts = np.unique(rows[order], return_counts=True)
+            cfg['rev_add'] = {
+                'order': cp.asarray(order.astype(np.int32)),
+                'rows': cp.asarray(uniq.astype(np.int32)),
+                'offsets': cp.asarray(np.concatenate([[0], np.cumsum(counts)]).astype(np.int32)),
+                'n_uniq': int(uniq.size),
+                'contrib': cp.empty((int(rows.size), stride), dtype=cp.float32),
+            }
+            fields.append(('bla', cfg['bla_i'], stride, tuple(cfg['shape_per_agent'])))
+            send_counts.append(cfg['rev_send_counts'])
+            recv_counts.append(cfg['rev_recv_counts'])
             del cfg['batched_recv_rows_per_peer'], cfg['batched_send_rows_per_peer']
-        self._rev_send_bufs_gpu, self._rev_send_bufs_cpu = {}, {}
-        self._rev_recv_bufs_gpu, self._rev_recv_bufs_cpu = {}, {}
-        for r, size in self._rev_send_size.items():
-            if size:
-                self._rev_send_bufs_gpu[r] = cp.empty(size, dtype=cp.float32)
-                if not self._gpu_aware_mpi:
-                    self._rev_send_bufs_cpu[r] = np.empty(size, dtype=np.float32)
-        for r, size in self._rev_recv_size.items():
-            if size:
-                if self._gpu_aware_mpi:
-                    self._rev_recv_bufs_gpu[r] = cp.empty(size, dtype=cp.float32)
-                else:
-                    self._rev_recv_bufs_cpu[r] = np.empty(size, dtype=np.float32)
-        self._rev_initialized = bool(self._rev_send_bufs_gpu or self._rev_recv_bufs_gpu
-                                     or self._rev_recv_bufs_cpu)
+        self._rev = None
+        if fields:
+            self._rev = {'send': self._plan_buffers(fields, send_counts, self._rev_send_peers),
+                         'recv': self._plan_buffers(fields, recv_counts, self._rev_recv_peers)}
+        self._rev_initialized = bool(self._rev and (self._rev['send']['total'] or self._rev['recv']['total']))
 
     def _reverse_exchange(self):
         """Ghost rows of every reduce array -> their owner, added into the owner's row."""
         if not getattr(self, '_rev_initialized', False):
             return
         buf = self.buf
-        # pack: one gather per array over all its ghost rows, split per owner peer
-        offsets = {r: 0 for r in self._rev_send_peers}
-        for cfg in self._rev_cfgs:
-            rows = cfg['rev_send_rows']
-            if len(rows) == 0:
-                continue
-            stride = cfg['stride']
-            gathered = buf.device_breed_locals[cfg['bla_i']][rows].ravel()
-            start = 0
-            for r in self._rev_send_peers:
-                m = cfg['rev_send_counts'][r]
-                if m == 0:
-                    continue
-                off = offsets[r]
-                self._rev_send_bufs_gpu[r][off:off + m * stride] = \
-                    gathered[start * stride:(start + m) * stride]
-                offsets[r] = off + m * stride
-                start += m
-        requests = []
-        if self._gpu_aware_mpi:
-            if self._rev_send_bufs_gpu:
+        send, recv = self._rev['send'], self._rev['recv']
+        if send['total']:
+            self._gather_fields(send, self._field_source,
+                                lambda kind, key: self._bla_configs[key]['rev_send_rows'])
+            cp.take(send['A'], send['perm'], out=send['B'])
+            if send['host'] is not None:
+                send['B'].get(out=send['host'])
+            else:
                 cp.cuda.get_current_stream().synchronize()
-            for r, sbuf in self._rev_send_bufs_gpu.items():
-                requests.append(self.comm.Isend([sbuf, MPI.FLOAT], dest=r, tag=2))
-            for r, rbuf in self._rev_recv_bufs_gpu.items():
-                requests.append(self.comm.Irecv([rbuf, MPI.FLOAT], source=r, tag=2))
-        else:
-            for r, sbuf in self._rev_send_bufs_gpu.items():
-                self._rev_send_bufs_cpu[r][:] = sbuf.get()
-                requests.append(self.comm.Isend([self._rev_send_bufs_cpu[r], MPI.FLOAT], dest=r, tag=2))
-            for r, rbuf in self._rev_recv_bufs_cpu.items():
-                requests.append(self.comm.Irecv([rbuf, MPI.FLOAT], source=r, tag=2))
+        # a pair exchanges a message only when it has rows for it, on both sides alike
+        requests = []
+        for r in self._rev_send_peers:
+            if send['peer_size'][r]:
+                requests.append(self.comm.Isend([self._message(send, r), MPI.FLOAT], dest=r, tag=2))
+        for r in self._rev_recv_peers:
+            if recv['peer_size'][r]:
+                requests.append(self.comm.Irecv([self._message(recv, r), MPI.FLOAT], source=r, tag=2))
         if requests:
             MPI.Request.Waitall(requests)
-        # unpack: add each peer's deposits into my rows (rows are unique within a peer,
-        # peers are applied one after another, so the order is fixed and the sum exact
-        # up to float rounding in that order)
-        for r in self._rev_recv_peers:
-            if self._rev_recv_size.get(r, 0) == 0:
-                continue
-            data = (self._rev_recv_bufs_gpu[r] if self._gpu_aware_mpi
-                    else cp.asarray(self._rev_recv_bufs_cpu[r]))
-            off = 0
-            for cfg in self._rev_cfgs:
-                m = cfg['rev_recv_counts'][r]
-                if m == 0:
+        if recv['total']:
+            if recv['host'] is not None:
+                recv['B'].set(recv['host'])
+            cp.take(recv['B'], recv['inv'], out=recv['A'])
+            seg_add = _segmented_add()
+            for (kind, key, width, tail, off, rows), cfg in zip(recv['fields'], self._rev_cfgs):
+                if rows == 0:
                     continue
-                stride = cfg['stride']
-                chunk = data[off:off + m * stride].reshape(m, *cfg['shape_per_agent'])
-                arr = buf.device_breed_locals[cfg['bla_i']]
-                rows = cfg['rev_recv_rows'][r]
-                arr[rows] = arr[rows] + chunk
-                off += m * stride
+                add = cfg['rev_add']
+                seg = recv['A'][off:off + rows * width].reshape(rows, width)
+                cp.take(seg, add['order'], axis=0, out=add['contrib'])
+                seg_add(add['contrib'], add['offsets'], add['rows'], np.int32(width),
+                        buf.device_breed_locals[cfg['bla_i']], size=add['n_uniq'] * width)
 
     def _batched_gpu_pack(self):
-        """Pack all peers' data with ONE gather per property, then split for MPI.
-
-        For each property, does ONE GPU fancy-index gather using concatenated
-        send indices, then splits the result per-peer and writes into the
-        correct offset within each peer's send buffer.  This keeps the per-peer
-        buffer layout (agent-grouped: [prop0(n), prop1(n), ...]) intact while
-        reducing GPU gathers from V*P to V.
-        """
-        all_indices = self._batched_send_indices_gpu
-        total_n = len(all_indices)
-        if total_n == 0:
+        """Every peer's message in one go: one gather per field into the field-major
+        buffer, one permutation into the peer-major buffer, one copy to the host
+        (without GPU-aware MPI). Independent of the number of peers."""
+        plan = self._fwd['send']
+        if plan['total'] == 0:
             return
-
-        # Track per-peer write offset into send buffers
-        peer_offsets = {r: 0 for r in self._send_peer_order}
-
-        for prop_idx in self.visible_prop_indices:
-            width = self.property_widths[prop_idx]
-            # ONE gather for all peers
-            gathered = self.buf.property_tensors[prop_idx][all_indices].ravel()
-            # Split per-peer and write into per-peer send buffers
-            agent_start = 0
-            for i, dest_rank in enumerate(self._send_peer_order):
-                n = self.send_counts[dest_rank]
-                chunk = gathered[agent_start * width:(agent_start + n) * width]
-                off = peer_offsets[dest_rank]
-                self.send_bufs_gpu[dest_rank][off:off + n * width] = chunk
-                peer_offsets[dest_rank] = off + n * width
-                agent_start += n
-
-        # Pack breed-local array data (appended after property data)
-        if self._bla_initialized:
-            for bla_i, cfg in enumerate(self._bla_configs):
-                if cfg is None or cfg['reduce']:
-                    continue
-                batched_rows = cfg['batched_send_rows']
-                if len(batched_rows) == 0:
-                    continue
-                stride = cfg['stride']
-                # ONE gather from breed-local array
-                gathered = self.buf.device_breed_locals[bla_i][batched_rows].ravel()
-                # Split per-peer and append to send buffers
-                agent_start = 0
-                for j, dest_rank in enumerate(self._send_peer_order):
-                    m = cfg['send_counts'].get(dest_rank, 0)
-                    if m == 0:
-                        continue
-                    chunk = gathered[agent_start * stride:(agent_start + m) * stride]
-                    off = peer_offsets[dest_rank]
-                    self.send_bufs_gpu[dest_rank][off:off + m * stride] = chunk
-                    peer_offsets[dest_rank] = off + m * stride
-                    agent_start += m
-
-        # CPU staging: one .get() per peer
-        if not self._gpu_aware_mpi:
-            for dest_rank in self._send_peer_order:
-                self.send_bufs_cpu[dest_rank][:] = self.send_bufs_gpu[dest_rank].get()
+        self._gather_fields(
+            plan, self._field_source,
+            lambda kind, key: (self._batched_send_indices_gpu if kind == 'prop'
+                               else self._bla_configs[key]['batched_send_rows']))
+        cp.take(plan['A'], plan['perm'], out=plan['B'])
+        if plan['host'] is not None:
+            plan['B'].get(out=plan['host'])
 
     def mpi_exchange(self):
-        """Non-blocking buffer-protocol MPI send/recv (no pickle).
-
-        With GPU-aware MPI: passes CuPy device pointers directly to Isend/Irecv.
-        Data moves GPU->NIC->GPU via GPU-Direct RDMA without CPU staging.
-        Without GPU-aware MPI: falls back to CPU-staged numpy buffers.
-        """
+        """Non-blocking buffer-protocol MPI send/recv (no pickle), one message per peer:
+        a slice of the peer-major buffer, on the device with GPU-aware MPI (GPU-Direct
+        RDMA, no staging) and of its pinned host copy otherwise."""
+        send, recv = self._fwd['send'], self._fwd['recv']
         if not self._verbose_timing:
-            # Fast path: no timing overhead
-            requests = []
-            if self._gpu_aware_mpi:
-                # GPU-aware path: MPI reads/writes GPU memory directly
-                for dest_rank in self._send_peer_order:
-                    sbuf = self.send_bufs_gpu[dest_rank]
-                    requests.append(self.comm.Isend(
-                        [sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
-                for src_rank in self._recv_peer_order:
-                    rbuf = self.recv_bufs_gpu[src_rank]
-                    requests.append(self.comm.Irecv(
-                        [rbuf, MPI.FLOAT], source=src_rank, tag=1))
-            else:
-                # CPU staging path
-                for dest_rank in self._send_peer_order:
-                    sbuf = self.send_bufs_cpu[dest_rank]
-                    requests.append(self.comm.Isend(
-                        [sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
-                for src_rank in self._recv_peer_order:
-                    rbuf = self.recv_bufs_cpu[src_rank]
-                    requests.append(self.comm.Irecv(
-                        [rbuf, MPI.FLOAT], source=src_rank, tag=1))
+            requests = [self.comm.Isend([self._message(send, r), MPI.FLOAT], dest=r, tag=1)
+                        for r in self._send_peer_order]
+            requests += [self.comm.Irecv([self._message(recv, r), MPI.FLOAT], source=r, tag=1)
+                         for r in self._recv_peer_order]
             MPI.Request.Waitall(requests)
         else:
-            # Verbose path: detailed timing
             import time
             t_isend_start = time.perf_counter()
-            send_requests = []
-            if self._gpu_aware_mpi:
-                for dest_rank in self._send_peer_order:
-                    sbuf = self.send_bufs_gpu[dest_rank]
-                    send_requests.append(self.comm.Isend(
-                        [sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
-            else:
-                for dest_rank in self._send_peer_order:
-                    sbuf = self.send_bufs_cpu[dest_rank]
-                    send_requests.append(self.comm.Isend(
-                        [sbuf, MPI.FLOAT], dest=dest_rank, tag=1))
+            send_requests = [self.comm.Isend([self._message(send, r), MPI.FLOAT], dest=r, tag=1)
+                             for r in self._send_peer_order]
             t_isend_end = time.perf_counter()
-
             t_irecv_start = time.perf_counter()
-            recv_requests = []
-            if self._gpu_aware_mpi:
-                for src_rank in self._recv_peer_order:
-                    rbuf = self.recv_bufs_gpu[src_rank]
-                    recv_requests.append(self.comm.Irecv(
-                        [rbuf, MPI.FLOAT], source=src_rank, tag=1))
-            else:
-                for src_rank in self._recv_peer_order:
-                    rbuf = self.recv_bufs_cpu[src_rank]
-                    recv_requests.append(self.comm.Irecv(
-                        [rbuf, MPI.FLOAT], source=src_rank, tag=1))
+            recv_requests = [self.comm.Irecv([self._message(recv, r), MPI.FLOAT], source=r, tag=1)
+                             for r in self._recv_peer_order]
             t_irecv_end = time.perf_counter()
-
             t_wait_start = time.perf_counter()
             MPI.Request.Waitall(send_requests + recv_requests)
             t_wait_end = time.perf_counter()
-
-            # Store detailed timing for retrieval by caller
             self._last_mpi_timing = {
                 'mpi_isend_overhead': t_isend_end - t_isend_start,
                 'mpi_irecv_overhead': t_irecv_end - t_irecv_start,
@@ -1266,88 +1243,25 @@ class CommunicationManager:
             }
 
     def _batched_gpu_unpack(self):
-        """Unpack all peers' data with ONE scatter per property.
-
-        Uploads received data to GPU (single transfer for CPU path), then for
-        each property extracts the correct slice from each peer's section,
-        concatenates on GPU, and does ONE scatter.  Per-peer buffers use
-        agent-grouped layout: [prop0(n), prop1(n), ...], so we use pre-computed
-        cumulative width offsets to find each property's data within each peer.
-        Also fuses write-buffer ghost sync into the same loop.
-        """
-        all_ghost_indices = self._batched_recv_indices_gpu
-        total_n = len(all_ghost_indices)
-        if total_n == 0:
+        """The mirror of the pack: one copy to the device (without GPU-aware MPI), one
+        permutation back to field-major, one scatter per field, plus the write-buffer
+        ghost sync for visible properties a kernel writes."""
+        plan = self._fwd['recv']
+        if plan['total'] == 0:
             return
-
-        # Get per-peer recv data on GPU (full buffer including BLA data)
-        if self._gpu_aware_mpi:
-            peer_recv_gpu = {r: self.recv_bufs_gpu[r] for r in self._recv_peer_order}
-        else:
-            # Single CPU→GPU upload for all peers
-            cpu_parts = [self.recv_bufs_cpu[r] for r in self._recv_peer_order]
-            combined = np.concatenate(cpu_parts) if len(cpu_parts) > 1 else cpu_parts[0]
-            all_recv_gpu = cp.array(combined)
-            # Split back into per-peer GPU views (full size including BLA)
-            peer_recv_gpu = {}
-            pos = 0
-            for r in self._recv_peer_order:
-                size = (self.recv_counts[r] * self.total_stride
-                        + self._bla_extra_recv_size.get(r, 0))
-                peer_recv_gpu[r] = all_recv_gpu[pos:pos + size]
-                pos += size
-
-        # One scatter per property into property_tensors
         buf = self.buf
-        for prop_idx in self.visible_prop_indices:
-            width = self.property_widths[prop_idx]
-            cum_w = self._prop_cum_widths[prop_idx]
-            chunks = []
-            for r in self._recv_peer_order:
-                n = self.recv_counts[r]
-                prop_start = n * cum_w
-                chunks.append(peer_recv_gpu[r][prop_start:prop_start + n * width])
-            prop_data = cp.concatenate(chunks) if len(chunks) > 1 else chunks[0]
-            tensor = buf.property_tensors[prop_idx]
-            if tensor.ndim > 1:
-                prop_data = prop_data.reshape(total_n, width)
-            tensor[all_ghost_indices] = prop_data  # ONE scatter
-
-        # Fused write-buffer ghost sync: one scatter per writable visible prop
+        if plan['host'] is not None:
+            plan['B'].set(plan['host'])
+        cp.take(plan['B'], plan['inv'], out=plan['A'])
+        self._scatter_fields(
+            plan, self._field_source,
+            lambda kind, key: (self._batched_recv_indices_gpu if kind == 'prop'
+                               else self._bla_configs[key]['batched_recv_rows']))
+        all_ghost_indices = self._batched_recv_indices_gpu
         for i in self._write_prop_mask:
             prop_idx = buf.sorted_write_indices[i]
             buf.write_buffers[i][all_ghost_indices] = \
                 buf.property_tensors[prop_idx][all_ghost_indices]
-
-        # Unpack breed-local array ghost data (after property data in each peer's buffer)
-        if self._bla_initialized:
-            # Track per-peer read offset (BLA data starts after property data)
-            peer_bla_offsets = {r: self.recv_counts[r] * self.total_stride
-                                for r in self._recv_peer_order}
-
-            for bla_i, cfg in enumerate(self._bla_configs):
-                if cfg is None or cfg['reduce']:
-                    continue
-                batched_rows = cfg['batched_recv_rows']
-                if len(batched_rows) == 0:
-                    continue
-                stride = cfg['stride']
-                shape_per_agent = buf.breed_local_ghost_info[bla_i]['shape_per_agent']
-
-                # Extract BLA data from each peer's buffer and concatenate
-                chunks = []
-                for r in self._recv_peer_order:
-                    m = cfg['recv_counts'].get(r, 0)
-                    if m == 0:
-                        continue
-                    off = peer_bla_offsets[r]
-                    chunks.append(peer_recv_gpu[r][off:off + m * stride])
-                    peer_bla_offsets[r] = off + m * stride
-
-                if chunks:
-                    bla_data = cp.concatenate(chunks) if len(chunks) > 1 else chunks[0]
-                    bla_data = bla_data.reshape(len(batched_rows), *shape_per_agent)
-                    buf.device_breed_locals[bla_i][batched_rows] = bla_data
 
     def exchange_ghost_data(self):
         """Full ghost exchange: batched GPU pack -> MPI -> batched GPU unpack."""
@@ -1397,17 +1311,9 @@ class CommunicationManager:
         if self._verbose_timing:
             timing_data['mpi_reverse'] = time.perf_counter() - t_rev_start
 
-            # Communication volume metrics (property + BLA data)
-            timing_data['mpi_send_bytes'] = sum(
-                (self.send_counts[r] * self.total_stride
-                 + self._bla_extra_send_size.get(r, 0)) * 4
-                for r in self._send_peer_order
-            )
-            timing_data['mpi_recv_bytes'] = sum(
-                (self.recv_counts[r] * self.total_stride
-                 + self._bla_extra_recv_size.get(r, 0)) * 4
-                for r in self._recv_peer_order
-            )
+            # Communication volume metrics (property + BLA data, forward direction)
+            timing_data['mpi_send_bytes'] = self._fwd['send']['total'] * 4
+            timing_data['mpi_recv_bytes'] = self._fwd['recv']['total'] * 4
             timing_data['mpi_num_peers'] = len(self._send_peer_order)
 
             return timing_data
