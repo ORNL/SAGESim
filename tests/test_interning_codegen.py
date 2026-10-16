@@ -41,28 +41,41 @@ def step_read_params(tick, agent_index, agent_ids, breeds, locations, params, st
     _bump_mods(tick, agent_index, agent_ids, breeds, locations, params, state, mods)
 
 
+@jit.rawkernel(device="cuda")
+def _row_product(agent_index, params, base):
+    # a parameter reader with no agent_ids / breeds / locations parameters -- the shape
+    # of a soma's synaptic-current helper: the (interned) tensor plus a column offset
+    return params[agent_index][0] * params[agent_index][1] + params[agent_index][base]
+
+
+@jit.rawkernel(device="cuda")
+def step_helper_without_agent_ids(tick, agent_index, agent_ids, breeds, locations, params, state, mods):
+    state[agent_index][0] = state[agent_index][0] + _row_product(agent_index, params, 2)
+    state[agent_index][1] = state[agent_index][1] + 1.0
+
+
 class ParamBreed(Breed):
-    def __init__(self, params_visible=False):
+    def __init__(self, params_visible=False, step=step_read_params):
         super().__init__("Param")
         self.register_property("params", [0.0, 0.0, 0.0], neighbor_visible=params_visible)
         self.register_property("state", [0.0, 0.0], neighbor_visible=False)
         self.register_property("mods", [0.0], neighbor_visible=False)
-        self.register_step_func(step_read_params, Path(__file__).resolve(), 0,
+        self.register_step_func(step, Path(__file__).resolve(), 0,
                                 no_double_buffer=["state", "mods"])
 
 
 class ParamModel(Model):
-    def __init__(self, tag, params_visible=False):
+    def __init__(self, tag, params_visible=False, step=step_read_params):
         super().__init__(NetworkSpace(), step_function_file_path=f"step_func_code_intern_{tag}.py")
-        self.breed = ParamBreed(params_visible)
+        self.breed = ParamBreed(params_visible, step)
         self.register_breed(self.breed)
 
 
 TABLE = np.array([[1.0, 2.0, 0.25], [3.0, 4.0, 0.5], [5.0, 6.0, 0.75]], dtype=np.float32)
 
 
-def _build(tag, how, n=600, params_visible=False, interning=True):
-    m = ParamModel(tag, params_visible)
+def _build(tag, how, n=600, params_visible=False, interning=True, step=step_read_params):
+    m = ParamModel(tag, params_visible, step)
     m.enable_property_interning = interning
     codes = np.arange(n) % 3
     off, val = build_csr_from_ragged([[] for _ in range(n)])
@@ -134,6 +147,27 @@ def test_interned_kernel_matches_dense_and_reference(how):
     # the generated kernel really takes table + codes for params
     src = Path(interned._generated_step_file).read_text()   # name carries a content hash
     assert "a2_table" in src and "a2_codes" in src and "params_table[params_codes[" in src
+
+
+def test_interned_tensor_forwarded_to_helper_without_agent_ids():
+    """A helper that takes the interned tensor but no agent_ids gets table + codes and
+    nothing more. The seed / logical_ids injection used to add a logical_ids argument at
+    the call site that the helper's definition never received (it is only inserted
+    after an agent_ids parameter), so the kernel failed to launch with "takes 10
+    positional arguments but 11 were given" -- every SuperNeuroABM soma reads its
+    (interned, when no rule writes it) parameters through such a helper."""
+    n, ticks = 600, 3
+    m = _run(_build("h", "indexed", n, step=step_helper_without_agent_ids), ticks)
+    idx = m._agent_factory._property_name_2_index
+    assert idx["params"] in m._interned_property_indices
+    # call and definition agree: table, the injected seed, codes, then the offset
+    src = Path(m._generated_step_file).read_text()
+    assert "_row_product(agent_index, params_table, _seed, params_codes, 2)" in src
+    assert "def _row_product(agent_index, params_table, _seed, params_codes, base)" in src
+    t = TABLE[np.arange(n) % 3]
+    st = m._gpu_buffers.property_tensors[idx["state"]][:n].get()
+    np.testing.assert_array_equal(st[:, 0], ticks * (t[:, 0] * t[:, 1] + t[:, 2]))
+    np.testing.assert_array_equal(st[:, 1], ticks)
 
 
 def test_neighbor_visible_property_is_not_interned():

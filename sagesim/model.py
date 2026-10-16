@@ -2996,9 +2996,14 @@ def _inject_seed(source: str, transformed_callees=()) -> str:
             if '_seed' not in names and len(node.args) >= 2:
                 node.args.insert(2, ast.Name(id='_seed', ctx=ast.Load()))
                 names.insert(2, '_seed')
-            if 'logical_ids' not in names:
-                pos = names.index('agent_ids') + 1 if 'agent_ids' in names else min(4, len(node.args))
-                node.args.insert(pos, ast.Name(id='logical_ids', ctx=ast.Load()))
+            # The callee's definition receives a logical_ids parameter only after an
+            # agent_ids parameter (below), so only a call that forwards agent_ids may
+            # pass it. A helper without agent_ids, e.g. a reader of one interned
+            # parameter row, used to be handed an extra argument it had no slot for
+            # (TypeError at launch: "takes 10 positional arguments but 11 were given").
+            if 'logical_ids' not in names and 'agent_ids' in names:
+                node.args.insert(names.index('agent_ids') + 1,
+                                 ast.Name(id='logical_ids', ctx=ast.Load()))
     # Insert _seed param at position 2 (after tick, agent_index) — skip if already present
     existing_params = {arg.arg for arg in func_def.args.args}
     if '_seed' not in existing_params:
