@@ -2472,7 +2472,7 @@ class Model:
             buf.device_globals = [cp.asarray(t) for t in self._global_tensors]
             self._globals_dirty = False
 
-        self._step_func[effective_blocks, threadsperblock](
+        launch_args = (
             self.tick,
             buf.seed_gpu,
             *buf.device_globals,
@@ -2488,6 +2488,18 @@ class Model:
             *self._build_bla_launch_args(buf),
             *self._build_wake_launch_args(buf),
         )
+        # The first launch goes through cupyx.jit's wrapper, which compiles (or finds) the
+        # kernel for this argument signature; later launches with the same signature call
+        # the compiled function directly (sagesim/launch.py: the wrapper's per-call type
+        # inference over ~60 arguments costs more than a sparse tick).
+        direct = getattr(self, '_direct_launch', None)
+        if (direct is not None and direct.jit_kernel is self._step_func
+                and direct.accepts(launch_args)):
+            direct((effective_blocks, 1, 1), (threadsperblock, 1, 1), launch_args)
+        else:
+            self._step_func[effective_blocks, threadsperblock](*launch_args)
+            from sagesim.launch import DirectLaunch
+            self._direct_launch = DirectLaunch.build(self._step_func, launch_args)
         if self._verbose_timing:
             t_kernel_launch_end = time.time()
             timing_data['kernel_launch_overhead'] = t_kernel_launch_end - t_kernel_launch_start
