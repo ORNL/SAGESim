@@ -100,21 +100,37 @@ def _segmented_add():
     return _segmented_add_kernel
 
 
-def _resolve_neighbor_ranks(neighbor_ids, agent2rank, local_ids=None, my_rank=-1):
-    """Resolve the owner rank of each id in ``neighbor_ids`` (boundary-scoped).
+def _sorted_unique(a):
+    """``np.unique(a)`` for a 1-D integer array, by a sort and a not-equal mask (unlike
+    ``np.unique`` it would not collapse NaNs, so it is not for float ids).
 
-    Returns an int32 array the same length as ``neighbor_ids``; entries whose id is
-    not in ``agent2rank`` are -1. Only the distinct neighbor ids are resolved, and
-    when ``local_ids`` (this rank's own agent ids) is given, ids found there are
-    assigned ``my_rank`` with a vectorised membership test, so the Python dict
-    lookup runs only over ids owned elsewhere -- the partition boundary. Without
-    ``local_ids`` every distinct id goes through the dict, which for a network whose
-    agents are each other's neighbours (synapses of a soma) is the whole population.
+    numpy 2.x's ``np.unique`` takes a hash path that is slower than sorting at every size
+    and duplicate ratio measured (2.4x with heavy duplicates to 57x all distinct); on a
+    38 M-entry neighbor list with 12.7 M distinct ids it took 9.5 s against 0.38 s.
     """
-    ranks = np.full(len(neighbor_ids), -1, dtype=np.int32)
+    s = np.sort(a)
+    keep = np.empty(len(s), dtype=bool)
+    keep[:1] = True
+    np.not_equal(s[1:], s[:-1], out=keep[1:])
+    return s[keep]
+
+
+def _distinct_neighbor_ranks(neighbor_ids, agent2rank, local_ids=None, my_rank=-1):
+    """The distinct ids in ``neighbor_ids`` and the owner rank of each (boundary-scoped).
+
+    Returns ``(ids, ranks)``: the sorted distinct ids and an int32 rank per id, -1 for
+    an id not in ``agent2rank``. Both callers need only these (which remote agents,
+    owned by whom), not a rank per neighbor entry, so no per-entry map is built back
+    (on Brunel's 38 M-entry neighbor list that was 0.9-1.2 s per call). When
+    ``local_ids`` (this rank's own agent ids) is given, ids found there are assigned
+    ``my_rank`` with a vectorised membership test, so the Python dict lookup runs only
+    over ids owned elsewhere -- the partition boundary. Without ``local_ids`` every
+    distinct id goes through the dict, which for a network whose agents are each
+    other's neighbours (synapses of a soma) is the whole population.
+    """
     if len(neighbor_ids) == 0:
-        return ranks
-    uniq = np.unique(neighbor_ids)
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int32)
+    uniq = _sorted_unique(neighbor_ids)
     uniq_ranks = np.full(len(uniq), -1, dtype=np.int32)
     remote = np.arange(len(uniq))
     if local_ids is not None and len(local_ids) > 0:
@@ -125,9 +141,7 @@ def _resolve_neighbor_ranks(neighbor_ids, agent2rank, local_ids=None, my_rank=-1
         uniq_ranks[remote] = np.fromiter(
             (agent2rank.get(int(a), -1) for a in uniq[remote]),
             dtype=np.int32, count=len(remote))
-    # Map each neighbor id back to its rank via the sorted unique ids (vectorized).
-    pos = np.searchsorted(uniq, neighbor_ids)
-    return uniq_ranks[pos]
+    return uniq, uniq_ranks
 
 
 def discover_ghost_topology(all_neighbors, agent2rank, my_rank, num_workers=None,
@@ -172,14 +186,10 @@ def discover_ghost_topology(all_neighbors, agent2rank, my_rank, num_workers=None
     if len(neighbor_ids) == 0:
         return np.array([], dtype=np.int64)
 
-    # Resolve owner rank per neighbor (boundary-scoped: O(distinct remote ids)).
-    neighbor_ranks = _resolve_neighbor_ranks(neighbor_ids, agent2rank, local_ids, my_rank)
-
-    # Keep only cross-rank neighbors
-    cross_mask = (neighbor_ranks != my_rank) & (neighbor_ranks >= 0)
-    ghost_ids = np.unique(neighbor_ids[cross_mask])
-
-    return ghost_ids
+    # Owner rank per distinct neighbor (boundary-scoped: O(distinct remote ids)); the
+    # ghosts are the distinct ids owned by another rank, already sorted.
+    uniq, ranks = _distinct_neighbor_ranks(neighbor_ids, agent2rank, local_ids, my_rank)
+    return uniq[(ranks != my_rank) & (ranks >= 0)]
 
 
 class GPUHashMap:
@@ -767,13 +777,7 @@ class CommunicationManager:
             cpu_values_ids = buf.neighbor_values_ids[:total_edges_local].get()
             cpu_values_ids = np.asarray(cpu_values_ids, dtype=np.int64)
 
-            # 3. Vectorized: expand (local_agent_idx, neighbor_id) pairs
-            counts = np.diff(cpu_offsets)
-            local_agent_indices = np.repeat(
-                np.arange(num_local, dtype=np.int32), counts
-            )
-
-            # Filter invalid neighbor IDs (padding: -1)
+            # 3. Filter invalid neighbor IDs (padding: -1)
             valid_mask = cpu_values_ids >= 0
             neighbor_ids = cpu_values_ids[valid_mask]
 
@@ -781,25 +785,23 @@ class CommunicationManager:
                 has_cross_rank_work = False
 
         if has_cross_rank_work:
-            # Resolve owner rank per neighbor (boundary-scoped: O(distinct neighbor ids)).
-            neighbor_ranks = _resolve_neighbor_ranks(
+            # Owner rank per distinct neighbor (boundary-scoped: O(distinct neighbor ids)).
+            uniq, uniq_ranks = _distinct_neighbor_ranks(
                 neighbor_ids, self.agent_factory._agent2rank, self._local_ids, self.my_rank)
 
-            # Filter to cross-rank neighbors
-            cross_mask = (neighbor_ranks != self.my_rank) & (neighbor_ranks >= 0)
-            cross_neighbor_ids = neighbor_ids[cross_mask]
-            cross_neighbor_ranks = neighbor_ranks[cross_mask]
+            # Keep the distinct ids owned by another rank (sorted, as uniq is)
+            cross_mask = (uniq_ranks != self.my_rank) & (uniq_ranks >= 0)
+            cross_neighbor_ids = uniq[cross_mask]
+            cross_neighbor_ranks = uniq_ranks[cross_mask]
 
             if len(cross_neighbor_ids) == 0:
                 has_cross_rank_work = False
 
         if has_cross_rank_work:
-            # Group by source rank: unique remote agent IDs needed from each
+            # Group by source rank: the sorted distinct remote agent IDs needed from each
             for src_rank in np.unique(cross_neighbor_ranks):
                 src_rank = int(src_rank)
-                mask = cross_neighbor_ranks == src_rank
-                unique_remote_ids = np.unique(cross_neighbor_ids[mask])
-                need_from_rank[src_rank] = unique_remote_ids
+                need_from_rank[src_rank] = cross_neighbor_ids[cross_neighbor_ranks == src_rank]
 
         # ---- Phase 1: Exchange request counts (collective) ----
         request_counts = np.zeros(self.num_workers, dtype=np.int32)
@@ -851,10 +853,7 @@ class CommunicationManager:
             breed_send_bufs = {}
             breed_send_requests = []
             for dest_rank, agent_ids_np in requested_by_rank.items():
-                breeds_np = np.array(
-                    [af._agent2breed.get(int(aid), -1) for aid in agent_ids_np],
-                    dtype=np.int32,
-                )
+                breeds_np = af.breeds_of(agent_ids_np)    # this rank's own agents
                 breed_send_bufs[dest_rank] = breeds_np
                 breed_send_requests.append(
                     self.comm.Isend([breeds_np, MPI.INT], dest=dest_rank, tag=101)
@@ -905,7 +904,6 @@ class CommunicationManager:
 
         # ---- Build breed-local array ghost exchange maps ----
         bla_ghost_infos = getattr(buf, 'breed_local_ghost_info', [])
-        agent2breed = self.agent_factory._agent2breed
         self._bla_configs = []
         self._bla_extra_send_size = {}
         self._bla_extra_recv_size = {}
@@ -914,11 +912,17 @@ class CommunicationManager:
         # itself (has_cross_rank_work False) and still be asked for its agents by
         # another rank (send side of a plain array, receive side of a reduce array).
         if bla_ghost_infos and (self.send_indices_gpu or self.recv_indices_gpu):
-            # Buffer_index → breed_id lookup (CPU)
-            buf_breeds = np.array(
-                [agent2breed.get(int(aid), -1)
-                 for aid in buf.all_agent_ids_list[:buf.num_total_agents]],
-                dtype=np.int32)
+            # Buffer_index -> breed_id (CPU), for the sent and received rows only: they are
+            # the only rows read below, so breeds are looked up per exchanged agent rather
+            # than per buffer row (12.7 M rows on Brunel, ~3 s). Sent rows are this rank's
+            # agents (breed column), received rows are ghosts (breeds recorded above).
+            send_rows = {r: idx.get().astype(np.int32) for r, idx in self.send_indices_gpu.items()}
+            recv_rows = {r: idx.get().astype(np.int32) for r, idx in self.recv_indices_gpu.items()}
+            exchanged = np.unique(np.concatenate(
+                [np.zeros(0, dtype=np.int32), *send_rows.values(), *recv_rows.values()]))
+            all_ids = np.asarray(buf.all_agent_ids_list)
+            buf_breeds = np.full(buf.num_total_agents, -1, dtype=np.int32)
+            buf_breeds[exchanged] = self.agent_factory.breeds_of(all_ids[exchanged])
 
             for bla_i, info in enumerate(bla_ghost_infos):
                 if info is None:
@@ -939,7 +943,7 @@ class CommunicationManager:
                 bla_recv_rows_per_peer = {}
 
                 for dest_rank in self.send_indices_gpu:
-                    cpu_indices = self.send_indices_gpu[dest_rank].get().astype(np.int32)
+                    cpu_indices = send_rows[dest_rank]
                     mask = np.isin(buf_breeds[cpu_indices], breed_ids)
                     filtered = cpu_indices[mask]
                     bla_rows = bla_idx_map[filtered]
@@ -947,7 +951,7 @@ class CommunicationManager:
                     bla_send_rows_per_peer[dest_rank] = bla_rows
 
                 for src_rank in self.recv_indices_gpu:
-                    cpu_indices = self.recv_indices_gpu[src_rank].get().astype(np.int32)
+                    cpu_indices = recv_rows[src_rank]
                     mask = np.isin(buf_breeds[cpu_indices], breed_ids)
                     filtered = cpu_indices[mask]
                     bla_rows = bla_idx_map[filtered]

@@ -26,11 +26,20 @@ import numpy as np
 from mpi4py import MPI
 
 from sagesim.agent import AgentFactory, Breed
+from sagesim.agent_index import AgentIndex
 from sagesim.space import Space
 from sagesim.internal_utils import convert_to_equal_side_tensor, build_csr_from_ragged, build_csr_values_only, convert_to_padded_gpu_tensor
 from sagesim.gpu_kernels import GPUBufferManager, GPUHashMap, CommunicationManager, is_gpu_aware_mpi, discover_ghost_topology
 from sagesim.columns import ArrayColumn, IndexedColumn
 from sagesim.internal_utils import _identity_groups, _DEDUP_MIN_RATIO
+
+
+def _local_ids_in_row_order(local_map):
+    """This rank's agent ids in row order, from its id -> row map: an AgentIndex holds
+    them as an array already; a dict's keys are in row order (insertion order)."""
+    if isinstance(local_map, AgentIndex):
+        return local_map.ids
+    return np.array(list(local_map.keys()), dtype=np.int64)
 
 
 def convert_agent_ids_to_indices(data_tensor, agent_id_to_index_map, return_arrays=False,
@@ -630,7 +639,6 @@ class Model:
         :param directed: if True, connections are one-way. If False (default),
             connections are bidirectional. Matches connect_agents() default.
         """
-        from collections import OrderedDict
         from copy import copy
 
         rank = MPI.COMM_WORLD.Get_rank()
@@ -642,13 +650,11 @@ class Model:
 
         # 2. Bulk agent factory setup
         af = self._agent_factory
-        local_mapping = OrderedDict((int(aid), i) for i, aid in enumerate(local_ids))
+        local_mapping = {int(aid): i for i, aid in enumerate(local_ids)}
         af._rank2agentid2agentidx[rank] = local_mapping
         af._num_agents = max(int(a) for a in local_ids) + 1 if local_ids else 0
-        for aid in local_ids:
-            af._agent2rank[int(aid)] = rank
-        for agent in agents:
-            af._agent2breed[agent['id']] = agent['breed']._breedidx
+        # local agents' rank and breed are not recorded in _agent2rank / _agent2breed:
+        # they are this rank and the breed column (AgentFactory.rank_of / breed_of)
 
         # 3. Fill property tensors in bulk
         for prop_name in af._property_name_2_agent_data_tensor:
@@ -732,11 +738,10 @@ class Model:
             values; the -1 external sentinel is allowed).
         :param remote_agent_ranks: dict {remote_agent_id: rank} for MPI ghost exchange.
         """
-        from collections import OrderedDict
         from copy import copy
 
         rank = MPI.COMM_WORLD.Get_rank()
-        agent_ids = [int(a) for a in agent_ids]
+        agent_ids = np.asarray(agent_ids, dtype=np.int64)
         n_local = len(agent_ids)
         if len(breed_indices) != n_local:
             raise ValueError(
@@ -766,15 +771,15 @@ class Model:
         space = self.get_space()
         space.set_prebuilt_csr(neighbor_offsets, neighbor_values_ids)
 
-        # 2. Agent-factory bookkeeping (id <-> local index, rank, breed).
-        local_mapping = OrderedDict((aid, i) for i, aid in enumerate(agent_ids))
-        af._rank2agentid2agentidx[rank] = local_mapping
-        af._num_agents = (max(agent_ids) + 1) if agent_ids else 0
-        for aid in agent_ids:
-            af._agent2rank[aid] = rank
-        breed_list = [int(b) for b in breed_indices]
-        for aid, b in zip(agent_ids, breed_list):
-            af._agent2breed[aid] = b
+        # 2. Agent-factory bookkeeping: the id -> row map over the ids as given, in row
+        # order. An AgentIndex keeps the array instead of a 12.7 M-entry dict (1-3.5 s
+        # and ~1 GB); it answers the same lookups, and the first simulate() reads its ids
+        # back directly. It turns into a dict if create_agent later adds to this rank.
+        af._rank2agentid2agentidx[rank] = AgentIndex(agent_ids)
+        af._num_agents = int(agent_ids.max()) + 1 if n_local else 0
+        # Local agents' rank and breed are not recorded in _agent2rank / _agent2breed:
+        # they are this rank and the breed column (AgentFactory.rank_of / breed_of);
+        # recording them was 3 s at 12.7 M agents.
 
         # 3. Property tensors, columnar: assign each registered property's column
         # directly (built-ins first, then supplied columns, then defaults for any
@@ -784,7 +789,8 @@ class Model:
             if prop_name == "breed":
                 af._property_name_2_agent_data_tensor[prop_name] = (
                     ArrayColumn(np.asarray(breed_indices, dtype=np.int32))
-                    if isinstance(breed_indices, np.ndarray) else breed_list)
+                    if isinstance(breed_indices, np.ndarray)
+                    else [int(b) for b in breed_indices])
             elif prop_name == "locations":
                 af._property_name_2_agent_data_tensor[prop_name] = []
             elif prop_name in property_columns:
@@ -1503,19 +1509,6 @@ class Model:
         t_jit_end = time.time()
         ###
 
-        # Print agent distribution summary
-        if worker == 0:
-            agents_per_rank = {}
-            a2r = self._agent_factory._agent2rank
-            if isinstance(a2r, np.ndarray):
-                unique, counts = np.unique(a2r, return_counts=True)
-                for r, c in zip(unique, counts):
-                    agents_per_rank[int(r)] = int(c)
-            else:
-                for r in a2r.values():
-                    agents_per_rank[r] = agents_per_rank.get(r, 0) + 1
-
-
         self._is_setup = True
 
         # Initialize GPU buffer manager (buffers allocated lazily on first tick)
@@ -1911,10 +1904,15 @@ class Model:
             agent_id_to_index = local_map
         else:
             all_agent_ids_np = np.concatenate([self.__rank_local_agent_ids, ghost_ids])
-            agent_id_to_index = dict(local_map)
-            base = len(self.__rank_local_agent_ids)
-            agent_id_to_index.update(
-                (int(aid), base + i) for i, aid in enumerate(ghost_ids.tolist()))
+            if isinstance(local_map, AgentIndex):
+                # rows are positions in locals + ghosts, which is what an index over that
+                # concatenation answers
+                agent_id_to_index = AgentIndex(all_agent_ids_np)
+            else:
+                agent_id_to_index = dict(local_map)
+                base = len(self.__rank_local_agent_ids)
+                agent_id_to_index.update(
+                    (int(aid), base + i) for i, aid in enumerate(ghost_ids.tolist()))
         buf.all_agent_ids_list = all_agent_ids_np
         buf.agent_id_to_index = agent_id_to_index
         buf.num_total_agents = len(all_agent_ids_np)
@@ -2273,18 +2271,14 @@ class Model:
         current_dict_id = id(self._agent_factory._rank2agentid2agentidx[worker])
         if not hasattr(self, '_cached_rank_local_agent_ids'):
             # First call - build and cache
-            self.__rank_local_agent_ids = np.array(
-                list(self._agent_factory._rank2agentid2agentidx[worker].keys()),
-                dtype=np.int64,
-            )
+            self.__rank_local_agent_ids = _local_ids_in_row_order(
+                self._agent_factory._rank2agentid2agentidx[worker])
             self._cached_rank_local_agent_ids = self.__rank_local_agent_ids
             self._cached_topology_dict_id = current_dict_id
         elif current_dict_id != self._cached_topology_dict_id:
             # Topology changed - rebuild cache
-            self.__rank_local_agent_ids = np.array(
-                list(self._agent_factory._rank2agentid2agentidx[worker].keys()),
-                dtype=np.int64,
-            )
+            self.__rank_local_agent_ids = _local_ids_in_row_order(
+                self._agent_factory._rank2agentid2agentidx[worker])
             self._cached_rank_local_agent_ids = self.__rank_local_agent_ids
             self._cached_topology_dict_id = current_dict_id
         else:

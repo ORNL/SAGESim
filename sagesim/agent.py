@@ -46,12 +46,20 @@ class AgentFactory:
             {"breed": True, "locations": False}
         )
         self._neighbor_visible_indices: List[int] = []  # Cached list of neighbor-visible property indices
-        self._agent2rank = {}  # global
-        self._agent2breed = {}  # global: agent_id -> breed_id (populated by all ranks)
+        # agent_id -> rank / breed_id. create_agent records every agent (all ranks run it
+        # for all agents); the bulk builders record only agents this rank does NOT hold
+        # (remote neighbors, ghosts), since a local agent's rank and breed are already its
+        # row in the ownership map and the breed column (12.7 M local entries cost 3 s).
+        # Ask rank_of / breed_of, which cover both.
+        self._agent2rank = {}
+        self._agent2breed = {}
         # global; every rank gets an entry up front so a rank that ends up with no
         # agents (post-owns placement of a tiny network on many ranks, or a sparse
-        # partition) still takes part in every collective instead of raising KeyError
-        self._rank2agentid2agentidx = {r: OrderedDict() for r in range(num_workers)}
+        # partition) still takes part in every collective instead of raising KeyError.
+        # Plain dicts (insertion-ordered): an OrderedDict of 12.7 M ids took 2x as long to
+        # build and 30x as long to copy (4.2 s against 0.14 s), and nothing here needs its
+        # extras (move_to_end, order-sensitive ==).
+        self._rank2agentid2agentidx = {r: {} for r in range(num_workers)}
 
         self._current_rank = 0
         # Set by the columnar bulk build (Model.build_from_local_columns), which
@@ -150,7 +158,7 @@ class AgentFactory:
             agent_id = self._num_agents
             self._num_agents += 1
         else:
-            if agent_id in self._agent2breed:
+            if agent_id in self._agent2breed or self._owns_locally(agent_id):
                 raise ValueError(
                     f"Explicit agent_id {agent_id} is already in use; agent IDs must "
                     f"be unique. Pass agent_id=None to auto-assign, or choose an "
@@ -170,8 +178,11 @@ class AgentFactory:
         self._agent2rank[agent_id] = assigned_rank
         self._agent2breed[agent_id] = self._breeds[breed.name]._breedidx
         agentid2agentidx_of_current_rank = self._rank2agentid2agentidx.get(
-            assigned_rank, OrderedDict()
+            assigned_rank, {}
         )
+        if not isinstance(agentid2agentidx_of_current_rank, dict):
+            # a bulk-built rank's read-only AgentIndex: becomes a dict on first insert
+            agentid2agentidx_of_current_rank = dict(agentid2agentidx_of_current_rank.items())
         agentid2agentidx_of_current_rank[agent_id] = len(
             self._property_name_2_agent_data_tensor["locations"]
         )
@@ -205,6 +216,26 @@ class AgentFactory:
         alone, so _agent2rank need not be global.
         """
         return agent_id in self._rank2agentid2agentidx.get(worker, {})
+
+    def rank_of(self, agent_id: int, default=-1):
+        """Owner rank of agent_id: this rank for an agent it holds, else the rank recorded
+        for a remote agent this rank knows of, else ``default``."""
+        if agent_id in self._rank2agentid2agentidx.get(worker, {}):
+            return worker
+        return self._agent2rank.get(agent_id, default)
+
+    def breed_of(self, agent_id: int, default=-1):
+        """Breed index of agent_id: from the breed column for an agent this rank holds,
+        else the breed recorded for a remote agent (ghosts), else ``default``."""
+        row = self._rank2agentid2agentidx.get(worker, {}).get(agent_id)
+        if row is not None:
+            return int(self._property_name_2_agent_data_tensor["breed"][row])
+        return self._agent2breed.get(agent_id, default)
+
+    def breeds_of(self, agent_ids) -> np.ndarray:
+        """breed_of for many ids, as an int32 array (-1 where unknown)."""
+        return np.fromiter((self.breed_of(int(a)) for a in agent_ids),
+                           dtype=np.int32, count=len(agent_ids))
 
     def get_agent_property_value(self, property_name: str, agent_id: int) -> Any:
         """
@@ -314,8 +345,7 @@ class AgentFactory:
         if not old_mapping:
             return
 
-        agent_ids = list(old_mapping.keys())
-        n = len(agent_ids)
+        n = len(old_mapping)
         if n == 0:
             return
 
@@ -333,7 +363,7 @@ class AgentFactory:
                 arr = np.asarray(breed_data)
                 unsorted = bool(np.any(np.diff(arr) < 0))
             else:
-                ordered = [breed_data[old_mapping[aid]] for aid in agent_ids]
+                ordered = [breed_data[idx] for idx in old_mapping.values()]
                 unsorted = any(ordered[i] > ordered[i + 1] for i in range(n - 1))
             if unsorted:
                 raise RuntimeError(
@@ -343,6 +373,9 @@ class AgentFactory:
                     "before calling build_from_local_columns."
                 )
             return
+        # the key list is needed only here: on the pre-sorted path above it was 1.6 s of
+        # list building at 12.7 M agents for nothing
+        agent_ids = list(old_mapping.keys())
         old_indices = [old_mapping[aid] for aid in agent_ids]
         breeds = [breed_data[idx] for idx in old_indices]
 
@@ -361,7 +394,7 @@ class AgentFactory:
             ]
 
         # Rebuild _rank2agentid2agentidx with sorted positions
-        new_mapping = OrderedDict()
+        new_mapping = {}
         for new_idx, old_pos in enumerate(sorted_order):
             new_mapping[agent_ids[old_pos]] = new_idx
         self._rank2agentid2agentidx[worker] = new_mapping

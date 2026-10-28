@@ -5,7 +5,7 @@ supplied (vectorised membership, dict lookups only for the remote boundary) or n
 """
 import numpy as np
 
-from sagesim.gpu_kernels import discover_ghost_topology, _resolve_neighbor_ranks
+from sagesim.gpu_kernels import discover_ghost_topology, _distinct_neighbor_ranks
 
 
 def _reference_ghosts(all_neighbors, agent2rank, my_rank):
@@ -60,8 +60,9 @@ def test_resolve_ranks_only_consults_dict_for_remote_ids():
     class Counting(dict):
         def get(self, k, d=-1):
             consulted.append(k); return super().get(k, d)
-    ranks = _resolve_neighbor_ranks(ids, Counting(agent2rank), local_ids, my_rank)
-    expected = np.array([agent2rank.get(int(i), -1) for i in ids], dtype=np.int32)
+    uniq, ranks = _distinct_neighbor_ranks(ids, Counting(agent2rank), local_ids, my_rank)
+    np.testing.assert_array_equal(uniq, np.unique(ids))
+    expected = np.array([agent2rank.get(int(i), -1) for i in uniq], dtype=np.int32)
     np.testing.assert_array_equal(ranks, expected)
     assert not (set(consulted) & set(local_ids.tolist())), "local ids went through the dict"
 

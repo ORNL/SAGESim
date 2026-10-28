@@ -123,13 +123,13 @@ def test_bulk_agents_property_values():
     # Property tensor values
     assert af._property_name_2_agent_data_tensor['state'] == states
 
-    # Agent-to-rank mapping
+    # Agent-to-rank and agent-to-breed answers (local agents come from the ownership
+    # map and the breed column, not from _agent2rank / _agent2breed)
     for i in range(5):
-        assert af._agent2rank[i] == 0
-
-    # Agent-to-breed mapping
-    for i in range(5):
-        assert af._agent2breed[i] == breed._breedidx
+        assert af.rank_of(i) == 0
+        assert af.breed_of(i) == breed._breedidx
+    assert not (set(af._agent2rank) | set(af._agent2breed)) & set(range(5)), \
+        "local agents recorded in the remote-agent maps"
 
     # Index mapping
     rank_map = af._rank2agentid2agentidx[0]
@@ -203,11 +203,11 @@ def test_remote_agent_ranks_registered():
 
     model.build_from_local_data(agents, [], remote_ranks)
 
-    assert af._agent2rank[100] == 1
-    assert af._agent2rank[200] == 2
+    assert af.rank_of(100) == 1
+    assert af.rank_of(200) == 2
     # Local agents still on rank 0
     for i in range(3):
-        assert af._agent2rank[i] == 0
+        assert af.rank_of(i) == 0
 
 
 def test_columns_match_local_data():
@@ -251,6 +251,9 @@ def test_columns_match_local_data():
             f"property '{prop}' differs")
     # Bookkeeping identical.
     assert afr._agent2breed == afc._agent2breed
+    ids = list(afr._rank2agentid2agentidx[0])
+    assert [afr.breed_of(i) for i in ids] == [afc.breed_of(i) for i in ids]
+    assert [afr.rank_of(i) for i in ids] == [afc.rank_of(i) for i in ids]
     assert (dict(afr._rank2agentid2agentidx[0])
             == dict(afc._rank2agentid2agentidx[0]))
     # CSR stored on the space matches the record path's build_csr_from_ragged.
