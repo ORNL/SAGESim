@@ -6,7 +6,7 @@ builds the simulation state, and drives the GPU step kernels.
 
 """
 
-from typing import Dict, List, Callable, Set, Any, Union
+from typing import Dict, List, Callable, Optional, Set, Any, Union
 import os
 import re
 import sys
