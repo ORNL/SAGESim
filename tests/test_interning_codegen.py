@@ -186,3 +186,29 @@ def test_reset_and_host_write_keep_working():
     st = m.get_agent_property_value(7, "state")
     assert st[0] == pytest.approx(_expected(n, 3)[7, 0] + 100.0 + 1.5)      # 10*10 + mods(1.5) + 0
     assert m.get_agent_property_value(7, "params") == [10.0, 10.0, 0.0]
+
+
+@pytest.mark.parametrize("how", ["indexed", "list"])
+def test_host_write_to_an_interned_property_reaches_the_kernel(how):
+    """A property held as table + codes on the device is read-only there, not on the host:
+    after set_agent_property_value the next run must compute with the new row. The
+    in-place refresh used to skip interned properties, so the kernel kept the rows of the
+    first launch (the new row is a fourth distinct one: the table grows)."""
+    n, ticks = 600, 4
+    m = _run(_build("w_" + how, how, n), ticks)
+    idx = m._agent_factory._property_name_2_index
+    assert idx["params"] in m._interned_property_indices
+    before = m._gpu_buffers.property_tensors[idx["state"]][:n].get()
+
+    changed = [7.0, 8.0, 0.125]
+    m.set_agent_property_value(4, "params", changed)
+    m.simulate(ticks, sync_workers_every_n_ticks=ticks)
+    after = m._gpu_buffers.property_tensors[idx["state"]][:n].get()
+
+    t = TABLE[np.arange(n) % 3].astype(np.float64)
+    t[4] = changed
+    mods = 0.5 * ticks + 0.5 * np.arange(ticks)[:, None]          # mods kept counting
+    gain = (t[:, 0] * t[:, 1] + t[:, 2])[None, :] * np.ones((ticks, 1)) + mods
+    np.testing.assert_allclose(after[:, 0] - before[:, 0], gain.sum(axis=0), rtol=1e-6)
+    assert m.get_agent_property_value(4, "params") == changed
+    assert m.get_agent_property_value(1, "params") == TABLE[1].tolist()

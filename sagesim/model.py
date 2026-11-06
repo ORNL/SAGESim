@@ -29,7 +29,7 @@ from sagesim.agent import AgentFactory, Breed
 from sagesim.agent_index import AgentIndex
 from sagesim.space import Space
 from sagesim.internal_utils import convert_to_equal_side_tensor, build_csr_from_ragged, build_csr_values_only, convert_to_padded_gpu_tensor
-from sagesim.gpu_kernels import GPUBufferManager, GPUHashMap, CommunicationManager, is_gpu_aware_mpi, discover_ghost_topology
+from sagesim.gpu_kernels import GPUBufferManager, GPUHashMap, CommunicationManager, is_gpu_aware_mpi, discover_ghost_topology, TableProperty
 from sagesim.columns import ArrayColumn, IndexedColumn
 from sagesim.internal_utils import _identity_groups, _DEDUP_MIN_RATIO
 
@@ -1734,8 +1734,9 @@ class Model:
         """Apply a reset(release_buffers=False) to the live device buffers: upload the
         host property columns over the local rows (and their write buffers), zero every
         breed-local array (a reduce inbox starts empty) and clear the event wake state.
-        Interned properties are left alone (read-only on the device, the host column is
-        authoritative and unchanged). Ghost rows are refreshed by the next exchange."""
+        An interned property is read-only on the device but not on the host (a
+        set_agent_property_value, a model restoring its initial values), so its table
+        and codes are sent again. Ghost rows are refreshed by the next exchange."""
         buf = getattr(self, '_gpu_buffers', None)
         if buf is None or not buf.is_initialized or not getattr(buf, 'pending_reset', False):
             return
@@ -1745,7 +1746,16 @@ class Model:
             write_slot = {pidx: j for j, pidx in enumerate(buf.sorted_write_indices)}
             for i in range(self._agent_factory.num_properties):
                 tensor = buf.property_tensors[i] if i < len(buf.property_tensors) else None
-                if i == 1 or tensor is None or buf.is_interned(i) or i >= len(columns):
+                if i == 1 or tensor is None or i >= len(columns):
+                    continue
+                if buf.is_interned(i):
+                    # Skipping these left the device on the rows of the first launch
+                    # after any host write to the property. The table may have grown, so
+                    # the pair is replaced and the cached kernel arguments dropped.
+                    self._intern_cache.pop(i, None)       # a list column's row groups
+                    table, codes = self._intern_column(i, columns[i], int(tensor.codes.shape[0]))
+                    buf.property_tensors[i] = TableProperty(table, codes)
+                    self._cached_all_args = None
                     continue
                 dev = convert_to_padded_gpu_tensor(columns[i], n, width=tuple(tensor.shape[1:]))
                 if dev.ndim != tensor.ndim:
